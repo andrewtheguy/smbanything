@@ -111,6 +111,7 @@ mod proto;
 mod session;
 mod sign;
 mod srvsvc;
+mod tun;
 mod wire;
 
 use std::net::TcpListener as StdTcpListener;
@@ -315,6 +316,9 @@ pub struct SmbHandle {
     mount: MountPoint,
     /// Shared with `Ctx`. Read by the owner to decide whether to stop.
     failed_logons: Arc<std::sync::atomic::AtomicU32>,
+    /// The client-facing packet tunnel, when one fronts this server. It is
+    /// taken down before the private loopback listener is stopped.
+    tun: Option<tun::TunShare>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
@@ -360,6 +364,7 @@ impl SmbHandle {
     }
 
     pub fn stop(mut self) {
+        drop(self.tun.take());
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -371,10 +376,79 @@ impl SmbHandle {
 
 impl Drop for SmbHandle {
     fn drop(&mut self) {
+        drop(self.tun.take());
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
     }
+}
+
+/// The two host addresses used by the packet tunnel.
+///
+/// Clients connect to `virtual_ip`; the native TUN interface owns the next
+/// address. Both are /32 host routes, so the tunnel never claims a subnet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunAddrs {
+    virtual_ip: std::net::Ipv4Addr,
+}
+
+impl TunAddrs {
+    pub const fn virtual_ip(self) -> std::net::Ipv4Addr {
+        self.virtual_ip
+    }
+
+    pub fn adapter_ip(self) -> std::net::Ipv4Addr {
+        std::net::Ipv4Addr::from(u32::from(self.virtual_ip) + 1)
+    }
+}
+
+impl std::fmt::Display for TunAddrs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.virtual_ip.fmt(f)
+    }
+}
+
+impl std::str::FromStr for TunAddrs {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let virtual_ip: std::net::Ipv4Addr = value
+            .parse()
+            .map_err(|_| anyhow!("expected an IPv4 address like 169.254.255.1, got `{value}`"))?;
+        let adapter_ip = u32::from(virtual_ip)
+            .checked_add(1)
+            .map(std::net::Ipv4Addr::from)
+            .ok_or_else(|| anyhow!("the adapter takes the address after {virtual_ip}, and there is none"))?;
+
+        for addr in [virtual_ip, adapter_ip] {
+            let first_octet = addr.octets()[0];
+            if addr.is_loopback()
+                || addr.is_multicast()
+                || first_octet == 0
+                || first_octet >= 240
+            {
+                return Err(anyhow!(
+                    "the tunnel needs {virtual_ip} and the next address, but {addr} is reserved by the local IP stack"
+                ));
+            }
+        }
+        Ok(Self { virtual_ip })
+    }
+}
+
+/// The link-local pair used when `--smb-tun-ip` is not specified.
+///
+/// RFC 3927 excludes 169.254.255.x from automatic address selection, so an
+/// APIPA interface cannot claim either address by accident.
+pub const DEFAULT_TUN_ADDRS: TunAddrs = TunAddrs {
+    virtual_ip: std::net::Ipv4Addr::new(169, 254, 255, 1),
+};
+
+/// Client-visible endpoint for [`Bind::Tun`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunConfig {
+    pub port: u16,
+    pub addrs: TunAddrs,
 }
 
 /// Turn a bind failure on a privileged port into an actionable message. Ports
@@ -405,6 +479,10 @@ pub enum Bind {
     /// This must be selected explicitly because SMB 2.1 traffic is signed but
     /// not encrypted, so file contents are visible on the network.
     AllInterfaces,
+    /// A native L3 packet adapter and a userspace TCP stack. This is how the
+    /// process serves the standard SMB port without binding a host socket to
+    /// it. Linux and macOS use their native TUN APIs; Windows uses Wintun.
+    Tun(TunConfig),
 }
 
 /// Start the server on `port` (0 picks an ephemeral one). Binding happens
@@ -421,6 +499,9 @@ pub fn start(
         Bind::Loopback => {
             local_server::bind_localhost(port).map_err(|e| privileged_hint(e, port))?
         }
+        // The client never sees this private listener. The packet stack
+        // proxies accepted connections to it over IPv4 loopback.
+        Bind::Tun(_) => local_server::bind_localhost(0)?,
         Bind::AllInterfaces => {
             let listener = StdTcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port))
                 .or_else(|_| StdTcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)))
@@ -439,12 +520,31 @@ pub fn start(
         .map_err(|e| anyhow!("read bound listener address: {e}"))?;
     let bound_port = bound_addr.port();
 
-    // Taken from the listener rather than assumed: with `Bind::AllInterfaces`
-    // this is the wildcard the socket bound, and reporting `127.0.0.1` there
-    // would hand callers a UNC path that names the wrong machine.
-    let mount = MountPoint {
-        host: bound_addr.ip().to_string(),
-        port: bound_port,
+    // Create the client-facing transport before spawning the SMB thread. A
+    // privilege, route, or driver failure therefore leaves no hidden server
+    // running behind a tunnel that never came up.
+    let (tun, mount) = match &bind {
+        Bind::Tun(config) => {
+            let forward_to = std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                bound_port,
+            ));
+            let share = tun::TunShare::start(config.port, forward_to, config.addrs)?;
+            let mount = MountPoint {
+                host: share.virtual_ip().to_string(),
+                port: config.port,
+            };
+            (Some(share), mount)
+        }
+        _ => (
+            None,
+            // Taken from the listener rather than assumed: with
+            // `AllInterfaces` this is the wildcard that actually bound.
+            MountPoint {
+                host: bound_addr.ip().to_string(),
+                port: bound_port,
+            },
+        ),
     };
 
     let share_name = share_name.into();
@@ -488,6 +588,7 @@ pub fn start(
         share_name,
         mount,
         failed_logons,
+        tun,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
     })

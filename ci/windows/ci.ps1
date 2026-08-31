@@ -1,9 +1,10 @@
 # Clippy, tests, and a release build, then an SMB smoke test of that binary
 # serving the candle 0.11.0 tar.gz fixture from .\tmp — fetched from the
 # GitHub release (https://github.com/huggingface/candle/releases/tag/0.11.0)
-# when missing — and reading a known file back through a `net use /TCPPORT`
-# drive mapping. The TAR.GZ backing must spill nothing into the runtime temp
-# directory while serving or after shutdown.
+# when missing — and reading a known file back through the 169.254.255.1
+# packet tunnel. The TAR.GZ backing must spill nothing into the runtime temp
+# directory while serving or after shutdown. Wintun is the Windows-only
+# driver sidecar; Linux and macOS use their native TUN interfaces.
 #
 # Runs natively on whatever Windows machine invokes it: the CI VM (see
 # ci\windows\remote.ps1) or a dev box. Every cargo step checks $LASTEXITCODE
@@ -39,20 +40,17 @@ Write-Host '== toolchain =='
 & cargo clippy --version
 if ($env:CARGO_TARGET_DIR) { Write-Host "   CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR" }
 
-Invoke-Step 'Clippy' @('clippy', '--all-targets', '--all-features', '--', '-D', 'warnings')
-Invoke-Step 'Test' @('test', '--all-features')
+Invoke-Step 'Clippy' @('clippy', '--workspace', '--all-targets', '--all-features', '--', '-D', 'warnings')
+Invoke-Step 'Test' @('test', '--workspace', '--all-features')
 Invoke-Step 'Release build' @('build', '--release')
 
 Write-Host ''
 Write-Host '== SMB smoke =='
 
-# Loopback SMB on a non-445 port needs `net use /TCPPORT`, which older Windows
-# builds lack; without it the smoke cannot run at all, so report and pass on
-# what did run rather than fail the machine.
-$netHelp = (& net.exe use /? 2>&1 | Out-String)
-if ($netHelp -notmatch '/TCPPORT') {
-    Write-Host '[smoke] net use has no /TCPPORT on this machine; build and tests passed, SMB smoke skipped'
-    exit 0
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'the packet-tunnel smoke must run from an elevated Windows session'
 }
 
 $expectedHash = '11ad61a87d8defac2031c6d6d5f88a4d5538df501b88503fddab6f739391169e'
@@ -65,6 +63,8 @@ if (-not (Test-Path $archive)) {
 
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path (Get-Location) 'target' }
 $binary = Join-Path $targetDir 'release\smbanything.exe'
+$wintun = Join-Path (Get-Location) 'vendor\wintun\wintun-amd64.dll'
+Copy-Item -Force $wintun (Join-Path (Split-Path $binary) 'wintun-amd64.dll')
 $work = Join-Path (Get-Location) 'tmp\smoke-work'
 if (Test-Path $work) { Remove-Item -Recurse -Force $work }
 $runtimeTmp = Join-Path $work 'runtime-tmp'
@@ -79,7 +79,7 @@ $server = $null
 $drive = $null
 try {
     $server = Start-Process -FilePath $binary `
-        -ArgumentList @($archive, '--port', '0') `
+        -ArgumentList @($archive, '--smb-tun') `
         -RedirectStandardOutput $stdout `
         -RedirectStandardError $stderr `
         -PassThru
@@ -112,8 +112,37 @@ try {
         Select-Object -First 1
     if (-not $drive) { throw 'no unused drive letter is available for the SMB smoke' }
 
-    $unc = "\\127.0.0.1\anything\$folder"
-    $mapOutput = & net.exe use "${drive}:" $unc 'ci-smoke-password' /user:smbanything "/TCPPORT:$port" 2>&1
+    if ($port -ne 445) { throw "packet tunnel reported port $port instead of 445" }
+
+    # A client whose handshake and FIN are processed in the same batch reaches
+    # the tunnel already in CLOSE-WAIT and never appears as ESTABLISHED. Bridge
+    # slots are a fixed pool, so one that is not recycled is retired for the
+    # life of the process. Three times the pool, then the mapping below: both
+    # have to survive.
+    # The server's banner only means its own threads are up: Windows still has
+    # to finish installing the adapter address and the /32 route before it will
+    # route anything to the tunnel. Wait for the first connection to land.
+    $ready = $false
+    foreach ($attempt in 1..100) {
+        $client = [Net.Sockets.TcpClient]::new()
+        try { $client.Connect('169.254.255.1', 445); $ready = $true } catch { }
+        finally { $client.Dispose() }
+        if ($ready) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $ready) { throw 'the packet tunnel never accepted a connection on 169.254.255.1:445' }
+
+    Write-Host '[smoke] probing the bridge pool with connect-then-close clients'
+    foreach ($probe in 1..24) {
+        $client = [Net.Sockets.TcpClient]::new()
+        try { $client.Connect('169.254.255.1', 445) }
+        catch { throw "connect-then-close client ${probe}: $($_.Exception.Message) — the bridge pool is not recycling" }
+        finally { $client.Dispose() }
+        Start-Sleep -Milliseconds 20
+    }
+
+    $unc = "\\169.254.255.1\anything\$folder"
+    $mapOutput = & net.exe use "${drive}:" $unc 'ci-smoke-password' /user:smbanything 2>&1
     $mapCode = $LASTEXITCODE
     $mapOutput | ForEach-Object { Write-Host "$_" }
     if ($mapCode -ne 0) { throw "net use failed with exit code $mapCode" }
@@ -121,7 +150,7 @@ try {
     $servedFile = "${drive}:\candle-0.11.0\Cargo.toml"
     $actualHash = (Get-FileHash -Algorithm SHA256 $servedFile).Hash.ToLowerInvariant()
     if ($actualHash -ne $expectedHash) { throw "served file hash mismatch: $actualHash" }
-    Write-Host "[smoke] verified candle-0.11.0.tar.gz ($actualHash)"
+    Write-Host "[smoke] verified candle-0.11.0.tar.gz through 169.254.255.1 ($actualHash)"
 }
 finally {
     if ($drive) {
@@ -131,6 +160,17 @@ finally {
         Stop-Process -Id $server.Id -Force
         Wait-Process -Id $server.Id -ErrorAction SilentlyContinue
     }
+}
+
+foreach ($attempt in 1..100) {
+    $adapter = Get-NetAdapter -Name 'smbanything' -ErrorAction SilentlyContinue
+    $routes = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.DestinationPrefix -like '169.254.255.*' }
+    if (-not $adapter -and -not $routes) { break }
+    Start-Sleep -Milliseconds 50
+}
+if ($adapter -or $routes) {
+    throw 'the packet tunnel left its adapter or 169.254.255.* routes behind'
 }
 
 if (Get-ChildItem -Force $runtimeTmp | Select-Object -First 1) {

@@ -62,15 +62,19 @@ jobs:
           - runner: ubuntu-latest
             label: linux-amd64
             ext: ""
+            artifact: target/release/smbanything-linux-amd64
           - runner: ubuntu-24.04-arm
             label: linux-arm64
             ext: ""
+            artifact: target/release/smbanything-linux-arm64
           - runner: macos-latest
             label: macos-arm64
             ext: ""
+            artifact: target/release/smbanything-macos-arm64
           - runner: windows-latest
             label: windows-amd64
             ext: ".exe"
+            artifact: target/release/smbanything-windows-amd64.zip
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -85,11 +89,21 @@ jobs:
         shell: bash
         run: mv target/release/smbanything${{ matrix.ext }} target/release/smbanything-${{ matrix.label }}${{ matrix.ext }}
 
+      - name: Package Windows binary and Wintun driver
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path target/release/smbanything-windows-amd64 | Out-Null
+          Copy-Item target/release/smbanything-windows-amd64.exe target/release/smbanything-windows-amd64/smbanything.exe
+          Copy-Item vendor/wintun/wintun-amd64.dll target/release/smbanything-windows-amd64/
+          Copy-Item vendor/wintun/LICENSE.txt target/release/smbanything-windows-amd64/WINTUN-LICENSE.txt
+          Compress-Archive -Path target/release/smbanything-windows-amd64/* -DestinationPath target/release/smbanything-windows-amd64.zip
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: smbanything-${{ matrix.label }}
-          path: target/release/smbanything-${{ matrix.label }}${{ matrix.ext }}
+          path: ${{ matrix.artifact }}
           if-no-files-found: error
 
   create-release:

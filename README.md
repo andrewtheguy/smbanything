@@ -41,6 +41,8 @@ Useful options:
 -s, --share <NAME>   SMB share name (default: anything)
 -u, --user <NAME>    SMB username (default: smbanything)
     --bind-all       Listen on every network interface
+    --smb-tun        Serve port 445 through a private packet tunnel
+    --smb-tun-ip     Tunnel address (default: 169.254.255.1)
 ```
 
 Run `smbanything --help` for the complete command-line help. Set
@@ -74,6 +76,35 @@ net use Z: \\127.0.0.1\anything\<8-hex-id> * /user:smbanything /TCPPORT:4456
 Older Windows clients require SMB's standard port 445. On Unix, binding that
 privileged port normally requires root or `CAP_NET_BIND_SERVICE`; it can also
 conflict with an SMB server already running on the host.
+
+## Packet tunnel
+
+`--smb-tun` serves the share at `169.254.255.1:445` without binding a host TCP
+socket to port 445. It creates a temporary L3 adapter, assigns
+`169.254.255.2/32` to it, and routes only `169.254.255.1/32` through it. A
+userspace TCP stack answers the first address and proxies authenticated SMB to
+the private loopback listener. The adapter and routes disappear when the
+process stops.
+
+```sh
+# Linux and macOS: /dev/net/tun and utun are native OS facilities.
+sudo -E ./target/release/smbanything archive.tar.gz --smb-tun
+
+# Choose another pair when the default is already in use.
+sudo -E ./target/release/smbanything archive.tar.gz \
+  --smb-tun --smb-tun-ip 169.254.255.3
+```
+
+Linux and macOS need no driver file. Windows has no native TUN API, so the
+Windows release is a ZIP containing `smbanything.exe`, the pinned
+`wintun-amd64.dll`, and Wintun's license; keep the DLL beside the executable
+and run from an elevated terminal. The DLL is hash-verified before it is
+loaded.
+
+The default pair is in the RFC 3927 link-local block reserved from APIPA
+autoconfiguration. Neither address is routed off the machine. Because the
+tunnel uses the standard port, clients use plain paths such as
+`\\169.254.255.1\anything\<8-hex-id>` and no `/TCPPORT` option is needed.
 
 ## Archive behavior
 

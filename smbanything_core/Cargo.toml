@@ -15,3 +15,30 @@ rc4 = "0.2"
 sha2 = "0.11"
 subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+# Linux uses /dev/net/tun and macOS uses utun. The crate configures those
+# native interfaces; neither platform has or needs a sidecar driver.
+libc = "0.2"
+tun = "0.8.14"
+
+[target.'cfg(windows)'.dependencies]
+# Windows has no native TUN API. Wintun supplies the L3 device that lets the
+# userspace stack serve port 445 without competing with srvnet.sys.
+windows-sys = { version = "0.61", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+wintun = "0.5"
+
+[dependencies.smoltcp]
+version = "0.13"
+default-features = false
+features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+    "auto-icmp-echo-reply",
+]
