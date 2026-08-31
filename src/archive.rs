@@ -98,13 +98,22 @@ impl ArchiveBacking {
             .extension()
             .and_then(|extension| extension.to_str())
             .map(str::to_ascii_lowercase);
+        let tar_gz = extension.as_deref() == Some("gz")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.to_ascii_lowercase().ends_with(".tar"));
         match extension.as_deref() {
             Some("zip") => Ok(Self(ArchiveKind::Zip(ZipBacking::open(path, label)?))),
             Some("tar") => Ok(Self(ArchiveKind::Tar(TarBacking::open(path, label)?))),
+            Some("tgz") => Ok(Self(ArchiveKind::Tar(TarBacking::open_gzip(path, label)?))),
+            Some("gz") if tar_gz => {
+                Ok(Self(ArchiveKind::Tar(TarBacking::open_gzip(path, label)?)))
+            }
             Some(extension) => bail!(
-                "unsupported archive extension .{extension}; expected .zip or .tar"
+                "unsupported archive extension .{extension}; expected .zip, .tar, .tar.gz, or .tgz"
             ),
-            None => bail!("archive path must end in .zip or .tar"),
+            None => bail!("archive path must end in .zip, .tar, .tar.gz, or .tgz"),
         }
     }
 
@@ -460,16 +469,48 @@ mod tests {
     }
 
     #[test]
-    fn gzip_and_unknown_extensions_are_rejected() {
-        for suffix in [".tar.gz", ".tgz", ".rar"] {
+    fn unknown_extensions_are_rejected() {
+        for suffix in [".rar", ".gz", ".tarball.gz"] {
             let temp = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
             let error = ArchiveBacking::open(temp.path(), "fixture")
                 .err()
                 .expect("unsupported extension must fail");
             assert!(
-                error.to_string().contains("expected .zip or .tar"),
+                error
+                    .to_string()
+                    .contains("expected .zip, .tar, .tar.gz, or .tgz"),
                 "{suffix}: {error:#}"
             );
+        }
+    }
+
+    #[test]
+    fn gzip_tar_extensions_dispatch_to_the_tar_backing() {
+        use std::io::Write as _;
+
+        for suffix in [".tar.gz", ".TAR.GZ", ".tgz"] {
+            let mut tar_bytes = Vec::new();
+            let mut writer = ::tar::Builder::new(&mut tar_bytes);
+            let mut header = ::tar::Header::new_gnu();
+            header.set_size(5);
+            header.set_mode(0o644);
+            header.set_cksum();
+            writer.append_data(&mut header, "hello.txt", &b"hello"[..]).unwrap();
+            writer.finish().unwrap();
+            drop(writer);
+
+            let temp = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+            let mut encoder = flate2::write::GzEncoder::new(
+                temp.reopen().unwrap(),
+                flate2::Compression::default(),
+            );
+            encoder.write_all(&tar_bytes).unwrap();
+            encoder.finish().unwrap();
+
+            let backing = ArchiveBacking::open(temp.path(), "fixture").unwrap();
+            assert_eq!(backing.file_count(), 1, "{suffix}");
+            let file = backing.open(&smb_path("hello.txt")).unwrap();
+            assert_eq!(&file.read_at(0, 5).unwrap()[..], b"hello", "{suffix}");
         }
     }
 }

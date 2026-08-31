@@ -753,12 +753,13 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "smbanything"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",
  "clap",
  "ctrlc",
+ "flate2",
  "sha2",
  "smbanything_core",
  "tar",

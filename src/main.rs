@@ -16,7 +16,7 @@ use smbanything_core::smb;
     about = "Serve a ZIP or TAR archive as an authenticated, read-only SMB 2.1 share"
 )]
 struct Args {
-    /// ZIP or uncompressed TAR archive to serve
+    /// ZIP, TAR, or gzip-compressed TAR archive to serve
     archive: PathBuf,
 
     /// TCP port to listen on (0 chooses an ephemeral port)
