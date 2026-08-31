@@ -212,19 +212,19 @@ impl FileReader for TarFile {
             .offset
             .checked_add(offset)
             .ok_or(status::INVALID_PARAMETER)?;
-        let mut buffer = vec![0u8; wanted];
-        let filled = match &self.source {
+        match &self.source {
             TarSource::Plain(source) => {
+                let mut buffer = vec![0u8; wanted];
                 let mut source = source
                     .lock()
                     .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
-                read_at(&mut *source, absolute_offset, &mut buffer)
-                    .map_err(|_| status::UNEXPECTED_IO_ERROR)?
+                let filled = read_at(&mut *source, absolute_offset, &mut buffer)
+                    .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+                buffer.truncate(filled);
+                Ok(Bytes::from(buffer))
             }
-            TarSource::Gzip(source) => return source.read_at(absolute_offset, wanted),
-        };
-        buffer.truncate(filled);
-        Ok(Bytes::from(buffer))
+            TarSource::Gzip(source) => source.read_at(absolute_offset, wanted),
+        }
     }
 }
 
@@ -294,11 +294,7 @@ impl GzipSource {
                                     buffer
                                 })
                                 .map_err(|_| ());
-                            let failed = result.is_err();
                             let _ = response.send(result);
-                            if failed {
-                                break;
-                            }
                         }
                         GzipRequest::Stop => break,
                     }
@@ -350,9 +346,27 @@ impl Drop for GzipSource {
 
 #[cfg(test)]
 mod tests {
+    use rapidgzip_core::DecodeError;
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    /// Extracts the decoder's typed failure, which reaches callers either
+    /// directly through `finish` or boxed inside the `io::Error` that the
+    /// decoding reader returns mid-stream.
+    fn decode_error(error: &anyhow::Error) -> &DecodeError {
+        error
+            .chain()
+            .find_map(|cause| {
+                cause.downcast_ref::<DecodeError>().or_else(|| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::get_ref)
+                        .and_then(|source| source.downcast_ref::<DecodeError>())
+                })
+            })
+            .unwrap_or_else(|| panic!("expected a decoder failure: {error:#}"))
+    }
 
     fn smb_path(path: &str) -> SmbPath {
         SmbPath::parse(path).expect("valid test SMB path")
@@ -585,7 +599,10 @@ mod tests {
             .err()
             .expect("oversized gzip must fail");
         assert!(
-            format!("{error:#}").contains("decoded output exceeded the 1024-byte limit"),
+            matches!(
+                decode_error(&error),
+                DecodeError::OutputLimitExceeded { limit: 1024 }
+            ),
             "{error:#}"
         );
     }
@@ -639,7 +656,13 @@ mod tests {
         let error = TarBacking::open_gzip(temp.path(), "fixture".to_string())
             .err()
             .expect("checksum mismatch must fail");
-        assert!(format!("{error:#}").contains("CRC32 mismatch"), "{error:#}");
+        assert!(
+            matches!(
+                decode_error(&error),
+                DecodeError::ChecksumMismatch { member: 0, .. }
+            ),
+            "{error:#}"
+        );
     }
 
     #[test]
