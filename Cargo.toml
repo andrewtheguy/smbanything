@@ -4,3 +4,27 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.5"
+hmac = "0.13"
+jiff = "0.2"
+md-5 = "0.11"
+md4 = "0.11"
+rand = "0.10.1"
+rc4 = "0.2"
+sha2 = "0.11"
+subtle = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
+zip = { version = "8.6", default-features = false, features = [
+    "bzip2",
+    "deflate64",
+    "deflate-flate2-zlib-rs",
+    "legacy-zip",
+    "lzma",
+    "ppmd",
+    "xz",
+    "zstd",
+] }
