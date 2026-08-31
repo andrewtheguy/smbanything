@@ -246,7 +246,22 @@ fn read_at<R: Read + Seek>(
     Ok(filled)
 }
 
+/// Upper bound on pooled gzip readers. Each reader owns its own clone of the
+/// checkpoint index and its own inflate state, so the pool stays small.
+const MAX_GZIP_READERS: usize = 4;
+
+/// A bounded pool of checkpoint-indexed gzip readers.
+///
+/// `IndexedReader` is not `Send`, so each reader lives on its own worker
+/// thread. Requests route stickily: a read continuing where a worker left off
+/// stays on that worker, so concurrent sequential streams keep hot readers
+/// instead of paying a checkpoint resume on every read.
 struct GzipSource {
+    workers: Vec<GzipWorker>,
+    router: Mutex<Router>,
+}
+
+struct GzipWorker {
     requests: mpsc::Sender<GzipRequest>,
     worker: Option<JoinHandle<()>>,
 }
@@ -260,12 +275,105 @@ enum GzipRequest {
     Stop,
 }
 
+struct Router {
+    routes: Vec<Route>,
+    clock: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Route {
+    next_offset: u64,
+    last_used: u64,
+}
+
+impl Router {
+    fn new(workers: usize) -> Self {
+        Self {
+            routes: vec![
+                Route {
+                    next_offset: 0,
+                    last_used: 0,
+                };
+                workers
+            ],
+            clock: 0,
+        }
+    }
+
+    /// Picks the worker whose reader already sits at `offset`, falling back to
+    /// the least recently used worker for non-sequential reads.
+    fn pick(&mut self, offset: u64, len: usize) -> usize {
+        let chosen = self
+            .routes
+            .iter()
+            .position(|route| route.next_offset == offset)
+            .unwrap_or_else(|| {
+                self.routes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, route)| route.last_used)
+                    .map(|(index, _)| index)
+                    .unwrap_or(0)
+            });
+        self.clock += 1;
+        self.routes[chosen] = Route {
+            next_offset: offset.saturating_add(len as u64),
+            last_used: self.clock,
+        };
+        chosen
+    }
+}
+
 impl GzipSource {
     fn start(compressed: File, index: DeflateIndex) -> Result<Self> {
+        let pool = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(MAX_GZIP_READERS);
+        let mut workers = Vec::with_capacity(pool);
+        for worker_index in 0..pool {
+            let compressed = compressed
+                .try_clone()
+                .context("cloning the gzip archive handle")?;
+            workers.push(GzipWorker::start(worker_index, compressed, index.clone())?);
+        }
+        Ok(Self {
+            router: Mutex::new(Router::new(workers.len())),
+            workers,
+        })
+    }
+
+    fn read_at(&self, offset: u64, len: usize) -> Result<Bytes, u32> {
+        let worker = {
+            let mut router = self
+                .router
+                .lock()
+                .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+            router.pick(offset, len)
+        };
+        let (response_sender, response_receiver) = mpsc::sync_channel(0);
+        self.workers[worker]
+            .requests
+            .send(GzipRequest::Read {
+                offset,
+                len,
+                response: response_sender,
+            })
+            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+        let buffer = response_receiver
+            .recv()
+            .map_err(|_| status::UNEXPECTED_IO_ERROR)?
+            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+        Ok(Bytes::from(buffer))
+    }
+}
+
+impl GzipWorker {
+    fn start(worker_index: usize, compressed: File, index: DeflateIndex) -> Result<Self> {
         let (request_sender, request_receiver) = mpsc::channel();
         let (initialization_sender, initialization_receiver) = mpsc::sync_channel(0);
         let worker = thread::Builder::new()
-            .name("smbanything-gzip-reader".to_string())
+            .name(format!("smbanything-gzip-reader-{worker_index}"))
             .spawn(move || {
                 let mut reader = match IndexedReader::new(compressed, index) {
                     Ok(reader) => {
@@ -300,7 +408,7 @@ impl GzipSource {
                     }
                 }
             })
-            .context("starting the checkpoint-indexed gzip reader")?;
+            .context("starting a checkpoint-indexed gzip reader")?;
 
         match initialization_receiver.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -317,25 +425,9 @@ impl GzipSource {
             }
         }
     }
-
-    fn read_at(&self, offset: u64, len: usize) -> Result<Bytes, u32> {
-        let (response_sender, response_receiver) = mpsc::sync_channel(0);
-        self.requests
-            .send(GzipRequest::Read {
-                offset,
-                len,
-                response: response_sender,
-            })
-            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
-        let buffer = response_receiver
-            .recv()
-            .map_err(|_| status::UNEXPECTED_IO_ERROR)?
-            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
-        Ok(Bytes::from(buffer))
-    }
 }
 
-impl Drop for GzipSource {
+impl Drop for GzipWorker {
     fn drop(&mut self) {
         let _ = self.requests.send(GzipRequest::Stop);
         if let Some(worker) = self.worker.take() {
@@ -565,6 +657,28 @@ mod tests {
             &contents[late_offset..late_offset + 4096]
         );
         assert_eq!(&file.read_at(17, 1024).unwrap()[..], &contents[17..1041]);
+
+        let contents = Arc::new(contents);
+        let streams: Vec<_> = (0..3)
+            .map(|stream| {
+                let file = file.clone();
+                let contents = contents.clone();
+                std::thread::spawn(move || {
+                    let start = stream * (1024 * 1024 + 61);
+                    for chunk in 0..24 {
+                        let offset = start + chunk * 4096;
+                        assert_eq!(
+                            &file.read_at(offset as u64, 4096).unwrap()[..],
+                            &contents[offset..offset + 4096],
+                            "stream {stream} chunk {chunk}"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for stream in streams {
+            stream.join().expect("concurrent sequential stream");
+        }
     }
 
     #[test]
