@@ -99,13 +99,14 @@ ZIP-specific behavior:
 
 TAR-specific behavior:
 
-- The headers are indexed at startup. File reads go directly to the entry's
-  byte range in the TAR, without extracting or copying its contents.
+- Uncompressed TAR headers are indexed at startup. File reads go directly to
+  the entry's byte range, without extracting or copying its contents.
 - Gzip-compressed archives (`.tar.gz`, `.tgz`, including multi-member gzip
-  streams) are decompressed once at startup into a temporary spill file, since
-  gzip has no random access. Reads are then served from that plain TAR, so the
-  decompressed size stays on disk — not in RAM — for the lifetime of the
-  process and is deleted on exit.
+  streams) are decompressed once at startup to index the TAR headers and build
+  an in-memory DEFLATE checkpoint index. The complete decompressed TAR is never
+  written to disk or retained in RAM. Reads resume from the nearest checkpoint,
+  trading some repeated decompression for bounded storage. Every gzip member's
+  CRC and uncompressed size are validated during startup.
 - Regular files and directories are supported. Symbolic links, hard links,
   sparse files, devices, FIFOs, and other special entry types are rejected.
 

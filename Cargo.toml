@@ -12,7 +12,7 @@ anyhow = "1"
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = { version = "3.5", features = ["termination"] }
-flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+rapidgzip-core = "0.3.1"
 sha2 = "0.11"
 smbanything_core = { path = "smbanything_core" }
 tar = "0.4"
@@ -27,3 +27,6 @@ zip = { version = "8.6", default-features = false, features = [
     "xz",
     "zstd",
 ] }
+
+[dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
