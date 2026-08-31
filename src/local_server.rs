@@ -36,7 +36,7 @@ fn bind_localhost_once(port: u16) -> Result<Vec<TcpListener>> {
     match bind_one(v6_addr, "IPv6") {
         Ok(v6) => Ok(vec![v4, v6]),
         Err(e) => {
-            eprintln!("smbzip: {e}; serving IPv4 loopback only");
+            eprintln!("smbanything: {e}; serving IPv4 loopback only");
             Ok(vec![v4])
         }
     }

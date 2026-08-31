@@ -1,7 +1,7 @@
 // Share enumeration, so the share can be *browsed* and not only addressed.
 //
-// Without this, a client that knows the full path works fine — `\\host\zip`,
-// `smb://host/zip` — but a client asked to list what a server offers gets
+// Without this, a client that knows the full path works fine — `\\host\anything`,
+// `smb://host/anything` — but a client asked to list what a server offers gets
 // nothing. In Explorer that is typing `\\host\` and getting an error after a
 // long wait; in Finder it is connecting to `smb://host` and being shown no
 // share to pick, leaving the user to navigate to the mount point by hand.
@@ -189,7 +189,7 @@ pub(crate) fn close(body: &[u8], pipe: &mut Option<Pipe>) -> Result<Vec<u8>, u32
 
 /// WRITE on the pipe: the client handing over a DCE/RPC request.
 ///
-/// This is the one write smbzip accepts anywhere, and it lands in
+/// This is the one write smbanything accepts anywhere, and it lands in
 /// `Pipe::pending` — an in-memory buffer bounded by `MAX_REQUEST`. It cannot
 /// reach an archive: the caller only routes here for a handle that is this pipe
 /// on an IPC$ tree.

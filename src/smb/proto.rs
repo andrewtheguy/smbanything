@@ -180,7 +180,7 @@ pub(crate) mod access {
     /// on the share cannot be launched from it, only copied off and run
     /// locally. Linux clients decide that from the mode instead, which comes
     /// from the mount's `file_mode=`/`dir_mode=` (0444/0555 in the mount
-    /// commands smbzip prints), because SMB 2.1 carries no POSIX mode.
+    /// commands smbanything prints), because SMB 2.1 carries no POSIX mode.
     pub(crate) const fn read_only(is_dir: bool) -> u32 {
         if is_dir {
             READ_ONLY_DIR

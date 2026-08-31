@@ -48,13 +48,13 @@
 // Mount it with — each prompts for the password, which is never passed as an
 // argument: a command line is readable by every other process while it runs,
 // and lands in shell (or console) history afterwards.
-//   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=smbzip,ro,\
-//                       file_mode=0444,dir_mode=0555 //127.0.0.1/zip/<id> /mnt
-//   macOS    Finder → Go → Connect to Server (Cmd+K): smb://smbzip@127.0.0.1:<p>/zip/<id>
-//   Windows  net use Z: \\127.0.0.1\zip\<id> * /user:smbzip   (add /TCPPORT:<p>)
+//   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=smbanything,ro,\
+//                       file_mode=0444,dir_mode=0555 //127.0.0.1/anything/<id> /mnt/smbanything
+//   macOS    Finder → Go → Connect to Server (Cmd+K): smb://smbanything@127.0.0.1:<p>/anything/<id>
+//   Windows  net use Z: \\127.0.0.1\anything\<id> * /user:smbanything   (add /TCPPORT:<p>)
 
 /// Whether to trace protocol traffic to stderr. Enabled by setting
-/// `SMBZIP_LOG` to anything.
+/// `SMBANYTHING_LOG` to anything.
 ///
 /// Worth having permanently rather than as scaffolding: when a client refuses a
 /// mount it says nothing useful (Linux reports a bare -EIO or -EINVAL, macOS
@@ -62,7 +62,7 @@
 /// was rejected and why.
 pub(crate) fn log_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("SMBZIP_LOG").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("SMBANYTHING_LOG").is_some())
 }
 
 /// Wall-clock stamp for a trace line, to millisecond resolution.
@@ -173,8 +173,8 @@ fn status_name(status: u32) -> String {
 /// keep a client from claiming an unbounded window.
 const MAX_CREDITS: u16 = 512;
 
-/// The default share name clients connect to: `\\127.0.0.1\zip`.
-pub(crate) const DEFAULT_SHARE_NAME: &str = "zip";
+/// The default share name clients connect to: `\\127.0.0.1\anything`.
+pub(crate) const DEFAULT_SHARE_NAME: &str = "anything";
 
 /// SMB's registered port, and the only one a Windows UNC path will ever try.
 /// A share reachable here needs no port option in any mount command, and works
@@ -182,7 +182,7 @@ pub(crate) const DEFAULT_SHARE_NAME: &str = "zip";
 pub(crate) const STANDARD_SMB_PORT: u16 = 445;
 
 /// The default account clients authenticate as; the CLI can override it.
-pub(crate) const DEFAULT_SHARE_USER: &str = "smbzip";
+pub(crate) const DEFAULT_SHARE_USER: &str = "smbanything";
 
 /// A short random password for a share.
 ///
@@ -354,7 +354,7 @@ fn privileged_hint(e: anyhow::Error, port: u16) -> anyhow::Error {
     anyhow!(
         "{e}\n\nPort {port} is privileged. Either run the whole command under \
 sudo -E, or grant the binary the capability once:\n  \
-sudo setcap cap_net_bind_service=+ep <path-to-smbzip>\n\
+sudo setcap cap_net_bind_service=+ep <path-to-smbanything>\n\
 (setcap must be re-applied after every rebuild.)"
     )
 }
@@ -426,7 +426,7 @@ pub(crate) fn start(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let join = thread::Builder::new()
-        .name(format!("smbzip-{bound_port}"))
+        .name(format!("smbanything-{bound_port}"))
         .spawn(move || {
             // Multi-thread rather than current-thread: ZIP decompression is
             // blocking, and `block_in_place` (below) requires a runtime that can
@@ -1151,7 +1151,7 @@ impl Conn {
 
             cmd::ECHO => Ok(Reply::ok(session::simple_ack())),
 
-            // The one write smbzip accepts: a DCE/RPC request handed to the
+            // The one write smbanything accepts: a DCE/RPC request handed to the
             // srvsvc pipe on IPC$, which lands in a bounded in-memory buffer.
             // Everything else, on any tree, stays refused at the protocol level
             // so a client learns the share is read-only from the operation
@@ -1632,7 +1632,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\zip"),
+                &tree_connect_body(r"\\127.0.0.1\anything"),
             ))
             .expect("tree connect answered");
         let h = parse_response(&resp);
@@ -1644,7 +1644,12 @@ mod tests {
     fn commands_before_authentication_are_refused() {
         let mut conn = Conn::new(ctx());
         let resp = conn
-            .handle_message(&request(cmd::TREE_CONNECT, 0, 0, &tree_connect_body("zip")))
+            .handle_message(&request(
+                cmd::TREE_CONNECT,
+                0,
+                0,
+                &tree_connect_body("anything"),
+            ))
             .expect("answered");
         assert_eq!(parse_response(&resp).status, status::USER_SESSION_DELETED);
     }
@@ -1657,7 +1662,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id ^ 0xFFFF,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\zip"),
+                &tree_connect_body(r"\\127.0.0.1\anything"),
             ))
             .expect("answered");
         assert_eq!(parse_response(&resp).status, status::USER_SESSION_DELETED);
@@ -1700,7 +1705,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\zip"),
+                &tree_connect_body(r"\\127.0.0.1\anything"),
             ))
             .expect("answered");
         assert_eq!(parse_response(&resp).status, status::USER_SESSION_DELETED);
@@ -1982,7 +1987,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\zip"),
+                &tree_connect_body(r"\\127.0.0.1\anything"),
             ))
             .expect("tree connect answered");
         parse_response(&resp).tree_id
@@ -2096,7 +2101,7 @@ mod tests {
             &[
                 (
                     cmd::TREE_CONNECT,
-                    tree_connect_body(r"\\127.0.0.1\zip"),
+                    tree_connect_body(r"\\127.0.0.1\anything"),
                     false,
                 ),
                 (cmd::CREATE, create_body_for("docs"), true),
@@ -2177,7 +2182,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\zip"),
+                &tree_connect_body(r"\\127.0.0.1\anything"),
             ))
             .unwrap();
         let tree_id = parse_response(&resp).tree_id;
@@ -2262,7 +2267,7 @@ mod tests {
         )
         .expect("server starts");
         assert_ne!(handle.port, 0);
-        assert_eq!(handle.unc(), r"\\127.0.0.1\zip");
+        assert_eq!(handle.unc(), r"\\127.0.0.1\anything");
         handle.stop();
     }
 
@@ -2357,7 +2362,7 @@ mod tests {
     #[test]
     #[ignore]
     fn smb_manual_server() {
-        let port: u16 = std::env::var("SMBZIP_PORT")
+        let port: u16 = std::env::var("SMBANYTHING_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4455);
@@ -2369,7 +2374,10 @@ mod tests {
             test_credentials(),
         )
         .expect("server starts");
-        eprintln!("serving \\\\127.0.0.1\\zip on port {}", handle.port);
+        eprintln!(
+            "serving \\\\127.0.0.1\\anything on port {}",
+            handle.port
+        );
         std::thread::sleep(std::time::Duration::from_secs(120));
         handle.stop();
     }
