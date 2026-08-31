@@ -64,7 +64,7 @@ pub(crate) struct OpenHandle {
     reader: Option<Arc<dyn FileReader>>,
     /// Directory listing, captured on the first QUERY_DIRECTORY.
     ///
-    /// The archive cannot change under us, so this is a cache rather than a
+    /// The backing cannot change under us, so this is a cache rather than a
     /// consistency device — but SMB directory enumeration is explicitly
     /// stateful (each call resumes where the last stopped), so the position has
     /// to live with the handle regardless.

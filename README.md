@@ -1,8 +1,9 @@
 # smbanything
 
-`smbanything` serves one unencrypted ZIP archive as an authenticated, read-only
-SMB 2.1 share. It is intended for browsing immutable archives without
-extracting their directory trees first.
+`smbanything` serves one ZIP or uncompressed TAR archive as an authenticated,
+read-only SMB 2.1 share. It is intended for browsing immutable archives without
+extracting their directory trees first. Gzip-compressed TAR archives are not
+supported.
 
 The SMB implementation is adapted from the immutable snapshot service in
 `wrustic`. It supports the operations needed to mount, list, stat, and read
@@ -15,6 +16,8 @@ message signing are required.
 ```sh
 cargo build --release
 ./target/release/smbanything archive.zip
+# or
+./target/release/smbanything archive.tar
 ```
 
 The default listener is IPv4 and IPv6 loopback on port 4456, with share name
@@ -71,21 +74,40 @@ Older Windows clients require SMB's standard port 445. On Unix, binding that
 privileged port normally requires root or `CAP_NET_BIND_SERVICE`; it can also
 conflict with an SMB server already running on the host.
 
-## ZIP behavior
+## Archive behavior
+
+- The archive format is selected from a case-insensitive `.zip` or `.tar`
+  extension. `.tar.gz`, `.tgz`, and other formats are rejected.
+- Parent directories omitted from the archive are synthesized automatically.
+- Paths must be valid UTF-8. Unsafe paths, names SMB cannot represent,
+  duplicate paths, and case-insensitive collisions are rejected.
+- The source archive is opened read-only and never modified. Do not modify it
+  in place while it is being served.
+
+ZIP-specific behavior:
 
 - Only unencrypted entries are accepted. If any entry is encrypted, startup
   fails before the listener is created.
 - Stored, Deflate, Deflate64, Bzip2, LZMA, PPMd, XZ, Zstandard, and legacy ZIP
   compression methods supported by the Rust `zip` library are enabled.
-- The central directory is indexed at startup. Parent directories omitted from
-  the archive are synthesized automatically.
-- Unsafe paths, names SMB cannot represent, duplicate paths,
-  case-insensitive collisions, and overlapping compressed data are rejected.
+- The central directory is indexed at startup, and overlapping compressed data
+  is rejected.
 - File data is decompressed lazily on first open into an anonymous temporary
   file. This gives efficient positional reads while bounding RAM use. Cached
   data is deleted by the operating system when the process exits.
-- The source ZIP is opened read-only and never modified. Do not modify the
-  archive in place while it is being served.
+
+TAR-specific behavior:
+
+- The headers are indexed at startup. File reads go directly to the entry's
+  byte range in the TAR, without extracting or copying its contents.
+- Regular files and directories are supported. Symbolic links, hard links,
+  sparse files, devices, FIFOs, and other special entry types are rejected.
+
+## Crate layout
+
+`smbanything_core` contains the archive-independent SMB server, authentication,
+protocol handling, and read-only backing interfaces. ZIP and TAR parsing stays
+in the `smbanything` application crate.
 
 ## Security boundary
 

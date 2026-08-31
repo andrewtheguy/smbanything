@@ -27,7 +27,7 @@
 // The read-only guarantee is preserved. `WRITE` remains
 // MEDIA_WRITE_PROTECTED everywhere except a handle that is this pipe on an
 // IPC$ tree, where it writes into a bounded in-memory buffer and never touches
-// the archive. There is still no code path that could modify archive data.
+// disk backing data. There is still no code path that could modify it.
 
 use super::proto::status;
 use super::wire::{Reader, Writer, from_utf16le, utf16le};
@@ -35,7 +35,7 @@ use super::wire::{Reader, Writer, from_utf16le, utf16le};
 /// The file id the srvsvc pipe is opened as.
 ///
 /// A fixed sentinel rather than an entry in `Handles`: that table is built
-/// around archive files (paths, readers, directory cursors), none of which a
+/// around disk files (paths, readers, directory cursors), none of which a
 /// pipe has, and a connection can hold at most one IPC$ tree and therefore at
 /// most one of these. Chosen far above anything `Handles` allocates — it counts
 /// up from 1 — and clear of the `u64::MAX` compound placeholder.
@@ -154,7 +154,7 @@ pub(crate) fn create(body: &[u8], message: &[u8], pipe: &mut Option<Pipe>) -> Re
 /// Check that a request naming a file id is naming *this* pipe.
 ///
 /// The pipe lives outside `Handles` and answers to one fixed id, so without
-/// this any id at all — a stale one, an archive handle's — would reach it once
+/// this any id at all — a stale one, a disk handle's — would reach it once
 /// an IPC$ tree was connected.
 fn check_file_id(r: &mut Reader<'_>) -> Result<(), u32> {
     let persistent = r.u64().map_err(|_| status::INVALID_PARAMETER)?;
@@ -191,7 +191,7 @@ pub(crate) fn close(body: &[u8], pipe: &mut Option<Pipe>) -> Result<Vec<u8>, u32
 ///
 /// This is the one write smbanything accepts anywhere, and it lands in
 /// `Pipe::pending` — an in-memory buffer bounded by `MAX_REQUEST`. It cannot
-/// reach an archive: the caller only routes here for a handle that is this pipe
+/// reach disk data: the caller only routes here for a handle that is this pipe
 /// on an IPC$ tree.
 pub(crate) fn write(
     body: &[u8],
@@ -660,7 +660,7 @@ fn net_share_enum(share_name: &str, level: u32) -> Vec<u8> {
 
     ndr_string(&mut w, share_name);
     // A remark is required to be present but may be empty; nothing useful can
-    // be said about an archive share that its name does not already say.
+    // be said about this share that its name does not already say.
     ndr_string(&mut w, "");
 
     w.u32(1); // TotalEntries

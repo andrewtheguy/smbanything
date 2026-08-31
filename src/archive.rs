@@ -1,65 +1,18 @@
-// Storage seam between the SMB protocol and an immutable ZIP archive.
+// Archive-specific implementations of the core SMB backing interface.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
+use smbanything_core::smb::{
+    Backing, FileReader, NodeInfo, NodeKind, SmbPath, status,
+};
 use zip::ZipArchive;
-
-use super::path::SmbPath;
-use super::proto::status;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeKind {
-    File,
-    Dir,
-}
-
-impl NodeKind {
-    pub(crate) fn is_dir(self) -> bool {
-        matches!(self, Self::Dir)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct NodeInfo {
-    pub(crate) name: String,
-    pub(crate) kind: NodeKind,
-    pub(crate) size: u64,
-    pub(crate) mtime: SystemTime,
-    pub(crate) atime: SystemTime,
-    pub(crate) ctime: SystemTime,
-}
-
-impl NodeInfo {
-    pub(crate) fn synthetic_dir(name: &str, now: SystemTime) -> Self {
-        Self {
-            name: name.to_string(),
-            kind: NodeKind::Dir,
-            size: 0,
-            mtime: now,
-            atime: now,
-            ctime: now,
-        }
-    }
-}
-
-pub(crate) trait FileReader: Send + Sync {
-    fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, u32>;
-}
-
-pub(crate) trait Backing: Send + Sync {
-    fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32>;
-    fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32>;
-    fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32>;
-    fn label(&self) -> &str;
-    fn total_size(&self) -> u64;
-}
 
 /// Places one backing beneath a single directory at the share root.
 ///
@@ -135,23 +88,32 @@ type CacheSlot = Arc<Mutex<Option<Arc<CachedFile>>>>;
 #[derive(Clone)]
 struct Entry {
     info: NodeInfo,
-    zip_index: Option<usize>,
-    // The first open expands this entry into an anonymous temporary file.
-    // Later SMB handles reuse it, giving true positional reads without keeping
-    // a potentially enormous decompressed entry in RAM.
-    cache: Option<CacheSlot>,
+    content: Option<EntryContent>,
+}
+
+#[derive(Clone)]
+enum EntryContent {
+    Zip {
+        index: usize,
+        // The first open expands this entry into an anonymous temporary file.
+        // Later SMB handles reuse it, giving true positional reads without
+        // keeping a potentially enormous decompressed entry in RAM.
+        cache: CacheSlot,
+    },
+    Tar {
+        offset: u64,
+    },
 }
 
 impl Entry {
     fn dir(name: &str, timestamp: SystemTime) -> Self {
         Self {
             info: NodeInfo::synthetic_dir(name, timestamp),
-            zip_index: None,
-            cache: None,
+            content: None,
         }
     }
 
-    fn file(name: &str, size: u64, timestamp: SystemTime, zip_index: usize) -> Self {
+    fn file(name: &str, size: u64, timestamp: SystemTime, content: EntryContent) -> Self {
         Self {
             info: NodeInfo {
                 name: name.to_string(),
@@ -161,9 +123,24 @@ impl Entry {
                 atime: timestamp,
                 ctime: timestamp,
             },
-            zip_index: Some(zip_index),
-            cache: Some(Arc::new(Mutex::new(None))),
+            content: Some(content),
         }
+    }
+
+    fn zip_file(name: &str, size: u64, timestamp: SystemTime, index: usize) -> Self {
+        Self::file(
+            name,
+            size,
+            timestamp,
+            EntryContent::Zip {
+                index,
+                cache: Arc::new(Mutex::new(None)),
+            },
+        )
+    }
+
+    fn tar_file(name: &str, size: u64, timestamp: SystemTime, offset: u64) -> Self {
+        Self::file(name, size, timestamp, EntryContent::Tar { offset })
     }
 }
 
@@ -173,13 +150,18 @@ impl Entry {
 /// fills the disk.
 const MAX_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// A ZIP archive indexed once when the service starts.
+enum ArchiveSource {
+    Zip(Mutex<ZipArchive<File>>),
+    Tar(Arc<Mutex<File>>),
+}
+
+/// A ZIP or uncompressed TAR archive indexed once when the service starts.
 ///
 /// The source file is opened read-only and kept open for the server lifetime,
 /// so replacing its pathname cannot silently switch the mounted contents to a
 /// different archive. Callers must not modify the file in place while serving.
-pub(crate) struct ZipBacking {
-    archive: Mutex<ZipArchive<File>>,
+pub(crate) struct ArchiveBacking {
+    source: ArchiveSource,
     // Keys are Unicode-lowercased components. SMB paths are case-insensitive;
     // rejecting collisions during indexing gives every client spelling one
     // unambiguous entry.
@@ -192,8 +174,23 @@ pub(crate) struct ZipBacking {
     expanded: Mutex<ExpandedCache>,
 }
 
-impl ZipBacking {
+impl ArchiveBacking {
     pub(crate) fn open(path: &Path, label: impl Into<String>) -> Result<Self> {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        match extension.as_deref() {
+            Some("zip") => Self::open_zip(path, label.into()),
+            Some("tar") => Self::open_tar(path, label.into()),
+            Some(extension) => bail!(
+                "unsupported archive extension .{extension}; expected .zip or .tar"
+            ),
+            None => bail!("archive path must end in .zip or .tar"),
+        }
+    }
+
+    fn open_zip(path: &Path, label: String) -> Result<Self> {
         let file =
             File::open(path).with_context(|| format!("opening ZIP archive {}", path.display()))?;
         let timestamp = file
@@ -240,7 +237,7 @@ impl ZipBacking {
                 })?);
             }
 
-            let components = parse_zip_path(&raw_name, is_dir)?;
+            let components = parse_archive_path(&raw_name, is_dir, "ZIP")?;
             if components.is_empty() {
                 // A conventional root entry (`/`) carries no content and adds
                 // nothing to the synthetic share root.
@@ -250,11 +247,11 @@ impl ZipBacking {
             // ZIP archives do not require explicit directory records. Build
             // every missing parent so those archives still form a real tree.
             for depth in 1..components.len() {
-                insert_directory(&mut entries, &components[..depth], timestamp)?;
+                insert_directory(&mut entries, &components[..depth], timestamp, "ZIP")?;
             }
 
             if is_dir {
-                insert_directory(&mut entries, &components, timestamp)?;
+                insert_directory(&mut entries, &components, timestamp, "ZIP")?;
                 continue;
             }
 
@@ -271,7 +268,7 @@ impl ZipBacking {
                 );
             }
             let name = components.last().expect("non-empty path");
-            entries.insert(key, Entry::file(name, size, timestamp, zip_index));
+            entries.insert(key, Entry::zip_file(name, size, timestamp, zip_index));
             total_size = total_size.saturating_add(size);
             file_count += 1;
         }
@@ -284,9 +281,114 @@ impl ZipBacking {
         }
 
         Ok(Self {
-            archive: Mutex::new(archive),
+            source: ArchiveSource::Zip(Mutex::new(archive)),
             entries,
-            label: label.into(),
+            label,
+            total_size,
+            file_count,
+            expanded: Mutex::new(ExpandedCache::new(MAX_EXPANDED_BYTES)),
+        })
+    }
+
+    fn open_tar(path: &Path, label: String) -> Result<Self> {
+        let file =
+            File::open(path).with_context(|| format!("opening TAR archive {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("reading TAR archive metadata from {}", path.display()))?;
+        let archive_size = metadata.len();
+        let archive_timestamp = metadata.modified().unwrap_or_else(|_| SystemTime::now());
+        let scanner = file
+            .try_clone()
+            .with_context(|| format!("cloning TAR archive handle for {}", path.display()))?;
+        let source = Arc::new(Mutex::new(file));
+        let mut archive = tar::Archive::new(scanner);
+
+        let mut entries = BTreeMap::new();
+        entries.insert(Vec::new(), Entry::dir("", archive_timestamp));
+        let mut total_size = 0u64;
+        let mut file_count = 0usize;
+
+        for (tar_index, tar_entry) in archive
+            .entries_with_seek()
+            .with_context(|| format!("reading TAR entries from {}", path.display()))?
+            .enumerate()
+        {
+            let mut tar_entry =
+                tar_entry.with_context(|| format!("reading TAR entry {tar_index}"))?;
+            let path_bytes = tar_entry.path_bytes();
+            let raw_name = std::str::from_utf8(&path_bytes)
+                .with_context(|| format!("TAR entry {tar_index} path is not valid UTF-8"))?
+                .to_string();
+            let entry_type = tar_entry.header().entry_type();
+            if entry_type.is_pax_global_extensions() {
+                let extensions = tar_entry
+                    .pax_extensions()
+                    .with_context(|| format!("reading global PAX header {raw_name:?}"))?
+                    .ok_or_else(|| anyhow!("global PAX header {raw_name:?} has no records"))?;
+                for extension in extensions {
+                    extension.with_context(|| {
+                        format!("reading record in global PAX header {raw_name:?}")
+                    })?;
+                }
+                continue;
+            }
+            let is_dir = entry_type.is_dir();
+            if !is_dir && !entry_type.is_file() {
+                bail!("TAR entry {raw_name:?} has unsupported type {entry_type:?}");
+            }
+            let size = if is_dir { 0 } else { tar_entry.size() };
+            let offset = tar_entry.raw_file_position();
+            let end = offset
+                .checked_add(size)
+                .ok_or_else(|| anyhow!("TAR entry {raw_name:?} data range overflows u64"))?;
+            if end > archive_size {
+                bail!(
+                    "TAR entry {raw_name:?} extends past the end of the archive"
+                );
+            }
+            let timestamp = tar_entry
+                .header()
+                .mtime()
+                .ok()
+                .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+                .unwrap_or(archive_timestamp);
+            let components = parse_archive_path(&raw_name, is_dir, "TAR")?;
+            if components.is_empty() {
+                continue;
+            }
+
+            for depth in 1..components.len() {
+                insert_directory(&mut entries, &components[..depth], timestamp, "TAR")?;
+            }
+
+            if is_dir {
+                insert_directory(&mut entries, &components, timestamp, "TAR")?;
+                continue;
+            }
+
+            let key = normalized_key(&components);
+            if let Some(existing) = entries.get(&key) {
+                bail!(
+                    "TAR path {raw_name:?} conflicts with existing {} {:?}",
+                    if existing.info.kind.is_dir() {
+                        "directory"
+                    } else {
+                        "file"
+                    },
+                    display_components(&components)
+                );
+            }
+            let name = components.last().expect("non-empty path");
+            entries.insert(key, Entry::tar_file(name, size, timestamp, offset));
+            total_size = total_size.saturating_add(size);
+            file_count += 1;
+        }
+
+        Ok(Self {
+            source: ArchiveSource::Tar(source),
+            entries,
+            label,
             total_size,
             file_count,
             expanded: Mutex::new(ExpandedCache::new(MAX_EXPANDED_BYTES)),
@@ -301,9 +403,13 @@ impl ZipBacking {
         self.entries.get(&key_for_smb_path(path))
     }
 
-    fn expand(&self, entry: &Entry, path: &SmbPath) -> Result<Arc<CachedFile>, u32> {
-        let zip_index = entry.zip_index.ok_or(status::FILE_IS_A_DIRECTORY)?;
-        let slot = entry.cache.as_ref().ok_or(status::UNEXPECTED_IO_ERROR)?;
+    fn expand_zip(
+        &self,
+        entry: &Entry,
+        path: &SmbPath,
+        zip_index: usize,
+        slot: &CacheSlot,
+    ) -> Result<Arc<CachedFile>, u32> {
         let key = key_for_smb_path(path);
 
         // The slot lock is held across the decompression below, so a hit is
@@ -327,8 +433,10 @@ impl ZipBacking {
         }
 
         let result = (|| -> Result<Arc<CachedFile>> {
-            let mut archive = self
-                .archive
+            let ArchiveSource::Zip(archive) = &self.source else {
+                return Err(anyhow!("ZIP entry is not backed by a ZIP archive"));
+            };
+            let mut archive = archive
                 .lock()
                 .map_err(|_| anyhow!("ZIP archive lock was poisoned"))?;
             let mut source = archive
@@ -368,7 +476,12 @@ impl ZipBacking {
                 Ok(file)
             }
             Err(error) => {
-                smb_log!("open {:?} failed: {error:#}", path.to_smb_absolute());
+                if std::env::var_os("SMBANYTHING_LOG").is_some() {
+                    eprintln!(
+                        "[archive] open {:?} failed: {error:#}",
+                        path.to_smb_absolute()
+                    );
+                }
                 Err(status::UNEXPECTED_IO_ERROR)
             }
         }
@@ -500,7 +613,7 @@ impl ExpandedCache {
     }
 }
 
-impl Backing for ZipBacking {
+impl Backing for ArchiveBacking {
     fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32> {
         self.entry(path)
             .map(|entry| entry.info.clone())
@@ -527,11 +640,23 @@ impl Backing for ZipBacking {
 
     fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
         let entry = self.entry(path).ok_or(status::OBJECT_NAME_NOT_FOUND)?;
-        if entry.info.kind.is_dir() {
-            return Err(status::FILE_IS_A_DIRECTORY);
+        match entry.content.as_ref() {
+            None => Err(status::FILE_IS_A_DIRECTORY),
+            Some(EntryContent::Zip { index, cache }) => {
+                let file: Arc<dyn FileReader> = self.expand_zip(entry, path, *index, cache)?;
+                Ok(file)
+            }
+            Some(EntryContent::Tar { offset }) => {
+                let ArchiveSource::Tar(file) = &self.source else {
+                    return Err(status::UNEXPECTED_IO_ERROR);
+                };
+                Ok(Arc::new(TarFile {
+                    file: file.clone(),
+                    offset: *offset,
+                    size: entry.info.size,
+                }))
+            }
         }
-        let file: Arc<dyn FileReader> = self.expand(entry, path)?;
-        Ok(file)
     }
 
     fn label(&self) -> &str {
@@ -547,13 +672,14 @@ fn insert_directory(
     entries: &mut BTreeMap<Vec<String>, Entry>,
     components: &[String],
     timestamp: SystemTime,
+    format: &str,
 ) -> Result<()> {
     let key = normalized_key(components);
     if let Some(existing) = entries.get(&key) {
         let expected_name = components.last().expect("non-root directory");
         if !existing.info.kind.is_dir() || existing.info.name != *expected_name {
             bail!(
-                "ZIP directory {:?} conflicts with an existing path",
+                "{format} directory {:?} conflicts with an existing path",
                 display_components(components)
             );
         }
@@ -564,7 +690,7 @@ fn insert_directory(
     Ok(())
 }
 
-fn parse_zip_path(raw: &str, is_dir: bool) -> Result<Vec<String>> {
+fn parse_archive_path(raw: &str, is_dir: bool, format: &str) -> Result<Vec<String>> {
     let path = if is_dir {
         raw.strip_suffix('/').unwrap_or(raw)
     } else {
@@ -574,13 +700,13 @@ fn parse_zip_path(raw: &str, is_dir: bool) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
     if path.starts_with('/') {
-        bail!("ZIP entry {raw:?} has an absolute path");
+        bail!("{format} entry {raw:?} has an absolute path");
     }
 
     let mut components = Vec::new();
     for component in path.split('/') {
         if component.is_empty() || component == "." || component == ".." {
-            bail!("ZIP entry {raw:?} has an unsafe or ambiguous path component");
+            bail!("{format} entry {raw:?} has an unsafe or ambiguous path component");
         }
         if component.chars().any(|ch| {
             ch == '\\'
@@ -588,7 +714,7 @@ fn parse_zip_path(raw: &str, is_dir: bool) -> Result<Vec<String>> {
                 || ch < ' '
                 || matches!(ch, ':' | '*' | '?' | '"' | '<' | '>' | '|')
         }) {
-            bail!("ZIP entry {raw:?} contains a name SMB cannot represent safely");
+            bail!("{format} entry {raw:?} contains a name SMB cannot represent safely");
         }
         components.push(component.to_string());
     }
@@ -639,135 +765,43 @@ impl FileReader for CachedFile {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::time::{Duration, UNIX_EPOCH};
+struct TarFile {
+    file: Arc<Mutex<File>>,
+    offset: u64,
+    size: u64,
+}
 
-    use super::*;
-
-    #[derive(Default)]
-    pub(crate) struct MemBacking {
-        entries: BTreeMap<String, (NodeInfo, Vec<u8>)>,
-    }
-
-    impl MemBacking {
-        pub(crate) fn new() -> Self {
-            let mut backing = Self::default();
-            backing.entries.insert(
-                String::new(),
-                (NodeInfo::synthetic_dir("", UNIX_EPOCH), Vec::new()),
-            );
-            backing
+impl FileReader for TarFile {
+    fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, u32> {
+        if offset >= self.size {
+            return Ok(Bytes::new());
         }
+        let wanted = u64::from(len).min(self.size - offset);
+        let wanted = usize::try_from(wanted).map_err(|_| status::INVALID_PARAMETER)?;
+        let absolute_offset = self
+            .offset
+            .checked_add(offset)
+            .ok_or(status::INVALID_PARAMETER)?;
+        let mut buffer = vec![0u8; wanted];
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+        file.seek(SeekFrom::Start(absolute_offset))
+            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
 
-        pub(crate) fn with_dir(mut self, path: &str) -> Self {
-            let name = path.rsplit('\\').next().unwrap_or(path).to_string();
-            self.entries.insert(
-                path.to_string(),
-                (
-                    NodeInfo {
-                        name,
-                        kind: NodeKind::Dir,
-                        size: 0,
-                        mtime: UNIX_EPOCH + Duration::from_secs(1_600_000_000),
-                        atime: UNIX_EPOCH + Duration::from_secs(1_600_000_001),
-                        ctime: UNIX_EPOCH + Duration::from_secs(1_600_000_002),
-                    },
-                    Vec::new(),
-                ),
-            );
-            self
-        }
-
-        pub(crate) fn with_file(mut self, path: &str, content: &[u8]) -> Self {
-            let name = path.rsplit('\\').next().unwrap_or(path).to_string();
-            self.entries.insert(
-                path.to_string(),
-                (
-                    NodeInfo {
-                        name,
-                        kind: NodeKind::File,
-                        size: content.len() as u64,
-                        mtime: UNIX_EPOCH + Duration::from_secs(1_600_000_000),
-                        atime: UNIX_EPOCH + Duration::from_secs(1_600_000_001),
-                        ctime: UNIX_EPOCH + Duration::from_secs(1_600_000_002),
-                    },
-                    content.to_vec(),
-                ),
-            );
-            self
-        }
-    }
-
-    impl Backing for MemBacking {
-        fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32> {
-            self.entries
-                .get(&path.to_smb_string())
-                .map(|(info, _)| info.clone())
-                .ok_or(status::OBJECT_NAME_NOT_FOUND)
-        }
-
-        fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
-            let prefix = path.to_smb_string();
-            let (info, _) = self
-                .entries
-                .get(&prefix)
-                .ok_or(status::OBJECT_PATH_NOT_FOUND)?;
-            if !info.kind.is_dir() {
-                return Err(status::NOT_A_DIRECTORY);
+        let mut filled = 0usize;
+        while filled < buffer.len() {
+            let read = file
+                .read(&mut buffer[filled..])
+                .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+            if read == 0 {
+                break;
             }
-            let scope = if prefix.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix}\\")
-            };
-            Ok(self
-                .entries
-                .iter()
-                .filter(|(key, _)| {
-                    !key.is_empty() && key.starts_with(&scope) && !key[scope.len()..].contains('\\')
-                })
-                .map(|(_, (info, _))| info.clone())
-                .collect())
+            filled += read;
         }
-
-        fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
-            let (info, content) = self
-                .entries
-                .get(&path.to_smb_string())
-                .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
-            if info.kind.is_dir() {
-                return Err(status::FILE_IS_A_DIRECTORY);
-            }
-            Ok(Arc::new(MemFile {
-                content: content.clone(),
-            }))
-        }
-
-        fn label(&self) -> &str {
-            "test"
-        }
-
-        fn total_size(&self) -> u64 {
-            self.entries.values().map(|(info, _)| info.size).sum()
-        }
-    }
-
-    struct MemFile {
-        content: Vec<u8>,
-    }
-
-    impl FileReader for MemFile {
-        fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, u32> {
-            let Ok(offset) = usize::try_from(offset) else {
-                return Ok(Bytes::new());
-            };
-            if offset >= self.content.len() {
-                return Ok(Bytes::new());
-            }
-            let end = offset.saturating_add(len as usize).min(self.content.len());
-            Ok(Bytes::copy_from_slice(&self.content[offset..end]))
-        }
+        buffer.truncate(filled);
+        Ok(Bytes::from(buffer))
     }
 }
 
@@ -785,8 +819,11 @@ mod tests {
         SmbPath::parse(path).expect("valid test SMB path")
     }
 
-    fn archive(entries: &[(&str, &[u8])]) -> (NamedTempFile, ZipBacking) {
-        let temp = NamedTempFile::new().expect("temporary ZIP");
+    fn zip_archive(entries: &[(&str, &[u8])]) -> (NamedTempFile, ArchiveBacking) {
+        let temp = tempfile::Builder::new()
+            .suffix(".zip")
+            .tempfile()
+            .expect("temporary ZIP");
         let mut writer = ZipWriter::new(temp.reopen().expect("reopen temporary ZIP"));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         for (name, contents) in entries {
@@ -794,17 +831,52 @@ mod tests {
             writer.write_all(contents).expect("write ZIP entry");
         }
         writer.finish().expect("finish ZIP");
-        let backing = ZipBacking::open(temp.path(), "fixture").expect("open ZIP backing");
+        let backing = ArchiveBacking::open(temp.path(), "fixture").expect("open ZIP backing");
         (temp, backing)
+    }
+
+    fn tar_archive(entries: &[(&str, &[u8])]) -> (NamedTempFile, ArchiveBacking) {
+        let temp = tempfile::Builder::new()
+            .suffix(".tar")
+            .tempfile()
+            .expect("temporary TAR");
+        let mut writer = tar::Builder::new(temp.reopen().expect("reopen temporary TAR"));
+        for (name, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(1_600_000_000);
+            header.set_cksum();
+            writer
+                .append_data(&mut header, *name, *contents)
+                .expect("write TAR entry");
+        }
+        writer.finish().expect("finish TAR");
+        let backing = ArchiveBacking::open(temp.path(), "fixture").expect("open TAR backing");
+        (temp, backing)
+    }
+
+    fn tar_with_raw_path(path: &[u8]) -> NamedTempFile {
+        assert!(path.len() <= 100);
+        let temp = tempfile::Builder::new()
+            .suffix(".tar")
+            .tempfile()
+            .expect("temporary TAR");
+        let mut writer = tar::Builder::new(temp.reopen().unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path);
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        writer.append(&header, &b"x"[..]).unwrap();
+        writer.finish().unwrap();
+        temp
     }
 
     #[test]
     fn folder_backing_exposes_the_archive_only_beneath_its_folder() {
-        let inner: Arc<dyn Backing> = Arc::new(
-            test_support::MemBacking::new()
-                .with_dir("docs")
-                .with_file(r"docs\readme.txt", b"hello"),
-        );
+        let (_temp, inner) = zip_archive(&[("docs/readme.txt", b"hello")]);
+        let inner: Arc<dyn Backing> = Arc::new(inner);
         let backing = FolderBacking::new("a1b2c3d4", inner);
 
         let root = backing.list(&smb_path("")).unwrap();
@@ -822,12 +894,12 @@ mod tests {
             .unwrap();
         assert_eq!(&file.read_at(0, 5).unwrap()[..], b"hello");
         assert_eq!(backing.total_size(), 5);
-        assert_eq!(backing.label(), "test");
+        assert_eq!(backing.label(), "fixture");
     }
 
     #[test]
     fn implicit_directories_are_indexed_and_listed() {
-        let (_temp, backing) = archive(&[
+        let (_temp, backing) = zip_archive(&[
             ("docs/readme.txt", b"hello"),
             ("docs/deep/data.bin", b"123"),
             ("root.txt", b"r"),
@@ -854,7 +926,7 @@ mod tests {
 
     #[test]
     fn files_support_repeated_positional_reads() {
-        let (_temp, backing) = archive(&[("numbers.txt", b"0123456789")]);
+        let (_temp, backing) = zip_archive(&[("numbers.txt", b"0123456789")]);
         let file = backing.open(&smb_path("NUMBERS.TXT")).unwrap();
         assert_eq!(&file.read_at(3, 4).unwrap()[..], b"3456");
         assert_eq!(&file.read_at(0, 3).unwrap()[..], b"012");
@@ -862,11 +934,141 @@ mod tests {
         assert!(file.read_at(10, 1).unwrap().is_empty());
     }
 
+    #[test]
+    fn tar_archives_are_indexed_and_read_by_offset() {
+        let (_temp, backing) = tar_archive(&[
+            ("docs/readme.txt", b"hello"),
+            ("docs/deep/numbers.txt", b"0123456789"),
+            ("root.txt", b"root"),
+        ]);
+
+        let root = backing.list(&smb_path("")).unwrap();
+        assert_eq!(
+            root.iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["docs", "root.txt"]
+        );
+        let file = backing
+            .open(&smb_path(r"DOCS\DEEP\NUMBERS.TXT"))
+            .unwrap();
+        assert_eq!(&file.read_at(3, 4).unwrap()[..], b"3456");
+        assert_eq!(&file.read_at(0, 3).unwrap()[..], b"012");
+        assert_eq!(&file.read_at(8, 20).unwrap()[..], b"89");
+        assert!(file.read_at(10, 1).unwrap().is_empty());
+        assert_eq!(backing.total_size(), 19);
+        assert_eq!(backing.file_count(), 3);
+    }
+
+    #[test]
+    fn tar_case_collisions_are_rejected() {
+        let temp = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+        let mut writer = tar::Builder::new(temp.reopen().unwrap());
+        for name in ["Docs/a.txt", "docs/b.txt"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            writer
+                .append_data(&mut header, name, &b"x"[..])
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let error = ArchiveBacking::open(temp.path(), "fixture")
+            .err()
+            .expect("case collision must fail");
+        assert!(error.to_string().contains("conflicts"), "{error:#}");
+    }
+
+    #[test]
+    fn tar_unsafe_and_non_utf8_paths_are_rejected() {
+        for path in [
+            &b"../secret"[..],
+            &b"/absolute"[..],
+            &b"a//b"[..],
+            &b"bad:name"[..],
+            &b"\xff"[..],
+        ] {
+            let temp = tar_with_raw_path(path);
+            let error = ArchiveBacking::open(temp.path(), "fixture")
+                .err()
+                .expect("unsafe TAR must fail");
+            assert!(
+                error.to_string().contains("TAR entry"),
+                "{path:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn tar_non_file_entries_are_rejected() {
+        let temp = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+        let mut writer = tar::Builder::new(temp.reopen().unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name("target.txt").unwrap();
+        header.set_cksum();
+        writer
+            .append_data(&mut header, "link.txt", std::io::empty())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let error = ArchiveBacking::open(temp.path(), "fixture")
+            .err()
+            .expect("symlink must fail");
+        assert!(error.to_string().contains("unsupported type"), "{error:#}");
+    }
+
+    #[test]
+    fn tar_global_pax_metadata_is_accepted() {
+        let temp = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+        let mut writer = tar::Builder::new(temp.reopen().unwrap());
+        let pax = b"16 comment=test\n";
+        let mut pax_header = tar::Header::new_gnu();
+        pax_header.set_entry_type(tar::EntryType::XGlobalHeader);
+        pax_header.set_size(pax.len() as u64);
+        pax_header.set_mode(0o644);
+        pax_header.set_cksum();
+        writer
+            .append_data(&mut pax_header, "pax_global_header", &pax[..])
+            .unwrap();
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_size(5);
+        file_header.set_mode(0o644);
+        file_header.set_cksum();
+        writer
+            .append_data(&mut file_header, "hello.txt", &b"hello"[..])
+            .unwrap();
+        writer.finish().unwrap();
+
+        let backing = ArchiveBacking::open(temp.path(), "fixture").unwrap();
+        assert_eq!(backing.file_count(), 1);
+        let file = backing.open(&smb_path("hello.txt")).unwrap();
+        assert_eq!(&file.read_at(0, 5).unwrap()[..], b"hello");
+    }
+
+    #[test]
+    fn gzip_and_unknown_extensions_are_rejected() {
+        for suffix in [".tar.gz", ".tgz", ".rar"] {
+            let temp = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+            let error = ArchiveBacking::open(temp.path(), "fixture")
+                .err()
+                .expect("unsupported extension must fail");
+            assert!(
+                error.to_string().contains("expected .zip or .tar"),
+                "{suffix}: {error:#}"
+            );
+        }
+    }
+
     /// Expanded copies are temporary files on disk, so reading through a large
     /// archive must not leave every entry decompressed at once.
     #[test]
     fn the_expanded_cache_evicts_least_recently_used_copies() {
-        let (_temp, backing) = archive(&[
+        let (_temp, backing) = zip_archive(&[
             ("a.txt", b"aaaaaaaaaa"),
             ("b.txt", b"bbbbbbbbbb"),
             ("c.txt", b"cccccccccc"),
@@ -913,7 +1115,7 @@ mod tests {
     /// on every read.
     #[test]
     fn an_entry_larger_than_the_limit_is_still_cached() {
-        let (_temp, backing) = archive(&[("big.bin", &[7u8; 64])]);
+        let (_temp, backing) = zip_archive(&[("big.bin", &[7u8; 64])]);
         backing.set_expanded_limit(8);
         let file = backing.open(&smb_path("big.bin")).unwrap();
         assert_eq!(file.read_at(0, 2).unwrap().len(), 2);
@@ -924,14 +1126,14 @@ mod tests {
     #[test]
     fn unsafe_and_ambiguous_paths_are_rejected() {
         for name in ["../secret", "/absolute", "a//b", "a\\b", "bad:name"] {
-            let temp = NamedTempFile::new().unwrap();
+            let temp = tempfile::Builder::new().suffix(".zip").tempfile().unwrap();
             let mut writer = ZipWriter::new(temp.reopen().unwrap());
             writer
                 .start_file(name, SimpleFileOptions::default())
                 .unwrap();
             writer.write_all(b"x").unwrap();
             writer.finish().unwrap();
-            let error = ZipBacking::open(temp.path(), "fixture")
+            let error = ArchiveBacking::open(temp.path(), "fixture")
                 .err()
                 .expect("unsafe ZIP must fail");
             assert!(
@@ -943,7 +1145,7 @@ mod tests {
 
     #[test]
     fn case_collisions_are_rejected() {
-        let temp = NamedTempFile::new().unwrap();
+        let temp = tempfile::Builder::new().suffix(".zip").tempfile().unwrap();
         let mut writer = ZipWriter::new(temp.reopen().unwrap());
         for name in ["Docs/a.txt", "docs/b.txt"] {
             writer
@@ -952,7 +1154,7 @@ mod tests {
             writer.write_all(b"x").unwrap();
         }
         writer.finish().unwrap();
-        let error = ZipBacking::open(temp.path(), "fixture")
+        let error = ArchiveBacking::open(temp.path(), "fixture")
             .err()
             .expect("case collision must fail");
         assert!(error.to_string().contains("conflicts"), "{error:#}");
@@ -960,7 +1162,7 @@ mod tests {
 
     #[test]
     fn encrypted_entries_are_rejected_before_serving() {
-        let temp = NamedTempFile::new().unwrap();
+        let temp = tempfile::Builder::new().suffix(".zip").tempfile().unwrap();
         let mut writer = ZipWriter::new(temp.reopen().unwrap());
         writer
             .start_file("secret.txt", SimpleFileOptions::default())
@@ -986,7 +1188,7 @@ mod tests {
         assert_eq!(marked, 2);
         std::fs::write(temp.path(), bytes).unwrap();
 
-        let error = ZipBacking::open(temp.path(), "fixture")
+        let error = ArchiveBacking::open(temp.path(), "fixture")
             .err()
             .expect("encrypted ZIP must fail");
         assert!(error.to_string().contains("encrypted"), "{error:#}");

@@ -115,9 +115,9 @@ fn find_ntlmssp(blob: &[u8]) -> Option<(u32, Framing, &[u8])> {
 
 /// The account a client must present to get an authenticated, signed session.
 #[derive(Debug, Clone)]
-pub(crate) struct Credentials {
-    pub(crate) user: String,
-    pub(crate) password: String,
+pub struct Credentials {
+    pub user: String,
+    pub password: String,
 }
 
 /// Build an NTLMSSP CHALLENGE (type 2) message.
@@ -544,7 +544,7 @@ pub(crate) fn session_setup(
 /// What a connected tree points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TreeKind {
-    /// The ZIP archive share.
+    /// The read-only disk share.
     Disk,
     /// IPC$. Accepted because macOS connects to it during mount, but every
     /// operation on it is refused.

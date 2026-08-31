@@ -1,5 +1,4 @@
-mod local_server;
-mod smb;
+mod archive;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,14 +8,15 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use sha2::{Digest, Sha256};
+use smbanything_core::smb;
 
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Serve an unencrypted ZIP archive as an authenticated, read-only SMB 2.1 share"
+    about = "Serve a ZIP or TAR archive as an authenticated, read-only SMB 2.1 share"
 )]
 struct Args {
-    /// Unencrypted ZIP archive to serve
+    /// ZIP or uncompressed TAR archive to serve
     archive: PathBuf,
 
     /// TCP port to listen on (0 chooses an ephemeral port)
@@ -46,10 +46,10 @@ fn main() -> Result<()> {
     let archive = absolute_archive_path(&args.archive)?;
     let folder_name = archive_folder_name(&archive);
     let label = archive_label(&archive);
-    let backing = Arc::new(smb::ZipBacking::open(&archive, label)?);
+    let backing = Arc::new(archive::ArchiveBacking::open(&archive, label)?);
     let file_count = backing.file_count();
     let total_size = smb::Backing::total_size(backing.as_ref());
-    let backing = smb::FolderBacking::new(&folder_name, backing);
+    let backing = archive::FolderBacking::new(&folder_name, backing);
 
     let bind = if args.bind_all {
         smb::Bind::AllInterfaces
@@ -70,9 +70,9 @@ fn main() -> Result<()> {
     let host = if args.bind_all {
         "<server-ip>"
     } else {
-        &handle.mount().host
+        handle.mount().host()
     };
-    let port = handle.port;
+    let port = handle.port();
     println!(
         "Serving {} file{} ({} bytes) from {}",
         file_count,
@@ -82,7 +82,7 @@ fn main() -> Result<()> {
     );
     println!(
         "Folder:   \\\\{host}\\{}\\{folder_name}",
-        handle.share_name
+        handle.share_name()
     );
     println!("Port:     {port}");
     println!("Username: {}", args.user);
@@ -99,21 +99,21 @@ fn main() -> Result<()> {
     println!("Mount examples (the clients prompt for the password):");
     println!(
         "  Linux:  sudo mount -t cifs -o port={port},vers=2.1,username={},ro,file_mode=0444,dir_mode=0555 //{host}/{}/{folder_name} /mnt/smbanything",
-        args.user, handle.share_name
+        args.user, handle.share_name()
     );
     println!(
         "  macOS:  smb://{}@{host}:{port}/{}/{folder_name}",
-        args.user, handle.share_name
+        args.user, handle.share_name()
     );
     if handle.on_standard_port() {
         println!(
             "  Windows: net use Z: \\\\{host}\\{}\\{folder_name} * /user:{}",
-            handle.share_name, args.user
+            handle.share_name(), args.user
         );
     } else {
         println!(
             "  Windows: net use Z: \\\\{host}\\{}\\{folder_name} * /user:{} /TCPPORT:{port}",
-            handle.share_name, args.user
+            handle.share_name(), args.user
         );
     }
     println!();
@@ -142,7 +142,7 @@ fn main() -> Result<()> {
 
 fn absolute_archive_path(path: &Path) -> Result<PathBuf> {
     std::path::absolute(path)
-        .with_context(|| format!("making ZIP archive path absolute: {}", path.display()))
+        .with_context(|| format!("making archive path absolute: {}", path.display()))
 }
 
 fn archive_folder_name(absolute_path: &Path) -> String {
