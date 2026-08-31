@@ -240,10 +240,18 @@ mod tests {
 
     #[test]
     fn archive_folder_is_the_sha256_prefix_of_the_absolute_path() {
-        assert_eq!(
-            archive_folder_name(Path::new("/tmp/photos.zip")),
-            "488b0141"
-        );
+        // The digest covers the path's own bytes, so the fixture has to be
+        // spelled the way the platform spells an absolute path — `/tmp/...` is
+        // rooted but not absolute on Windows, which needs a drive prefix — and
+        // each spelling hashes to its own folder name.
+        #[cfg(unix)]
+        let (path, expected) = ("/tmp/photos.zip", "488b0141");
+        #[cfg(windows)]
+        let (path, expected) = (r"C:\tmp\photos.zip", "765fbe48");
+
+        let path = Path::new(path);
+        assert!(path.is_absolute(), "{path:?} is not absolute here");
+        assert_eq!(archive_folder_name(path), expected);
     }
 
     #[test]
