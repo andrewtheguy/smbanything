@@ -107,7 +107,8 @@ TAR-specific behavior:
 
 `smbanything_core` contains the archive-independent SMB server, authentication,
 protocol handling, and read-only backing interfaces. ZIP and TAR parsing stays
-in the `smbanything` application crate.
+in the `smbanything` application crate, in `src/archive/zip.rs` and
+`src/archive/tar.rs` respectively.
 
 ## Security boundary
 
