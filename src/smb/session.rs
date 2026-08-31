@@ -37,7 +37,7 @@ const NTLMSSP_NEGOTIATE: u32 = 1;
 const NTLMSSP_AUTHENTICATE: u32 = 3;
 
 /// The name reported as the NTLM target and the SMB volume label.
-const SERVER_NAME: &str = "SMBZIP";
+const SERVER_NAME: &str = "SMBANYTHING";
 
 /// Build the SPNEGO `NegTokenInit` advertised in the NEGOTIATE response: a
 /// mechTypes list containing NTLMSSP and nothing else. Offering only one

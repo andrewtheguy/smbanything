@@ -1,8 +1,8 @@
-# smbzip
+# smbanything
 
-`smbzip` serves one unencrypted ZIP archive as an authenticated, read-only SMB
-2.1 share. It is intended for browsing immutable archives without extracting
-their directory trees first.
+`smbanything` serves one unencrypted ZIP archive as an authenticated, read-only
+SMB 2.1 share. It is intended for browsing immutable archives without
+extracting their directory trees first.
 
 The SMB implementation is adapted from the immutable snapshot service in
 `wrustic`. It supports the operations needed to mount, list, stat, and read
@@ -14,31 +14,33 @@ message signing are required.
 
 ```sh
 cargo build --release
-./target/release/smbzip archive.zip
+./target/release/smbanything archive.zip
 ```
 
 The default listener is IPv4 and IPv6 loopback on port 4456, with share name
-`zip` and username `smbzip`. The archive is placed in a directory named with
-the first eight hexadecimal characters of the SHA-256 of its absolute path, so
-its SMB path is `//127.0.0.1/zip/<8-hex-id>`. A random password is printed for
-each run. To use a stable password, pass it through the environment rather than
-the process list:
+`anything` and username `smbanything`. The archive is placed in a directory
+named with the first eight hexadecimal characters of the SHA-256 of its
+absolute path, so its SMB path is
+`//127.0.0.1/anything/<8-hex-id>`. A random password is printed for each run. To
+use a stable password, pass it through the environment rather than the process
+list:
 
 ```sh
-SMBZIP_PASSWORD='choose-a-strong-password' ./target/release/smbzip archive.zip
+SMBANYTHING_PASSWORD='choose-a-strong-password' \
+  ./target/release/smbanything archive.zip
 ```
 
 Useful options:
 
 ```text
 -p, --port <PORT>    Listen port; 0 chooses an ephemeral port
--s, --share <NAME>   SMB share name (default: zip)
--u, --user <NAME>    SMB username (default: smbzip)
+-s, --share <NAME>   SMB share name (default: anything)
+-u, --user <NAME>    SMB username (default: smbanything)
     --bind-all       Listen on every network interface
 ```
 
-Run `smbzip --help` for the complete command-line help. Set `SMBZIP_LOG=1` for
-per-command protocol diagnostics.
+Run `smbanything --help` for the complete command-line help. Set
+`SMBANYTHING_LOG=1` for per-command protocol diagnostics.
 
 ## Mounting
 
@@ -49,20 +51,20 @@ Linux:
 
 ```sh
 sudo mount -t cifs \
-  -o port=4456,vers=2.1,username=smbzip,ro,file_mode=0444,dir_mode=0555 \
-  //127.0.0.1/zip/<8-hex-id> /mnt/zip
+  -o port=4456,vers=2.1,username=smbanything,ro,file_mode=0444,dir_mode=0555 \
+  //127.0.0.1/anything/<8-hex-id> /mnt/smbanything
 ```
 
 macOS, using Finder → Go → Connect to Server:
 
 ```text
-smb://smbzip@127.0.0.1:4456/zip/<8-hex-id>
+smb://smbanything@127.0.0.1:4456/anything/<8-hex-id>
 ```
 
 Windows 11 24H2 or newer:
 
 ```bat
-net use Z: \\127.0.0.1\zip\<8-hex-id> * /user:smbzip /TCPPORT:4456
+net use Z: \\127.0.0.1\anything\<8-hex-id> * /user:smbanything /TCPPORT:4456
 ```
 
 Older Windows clients require SMB's standard port 445. On Unix, binding that

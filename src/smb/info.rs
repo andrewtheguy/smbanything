@@ -292,7 +292,7 @@ pub(crate) fn fs_attribute() -> Vec<u8> {
     const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
     const FILE_READ_ONLY_VOLUME: u32 = 0x0008_0000;
 
-    let name = utf16le("smbzip");
+    let name = utf16le("smbanything");
     let mut w = Writer::with_capacity(12 + name.len());
     w.u32(FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK | FILE_READ_ONLY_VOLUME); // 0 FileSystemAttributes
     w.u32(255); // 4 MaximumComponentNameLength

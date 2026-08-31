@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     validate_simple_name("user", &args.user)?;
 
     let password = password()?;
-    let generated_password = std::env::var_os("SMBZIP_PASSWORD").is_none();
+    let generated_password = std::env::var_os("SMBANYTHING_PASSWORD").is_none();
     let archive = absolute_archive_path(&args.archive)?;
     let folder_name = archive_folder_name(&archive);
     let label = archive_label(&archive);
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     println!("Username: {}", args.user);
     println!("Password: {password}");
     if generated_password {
-        println!("(generated for this run; set SMBZIP_PASSWORD to choose it)");
+        println!("(generated for this run; set SMBANYTHING_PASSWORD to choose it)");
     }
     if args.bind_all {
         println!();
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
     println!();
     println!("Mount examples (the clients prompt for the password):");
     println!(
-        "  Linux:  sudo mount -t cifs -o port={port},vers=2.1,username={},ro,file_mode=0444,dir_mode=0555 //{host}/{}/{folder_name} /mnt/zip",
+        "  Linux:  sudo mount -t cifs -o port={port},vers=2.1,username={},ro,file_mode=0444,dir_mode=0555 //{host}/{}/{folder_name} /mnt/smbanything",
         args.user, handle.share_name
     );
     println!(
@@ -158,15 +158,15 @@ fn archive_folder_name(absolute_path: &Path) -> String {
 }
 
 fn password() -> Result<String> {
-    let password = match std::env::var("SMBZIP_PASSWORD") {
+    let password = match std::env::var("SMBANYTHING_PASSWORD") {
         Ok(password) => password,
         Err(std::env::VarError::NotPresent) => smb::random_password(),
         Err(std::env::VarError::NotUnicode(_)) => {
-            bail!("SMBZIP_PASSWORD must be valid UTF-8")
+            bail!("SMBANYTHING_PASSWORD must be valid UTF-8")
         }
     };
     if password.is_empty() || password.chars().any(char::is_control) {
-        bail!("SMBZIP_PASSWORD must be non-empty and contain no control characters");
+        bail!("SMBANYTHING_PASSWORD must be non-empty and contain no control characters");
     }
     Ok(password)
 }
@@ -190,8 +190,8 @@ fn archive_label(path: &Path) -> String {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("archive");
-    let mut label = String::from("zip-");
-    label.extend(stem.chars().filter(|ch| !ch.is_control()).take(28));
+    let mut label = String::from("smbanything-");
+    label.extend(stem.chars().filter(|ch| !ch.is_control()).take(20));
     label
 }
 
@@ -214,7 +214,10 @@ mod tests {
 
     #[test]
     fn archive_labels_are_bounded() {
-        assert_eq!(archive_label(Path::new("/tmp/photos.zip")), "zip-photos");
+        assert_eq!(
+            archive_label(Path::new("/tmp/photos.zip")),
+            "smbanything-photos"
+        );
         assert!(
             archive_label(Path::new("/tmp/a\nname.zip"))
                 .chars()

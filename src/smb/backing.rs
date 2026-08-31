@@ -63,7 +63,7 @@ pub(crate) trait Backing: Send + Sync {
 
 /// Places one backing beneath a single directory at the share root.
 ///
-/// The directory name identifies the archive while keeping `zip` as the one
+/// The directory name identifies the archive while keeping `anything` as the one
 /// SMB share clients connect to. There is deliberately no route to the inner
 /// backing at the share root: every archive path begins with this directory.
 pub(crate) struct FolderBacking {
