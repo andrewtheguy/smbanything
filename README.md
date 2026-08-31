@@ -18,8 +18,11 @@ cargo build --release
 ```
 
 The default listener is IPv4 and IPv6 loopback on port 4456, with share name
-`zip` and username `smbzip`. A random password is printed for each run. To use a
-stable password, pass it through the environment rather than the process list:
+`zip` and username `smbzip`. The archive is placed in a directory named with
+the first eight hexadecimal characters of the SHA-256 of its absolute path, so
+its SMB path is `//127.0.0.1/zip/<8-hex-id>`. A random password is printed for
+each run. To use a stable password, pass it through the environment rather than
+the process list:
 
 ```sh
 SMBZIP_PASSWORD='choose-a-strong-password' ./target/release/smbzip archive.zip
@@ -47,19 +50,19 @@ Linux:
 ```sh
 sudo mount -t cifs \
   -o port=4456,vers=2.1,username=smbzip,ro,file_mode=0444,dir_mode=0555 \
-  //127.0.0.1/zip /mnt/zip
+  //127.0.0.1/zip/<8-hex-id> /mnt/zip
 ```
 
 macOS, using Finder → Go → Connect to Server:
 
 ```text
-smb://smbzip@127.0.0.1:4456/zip
+smb://smbzip@127.0.0.1:4456/zip/<8-hex-id>
 ```
 
 Windows 11 24H2 or newer:
 
 ```bat
-net use Z: \\127.0.0.1\zip * /user:smbzip /TCPPORT:4456
+net use Z: \\127.0.0.1\zip\<8-hex-id> * /user:smbzip /TCPPORT:4456
 ```
 
 Older Windows clients require SMB's standard port 445. On Unix, binding that

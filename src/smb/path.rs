@@ -91,7 +91,6 @@ impl SmbPath {
     /// Split off the first component: `(first, rest)`, `None` for the root.
     /// Lets a backing that nests another one route a client path into the
     /// inner tree without re-parsing anything.
-    #[cfg(test)]
     pub(crate) fn split_first(&self) -> Option<(&str, Self)> {
         let (first, rest) = self.components.split_first()?;
         Some((

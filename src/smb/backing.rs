@@ -61,6 +61,72 @@ pub(crate) trait Backing: Send + Sync {
     fn total_size(&self) -> u64;
 }
 
+/// Places one backing beneath a single directory at the share root.
+///
+/// The directory name identifies the archive while keeping `zip` as the one
+/// SMB share clients connect to. There is deliberately no route to the inner
+/// backing at the share root: every archive path begins with this directory.
+pub(crate) struct FolderBacking {
+    folder: NodeInfo,
+    inner: Arc<dyn Backing>,
+}
+
+impl FolderBacking {
+    pub(crate) fn new(name: impl Into<String>, inner: Arc<dyn Backing>) -> Self {
+        Self {
+            folder: NodeInfo::synthetic_dir(&name.into(), SystemTime::now()),
+            inner,
+        }
+    }
+
+    fn inner_path(&self, path: &SmbPath) -> Option<SmbPath> {
+        let (first, rest) = path.split_first()?;
+        first
+            .eq_ignore_ascii_case(&self.folder.name)
+            .then_some(rest)
+    }
+}
+
+impl Backing for FolderBacking {
+    fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32> {
+        if path.components().next().is_none() {
+            return Ok(NodeInfo::synthetic_dir("", self.folder.mtime));
+        }
+        let inner_path = self
+            .inner_path(path)
+            .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
+        if inner_path.components().next().is_none() {
+            return Ok(self.folder.clone());
+        }
+        self.inner.stat(&inner_path)
+    }
+
+    fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
+        if path.components().next().is_none() {
+            return Ok(vec![self.folder.clone()]);
+        }
+        let inner_path = self
+            .inner_path(path)
+            .ok_or(status::OBJECT_PATH_NOT_FOUND)?;
+        self.inner.list(&inner_path)
+    }
+
+    fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
+        let inner_path = self
+            .inner_path(path)
+            .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
+        self.inner.open(&inner_path)
+    }
+
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+
+    fn total_size(&self) -> u64 {
+        self.inner.total_size()
+    }
+}
+
 /// Where an entry's expanded copy lives, if it currently has one. Shared with
 /// `ExpandedCache` so eviction can release it without going through the map of
 /// entries.
@@ -730,6 +796,33 @@ mod tests {
         writer.finish().expect("finish ZIP");
         let backing = ZipBacking::open(temp.path(), "fixture").expect("open ZIP backing");
         (temp, backing)
+    }
+
+    #[test]
+    fn folder_backing_exposes_the_archive_only_beneath_its_folder() {
+        let inner: Arc<dyn Backing> = Arc::new(
+            test_support::MemBacking::new()
+                .with_dir("docs")
+                .with_file(r"docs\readme.txt", b"hello"),
+        );
+        let backing = FolderBacking::new("a1b2c3d4", inner);
+
+        let root = backing.list(&smb_path("")).unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].name, "a1b2c3d4");
+        assert!(root[0].kind.is_dir());
+
+        let archive_root = backing.list(&smb_path("A1B2C3D4")).unwrap();
+        assert_eq!(archive_root.len(), 1);
+        assert_eq!(archive_root[0].name, "docs");
+        assert!(backing.list(&smb_path("docs")).is_err());
+
+        let file = backing
+            .open(&smb_path(r"a1b2c3d4\docs\readme.txt"))
+            .unwrap();
+        assert_eq!(&file.read_at(0, 5).unwrap()[..], b"hello");
+        assert_eq!(backing.total_size(), 5);
+        assert_eq!(backing.label(), "test");
     }
 
     #[test]

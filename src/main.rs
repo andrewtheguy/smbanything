@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,10 +43,13 @@ fn main() -> Result<()> {
 
     let password = password()?;
     let generated_password = std::env::var_os("SMBZIP_PASSWORD").is_none();
-    let label = archive_label(&args.archive);
-    let backing = smb::ZipBacking::open(&args.archive, label)?;
+    let archive = absolute_archive_path(&args.archive)?;
+    let folder_name = archive_folder_name(&archive);
+    let label = archive_label(&archive);
+    let backing = Arc::new(smb::ZipBacking::open(&archive, label)?);
     let file_count = backing.file_count();
-    let total_size = smb::Backing::total_size(&backing);
+    let total_size = smb::Backing::total_size(backing.as_ref());
+    let backing = smb::FolderBacking::new(&folder_name, backing);
 
     let bind = if args.bind_all {
         smb::Bind::AllInterfaces
@@ -74,9 +78,12 @@ fn main() -> Result<()> {
         file_count,
         if file_count == 1 { "" } else { "s" },
         total_size,
-        args.archive.display()
+        archive.display()
     );
-    println!("Share:    \\\\{host}\\{}", handle.share_name);
+    println!(
+        "Folder:   \\\\{host}\\{}\\{folder_name}",
+        handle.share_name
+    );
     println!("Port:     {port}");
     println!("Username: {}", args.user);
     println!("Password: {password}");
@@ -91,21 +98,21 @@ fn main() -> Result<()> {
     println!();
     println!("Mount examples (the clients prompt for the password):");
     println!(
-        "  Linux:  sudo mount -t cifs -o port={port},vers=2.1,username={},ro,file_mode=0444,dir_mode=0555 //{host}/{} /mnt/zip",
+        "  Linux:  sudo mount -t cifs -o port={port},vers=2.1,username={},ro,file_mode=0444,dir_mode=0555 //{host}/{}/{folder_name} /mnt/zip",
         args.user, handle.share_name
     );
     println!(
-        "  macOS:  smb://{}@{host}:{port}/{}",
+        "  macOS:  smb://{}@{host}:{port}/{}/{folder_name}",
         args.user, handle.share_name
     );
     if handle.on_standard_port() {
         println!(
-            "  Windows: net use Z: \\\\{host}\\{} * /user:{}",
+            "  Windows: net use Z: \\\\{host}\\{}\\{folder_name} * /user:{}",
             handle.share_name, args.user
         );
     } else {
         println!(
-            "  Windows: net use Z: \\\\{host}\\{} * /user:{} /TCPPORT:{port}",
+            "  Windows: net use Z: \\\\{host}\\{}\\{folder_name} * /user:{} /TCPPORT:{port}",
             handle.share_name, args.user
         );
     }
@@ -131,6 +138,23 @@ fn main() -> Result<()> {
     }
     handle.stop();
     Ok(())
+}
+
+fn absolute_archive_path(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path)
+        .with_context(|| format!("making ZIP archive path absolute: {}", path.display()))
+}
+
+fn archive_folder_name(absolute_path: &Path) -> String {
+    use std::fmt::Write as _;
+
+    debug_assert!(absolute_path.is_absolute());
+    let digest = Sha256::digest(absolute_path.as_os_str().as_encoded_bytes());
+    let mut folder_name = String::with_capacity(8);
+    for byte in &digest[..4] {
+        write!(&mut folder_name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    folder_name
 }
 
 fn password() -> Result<String> {
@@ -201,6 +225,24 @@ mod tests {
                 .chars()
                 .count()
                 <= 32
+        );
+    }
+
+    #[test]
+    fn archive_folder_is_the_sha256_prefix_of_the_absolute_path() {
+        assert_eq!(
+            archive_folder_name(Path::new("/tmp/photos.zip")),
+            "488b0141"
+        );
+    }
+
+    #[test]
+    fn relative_archive_paths_are_made_absolute_before_hashing() {
+        let absolute = absolute_archive_path(Path::new("photos.zip")).unwrap();
+        assert!(absolute.is_absolute());
+        assert_eq!(
+            absolute.file_name().and_then(|name| name.to_str()),
+            Some("photos.zip")
         );
     }
 }

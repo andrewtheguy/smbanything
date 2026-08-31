@@ -49,9 +49,9 @@
 // argument: a command line is readable by every other process while it runs,
 // and lands in shell (or console) history afterwards.
 //   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=smbzip,ro,\
-//                       file_mode=0444,dir_mode=0555 //127.0.0.1/zip /mnt
-//   macOS    Finder → Go → Connect to Server (Cmd+K): smb://smbzip@127.0.0.1:<p>/zip
-//   Windows  net use Z: \\127.0.0.1\zip * /user:smbzip   (add /TCPPORT:<p>)
+//                       file_mode=0444,dir_mode=0555 //127.0.0.1/zip/<id> /mnt
+//   macOS    Finder → Go → Connect to Server (Cmd+K): smb://smbzip@127.0.0.1:<p>/zip/<id>
+//   Windows  net use Z: \\127.0.0.1\zip\<id> * /user:smbzip   (add /TCPPORT:<p>)
 
 /// Whether to trace protocol traffic to stderr. Enabled by setting
 /// `SMBZIP_LOG` to anything.
@@ -125,7 +125,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use crate::local_server;
-pub(crate) use backing::{Backing, ZipBacking};
+pub(crate) use backing::{Backing, FolderBacking, ZipBacking};
 use files::Handles;
 use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, status, write_error_body};
 pub(crate) use session::Credentials;
