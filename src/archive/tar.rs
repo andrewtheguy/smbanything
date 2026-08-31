@@ -1,42 +1,115 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
+use rapidgzip_core::{Decoder, DeflateIndex, IndexOptions, IndexedReader};
 use smbanything_core::smb::{Backing, FileReader, NodeInfo, SmbPath, status};
 
 use super::ArchiveIndex;
 
+/// Maximum decompressed gzip size. Checkpoint indexing does not materialize
+/// these bytes, but the cap still bounds gzip-bomb CPU time, index size, and
+/// the logical size exposed through SMB.
+const MAX_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 pub(super) struct TarBacking {
-    file: Arc<Mutex<File>>,
+    source: TarSource,
     index: ArchiveIndex<u64>,
     label: String,
+}
+
+#[derive(Clone)]
+enum TarSource {
+    Plain(Arc<Mutex<File>>),
+    Gzip(Arc<GzipSource>),
 }
 
 impl TarBacking {
     pub(super) fn open(path: &Path, label: String) -> Result<Self> {
         let file =
             File::open(path).with_context(|| format!("opening TAR archive {}", path.display()))?;
-        let metadata = file
+        let archive_timestamp = file
             .metadata()
-            .with_context(|| format!("reading TAR archive metadata from {}", path.display()))?;
-        let archive_size = metadata.len();
-        let archive_timestamp = metadata.modified().unwrap_or_else(|_| SystemTime::now());
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or_else(|_| SystemTime::now());
+        let archive_size = file
+            .metadata()
+            .context("reading TAR archive metadata")?
+            .len();
         let scanner = file
             .try_clone()
-            .with_context(|| format!("cloning TAR archive handle for {}", path.display()))?;
-        let file = Arc::new(Mutex::new(file));
+            .context("cloning TAR archive handle")?;
         let mut archive = tar::Archive::new(scanner);
-        let mut index = ArchiveIndex::new(archive_timestamp);
-
-        for (tar_index, tar_entry) in archive
+        let entries = archive
             .entries_with_seek()
-            .with_context(|| format!("reading TAR entries from {}", path.display()))?
-            .enumerate()
-        {
+            .context("reading TAR entries")?;
+        let (index, _) = Self::index_entries(entries, archive_timestamp, Some(archive_size))?;
+        Ok(Self {
+            source: TarSource::Plain(Arc::new(Mutex::new(file))),
+            index,
+            label,
+        })
+    }
+
+    /// Builds a compact DEFLATE checkpoint index while the TAR headers are
+    /// scanned. The decompressed TAR is never materialized; positional SMB
+    /// reads resume inflation at the nearest preceding checkpoint.
+    pub(super) fn open_gzip(path: &Path, label: String) -> Result<Self> {
+        Self::open_gzip_with_limit(path, label, MAX_EXPANDED_BYTES)
+    }
+
+    fn open_gzip_with_limit(path: &Path, label: String, expanded_limit: u64) -> Result<Self> {
+        let compressed = File::open(path)
+            .with_context(|| format!("opening gzip TAR archive {}", path.display()))?;
+        let archive_timestamp = compressed
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or_else(|_| SystemTime::now());
+        let decoder = Decoder::builder()
+            .decoder_threads(1)
+            .output_limit(Some(expanded_limit))
+            .build()
+            .context("configuring the indexed gzip decoder")?;
+        let mut scanner = decoder
+            .reader_with_index(compressed, IndexOptions::default())
+            .with_context(|| format!("decompressing gzip TAR archive {}", path.display()))?;
+        let (index, maximum_entry_end) = {
+            let mut archive = tar::Archive::new(&mut scanner);
+            let entries = archive.entries().context("reading gzip TAR entries")?;
+            Self::index_entries(entries, archive_timestamp, None)
+                .with_context(|| format!("decompressing gzip TAR archive {}", path.display()))?
+        };
+        let report = scanner
+            .finish()
+            .with_context(|| format!("decompressing gzip TAR archive {}", path.display()))?;
+        if maximum_entry_end > report.decode.decompressed_bytes {
+            bail!("gzip TAR entry extends past the end of the archive");
+        }
+
+        let compressed = File::open(path)
+            .with_context(|| format!("reopening gzip TAR archive {}", path.display()))?;
+        let source = GzipSource::start(compressed, report.index)?;
+        Ok(Self {
+            source: TarSource::Gzip(Arc::new(source)),
+            index,
+            label,
+        })
+    }
+
+    fn index_entries<'a, R: Read + 'a>(
+        entries: impl Iterator<Item = std::io::Result<tar::Entry<'a, R>>>,
+        archive_timestamp: SystemTime,
+        archive_size: Option<u64>,
+    ) -> Result<(ArchiveIndex<u64>, u64)> {
+        let mut index = ArchiveIndex::new(archive_timestamp);
+        let mut maximum_entry_end = 0;
+
+        for (tar_index, tar_entry) in entries.enumerate() {
             let mut tar_entry =
                 tar_entry.with_context(|| format!("reading TAR entry {tar_index}"))?;
             let path_bytes = tar_entry.path_bytes();
@@ -66,9 +139,10 @@ impl TarBacking {
             let end = offset
                 .checked_add(size)
                 .ok_or_else(|| anyhow!("TAR entry {raw_name:?} data range overflows u64"))?;
-            if end > archive_size {
+            if archive_size.is_some_and(|archive_size| end > archive_size) {
                 bail!("TAR entry {raw_name:?} extends past the end of the archive");
             }
+            maximum_entry_end = maximum_entry_end.max(end);
             let timestamp = tar_entry
                 .header()
                 .mtime()
@@ -79,7 +153,7 @@ impl TarBacking {
             index.insert(&raw_name, is_dir, size, timestamp, "TAR", content)?;
         }
 
-        Ok(Self { file, index, label })
+        Ok((index, maximum_entry_end))
     }
 
     pub(super) fn file_count(&self) -> usize {
@@ -106,7 +180,7 @@ impl Backing for TarBacking {
             .as_ref()
             .ok_or(status::FILE_IS_A_DIRECTORY)?;
         Ok(Arc::new(TarFile {
-            file: self.file.clone(),
+            source: self.source.clone(),
             offset: *offset,
             size: entry.info.size,
         }))
@@ -122,7 +196,7 @@ impl Backing for TarBacking {
 }
 
 struct TarFile {
-    file: Arc<Mutex<File>>,
+    source: TarSource,
     offset: u64,
     size: u64,
 }
@@ -138,34 +212,161 @@ impl FileReader for TarFile {
             .offset
             .checked_add(offset)
             .ok_or(status::INVALID_PARAMETER)?;
-        let mut buffer = vec![0u8; wanted];
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
-        file.seek(SeekFrom::Start(absolute_offset))
-            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
-
-        let mut filled = 0usize;
-        while filled < buffer.len() {
-            let read = file
-                .read(&mut buffer[filled..])
-                .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
-            if read == 0 {
-                break;
+        match &self.source {
+            TarSource::Plain(source) => {
+                let mut buffer = vec![0u8; wanted];
+                let mut source = source
+                    .lock()
+                    .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+                let filled = read_at(&mut *source, absolute_offset, &mut buffer)
+                    .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+                buffer.truncate(filled);
+                Ok(Bytes::from(buffer))
             }
-            filled += read;
+            TarSource::Gzip(source) => source.read_at(absolute_offset, wanted),
         }
-        buffer.truncate(filled);
+    }
+}
+
+fn read_at<R: Read + Seek>(
+    source: &mut R,
+    absolute_offset: u64,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    source.seek(SeekFrom::Start(absolute_offset))?;
+
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read = source.read(&mut buffer[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
+}
+
+struct GzipSource {
+    requests: mpsc::Sender<GzipRequest>,
+    worker: Option<JoinHandle<()>>,
+}
+
+enum GzipRequest {
+    Read {
+        offset: u64,
+        len: usize,
+        response: mpsc::SyncSender<std::result::Result<Vec<u8>, ()>>,
+    },
+    Stop,
+}
+
+impl GzipSource {
+    fn start(compressed: File, index: DeflateIndex) -> Result<Self> {
+        let (request_sender, request_receiver) = mpsc::channel();
+        let (initialization_sender, initialization_receiver) = mpsc::sync_channel(0);
+        let worker = thread::Builder::new()
+            .name("smbanything-gzip-reader".to_string())
+            .spawn(move || {
+                let mut reader = match IndexedReader::new(compressed, index) {
+                    Ok(reader) => {
+                        if initialization_sender.send(Ok(())).is_err() {
+                            return;
+                        }
+                        reader
+                    }
+                    Err(error) => {
+                        let _ = initialization_sender.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+
+                while let Ok(request) = request_receiver.recv() {
+                    match request {
+                        GzipRequest::Read {
+                            offset,
+                            len,
+                            response,
+                        } => {
+                            let mut buffer = vec![0; len];
+                            let result = read_at(&mut reader, offset, &mut buffer)
+                                .map(|filled| {
+                                    buffer.truncate(filled);
+                                    buffer
+                                })
+                                .map_err(|_| ());
+                            let _ = response.send(result);
+                        }
+                        GzipRequest::Stop => break,
+                    }
+                }
+            })
+            .context("starting the checkpoint-indexed gzip reader")?;
+
+        match initialization_receiver.recv() {
+            Ok(Ok(())) => Ok(Self {
+                requests: request_sender,
+                worker: Some(worker),
+            }),
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                bail!("opening the checkpoint-indexed gzip stream: {error}")
+            }
+            Err(_) => {
+                let _ = worker.join();
+                bail!("checkpoint-indexed gzip reader stopped during initialization")
+            }
+        }
+    }
+
+    fn read_at(&self, offset: u64, len: usize) -> Result<Bytes, u32> {
+        let (response_sender, response_receiver) = mpsc::sync_channel(0);
+        self.requests
+            .send(GzipRequest::Read {
+                offset,
+                len,
+                response: response_sender,
+            })
+            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+        let buffer = response_receiver
+            .recv()
+            .map_err(|_| status::UNEXPECTED_IO_ERROR)?
+            .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
         Ok(Bytes::from(buffer))
+    }
+}
+
+impl Drop for GzipSource {
+    fn drop(&mut self) {
+        let _ = self.requests.send(GzipRequest::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rapidgzip_core::DecodeError;
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    /// Extracts the decoder's typed failure, which reaches callers either
+    /// directly through `finish` or boxed inside the `io::Error` that the
+    /// decoding reader returns mid-stream.
+    fn decode_error(error: &anyhow::Error) -> &DecodeError {
+        error
+            .chain()
+            .find_map(|cause| {
+                cause.downcast_ref::<DecodeError>().or_else(|| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::get_ref)
+                        .and_then(|source| source.downcast_ref::<DecodeError>())
+                })
+            })
+            .unwrap_or_else(|| panic!("expected a decoder failure: {error:#}"))
+    }
 
     fn smb_path(path: &str) -> SmbPath {
         SmbPath::parse(path).expect("valid test SMB path")
@@ -233,6 +434,235 @@ mod tests {
         assert!(file.read_at(10, 1).unwrap().is_empty());
         assert_eq!(backing.total_size(), 19);
         assert_eq!(backing.file_count(), 3);
+    }
+
+    #[test]
+    fn gzip_archives_are_checkpoint_indexed_and_read_by_offset() {
+        use std::io::Write as _;
+
+        let temp = tempfile::Builder::new()
+            .suffix(".tar.gz")
+            .tempfile()
+            .expect("temporary TAR.GZ");
+        let mut writer = tar::Builder::new(flate2::write::GzEncoder::new(
+            temp.reopen().expect("reopen temporary TAR.GZ"),
+            flate2::Compression::default(),
+        ));
+        for (name, contents) in [
+            ("docs/readme.txt", &b"hello"[..]),
+            ("docs/deep/numbers.txt", &b"0123456789"[..]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(1_600_000_000);
+            header.set_cksum();
+            writer
+                .append_data(&mut header, name, contents)
+                .expect("write TAR entry");
+        }
+        writer
+            .into_inner()
+            .expect("finish TAR")
+            .finish()
+            .expect("finish gzip")
+            .flush()
+            .expect("flush gzip");
+
+        let backing =
+            TarBacking::open_gzip(temp.path(), "fixture".to_string()).expect("open TAR.GZ");
+        let root = backing.list(&smb_path("")).unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].name, "docs");
+        let file = backing.open(&smb_path(r"DOCS\DEEP\NUMBERS.TXT")).unwrap();
+        let concurrent = file.clone();
+        let concurrent_read = std::thread::spawn(move || concurrent.read_at(0, 5));
+        assert_eq!(&file.read_at(3, 4).unwrap()[..], b"3456");
+        assert_eq!(&file.read_at(8, 20).unwrap()[..], b"89");
+        assert_eq!(&concurrent_read.join().unwrap().unwrap()[..], b"01234");
+        assert_eq!(backing.total_size(), 15);
+        assert_eq!(backing.file_count(), 2);
+    }
+
+    #[test]
+    fn multi_member_gzip_archives_are_checkpoint_indexed() {
+        use std::io::Write as _;
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut writer = tar::Builder::new(&mut tar_bytes);
+            let contents = b"a gzip member boundary can split the TAR byte stream";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            writer
+                .append_data(&mut header, "split.txt", &contents[..])
+                .expect("write TAR entry");
+            writer.finish().expect("finish TAR");
+        }
+
+        let split = 530;
+        let mut gzip_bytes = Vec::new();
+        for part in [&tar_bytes[..split], &tar_bytes[split..]] {
+            let mut encoder = flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            );
+            encoder.write_all(part).expect("write gzip member");
+            gzip_bytes.extend(encoder.finish().expect("finish gzip member"));
+        }
+        let mut temp = tempfile::Builder::new()
+            .suffix(".tar.gz")
+            .tempfile()
+            .expect("temporary TAR.GZ");
+        temp.write_all(&gzip_bytes).expect("write multi-member gzip");
+        temp.flush().expect("flush multi-member gzip");
+
+        let backing =
+            TarBacking::open_gzip(temp.path(), "fixture".to_string()).expect("open TAR.GZ");
+        let file = backing.open(&smb_path("split.txt")).unwrap();
+        assert_eq!(&file.read_at(2, 12).unwrap()[..], b"gzip member ");
+        assert_eq!(&file.read_at(0, 5).unwrap()[..], b"a gzi");
+    }
+
+    #[test]
+    fn gzip_reads_seek_across_interior_checkpoints() {
+        use std::io::Write as _;
+
+        let contents: Vec<u8> = (0..5 * 1024 * 1024 + 257)
+            .map(|index| (index as u8).wrapping_mul(31))
+            .collect();
+        let temp = tempfile::Builder::new()
+            .suffix(".tar.gz")
+            .tempfile()
+            .expect("temporary TAR.GZ");
+        let mut writer = tar::Builder::new(flate2::write::GzEncoder::new(
+            temp.reopen().expect("reopen temporary TAR.GZ"),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        writer
+            .append_data(&mut header, "large.bin", &contents[..])
+            .expect("write TAR entry");
+        writer
+            .into_inner()
+            .expect("finish TAR")
+            .finish()
+            .expect("finish gzip")
+            .flush()
+            .expect("flush gzip");
+
+        let backing =
+            TarBacking::open_gzip(temp.path(), "fixture".to_string()).expect("open TAR.GZ");
+        let file = backing.open(&smb_path("large.bin")).unwrap();
+        let late_offset = 4 * 1024 * 1024 + 113;
+        assert_eq!(
+            &file.read_at(late_offset as u64, 4096).unwrap()[..],
+            &contents[late_offset..late_offset + 4096]
+        );
+        assert_eq!(&file.read_at(17, 1024).unwrap()[..], &contents[17..1041]);
+    }
+
+    #[test]
+    fn gzip_archives_past_the_expansion_limit_are_rejected() {
+        use std::io::Write as _;
+
+        let temp = tempfile::Builder::new()
+            .suffix(".tar.gz")
+            .tempfile()
+            .expect("temporary TAR.GZ");
+        let mut writer = tar::Builder::new(flate2::write::GzEncoder::new(
+            temp.reopen().expect("reopen temporary TAR.GZ"),
+            flate2::Compression::default(),
+        ));
+        let contents = [0u8; 4096];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        writer
+            .append_data(&mut header, "zeros.bin", &contents[..])
+            .expect("write TAR entry");
+        writer
+            .into_inner()
+            .expect("finish TAR")
+            .finish()
+            .expect("finish gzip")
+            .flush()
+            .expect("flush gzip");
+
+        let error = TarBacking::open_gzip_with_limit(temp.path(), "fixture".to_string(), 1024)
+            .err()
+            .expect("oversized gzip must fail");
+        assert!(
+            matches!(
+                decode_error(&error),
+                DecodeError::OutputLimitExceeded { limit: 1024 }
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn corrupt_gzip_archives_are_rejected() {
+        use std::io::Write as _;
+
+        let mut temp = tempfile::Builder::new()
+            .suffix(".tar.gz")
+            .tempfile()
+            .unwrap();
+        temp.write_all(b"this is not a gzip stream").unwrap();
+        temp.flush().unwrap();
+
+        let error = TarBacking::open_gzip(temp.path(), "fixture".to_string())
+            .err()
+            .expect("corrupt gzip must fail");
+        assert!(error.to_string().contains("decompressing"), "{error:#}");
+    }
+
+    #[test]
+    fn gzip_checksum_mismatches_are_rejected() {
+        use std::io::Write as _;
+
+        let mut temp = tempfile::Builder::new()
+            .suffix(".tar.gz")
+            .tempfile()
+            .expect("temporary TAR.GZ");
+        let mut encoder = flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        );
+        {
+            let mut writer = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(5);
+            header.set_mode(0o644);
+            header.set_cksum();
+            writer
+                .append_data(&mut header, "file.txt", &b"hello"[..])
+                .expect("write TAR entry");
+            writer.finish().expect("finish TAR");
+        }
+        let mut gzip = encoder.finish().expect("finish gzip");
+        let checksum_byte = gzip.len() - 8;
+        gzip[checksum_byte] ^= 0xff;
+        temp.write_all(&gzip).expect("write corrupt gzip");
+        temp.flush().expect("flush corrupt gzip");
+
+        let error = TarBacking::open_gzip(temp.path(), "fixture".to_string())
+            .err()
+            .expect("checksum mismatch must fail");
+        assert!(
+            matches!(
+                decode_error(&error),
+                DecodeError::ChecksumMismatch { member: 0, .. }
+            ),
+            "{error:#}"
+        );
     }
 
     #[test]

@@ -1,9 +1,8 @@
 # smbanything
 
-`smbanything` serves one ZIP or uncompressed TAR archive as an authenticated,
-read-only SMB 2.1 share. It is intended for browsing immutable archives without
-extracting their directory trees first. Gzip-compressed TAR archives are not
-supported.
+`smbanything` serves one ZIP, TAR, or gzip-compressed TAR archive as an
+authenticated, read-only SMB 2.1 share. It is intended for browsing immutable
+archives without extracting their directory trees first.
 
 The SMB implementation is adapted from the immutable snapshot service in
 `wrustic`. It supports the operations needed to mount, list, stat, and read
@@ -18,6 +17,8 @@ cargo build --release
 ./target/release/smbanything archive.zip
 # or
 ./target/release/smbanything archive.tar
+# or
+./target/release/smbanything archive.tar.gz
 ```
 
 The default listener is IPv4 and IPv6 loopback on port 4456, with share name
@@ -76,8 +77,8 @@ conflict with an SMB server already running on the host.
 
 ## Archive behavior
 
-- The archive format is selected from a case-insensitive `.zip` or `.tar`
-  extension. `.tar.gz`, `.tgz`, and other formats are rejected.
+- The archive format is selected from a case-insensitive `.zip`, `.tar`,
+  `.tar.gz`, or `.tgz` extension. Other formats are rejected.
 - Parent directories omitted from the archive are synthesized automatically.
 - Paths must be valid UTF-8. Unsafe paths, names SMB cannot represent,
   duplicate paths, and case-insensitive collisions are rejected.
@@ -98,8 +99,14 @@ ZIP-specific behavior:
 
 TAR-specific behavior:
 
-- The headers are indexed at startup. File reads go directly to the entry's
-  byte range in the TAR, without extracting or copying its contents.
+- Uncompressed TAR headers are indexed at startup. File reads go directly to
+  the entry's byte range, without extracting or copying its contents.
+- Gzip-compressed archives (`.tar.gz`, `.tgz`, including multi-member gzip
+  streams) are decompressed once at startup to index the TAR headers and build
+  an in-memory DEFLATE checkpoint index. The complete decompressed TAR is never
+  written to disk or retained in RAM. Reads resume from the nearest checkpoint,
+  trading some repeated decompression for bounded storage. Every gzip member's
+  CRC and uncompressed size are validated during startup.
 - Regular files and directories are supported. Symbolic links, hard links,
   sparse files, devices, FIFOs, and other special entry types are rejected.
 
