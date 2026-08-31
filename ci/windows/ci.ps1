@@ -113,6 +113,34 @@ try {
     if (-not $drive) { throw 'no unused drive letter is available for the SMB smoke' }
 
     if ($port -ne 445) { throw "packet tunnel reported port $port instead of 445" }
+
+    # A client whose handshake and FIN are processed in the same batch reaches
+    # the tunnel already in CLOSE-WAIT and never appears as ESTABLISHED. Bridge
+    # slots are a fixed pool, so one that is not recycled is retired for the
+    # life of the process. Three times the pool, then the mapping below: both
+    # have to survive.
+    # The server's banner only means its own threads are up: Windows still has
+    # to finish installing the adapter address and the /32 route before it will
+    # route anything to the tunnel. Wait for the first connection to land.
+    $ready = $false
+    foreach ($attempt in 1..100) {
+        $client = [Net.Sockets.TcpClient]::new()
+        try { $client.Connect('169.254.255.1', 445); $ready = $true } catch { }
+        finally { $client.Dispose() }
+        if ($ready) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $ready) { throw 'the packet tunnel never accepted a connection on 169.254.255.1:445' }
+
+    Write-Host '[smoke] probing the bridge pool with connect-then-close clients'
+    foreach ($probe in 1..24) {
+        $client = [Net.Sockets.TcpClient]::new()
+        try { $client.Connect('169.254.255.1', 445) }
+        catch { throw "connect-then-close client ${probe}: $($_.Exception.Message) — the bridge pool is not recycling" }
+        finally { $client.Dispose() }
+        Start-Sleep -Milliseconds 20
+    }
+
     $unc = "\\169.254.255.1\anything\$folder"
     $mapOutput = & net.exe use "${drive}:" $unc 'ci-smoke-password' /user:smbanything 2>&1
     $mapCode = $LASTEXITCODE

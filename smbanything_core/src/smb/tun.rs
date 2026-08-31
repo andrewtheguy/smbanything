@@ -580,7 +580,15 @@ fn pump(
     let mut did_work = false;
     let socket = sockets.get_mut::<tcp::Socket>(bridge.handle);
 
-    if bridge.upstream.is_none() && socket.state() == tcp::State::Established {
+    // CloseWait as well as Established: a client whose handshake, request and
+    // FIN are all processed in one `interface.poll` never appears here as
+    // Established, but its request is buffered and still has to be served.
+    if bridge.upstream.is_none()
+        && matches!(
+            socket.state(),
+            tcp::State::Established | tcp::State::CloseWait
+        )
+    {
         match TcpStream::connect(forward_to) {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
@@ -602,11 +610,22 @@ fn pump(
     }
 
     let Some(upstream) = bridge.upstream.as_mut() else {
-        if !socket.is_open() {
-            recycle(bridge, socket, port);
-            return true;
-        }
-        return did_work;
+        return match socket.state() {
+            // Waiting for a client, or mid-handshake: nothing to bridge yet.
+            tcp::State::Listen | tcp::State::SynReceived => did_work,
+            // Closed or TimeWait: the slot is free for the next client.
+            _ if !socket.is_open() => {
+                recycle(bridge, socket, port);
+                true
+            }
+            // Every other state is a connection that ended before it could be
+            // bridged. Aborting returns the slot; leaving it open would retire
+            // one of the MAX_CONNS bridges for the life of the process.
+            _ => {
+                socket.abort();
+                true
+            }
+        };
     };
 
     while socket.can_recv() && bridge.to_upstream.len() < PROXY_HIGH_WATER {

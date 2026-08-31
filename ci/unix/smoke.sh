@@ -154,6 +154,21 @@ grep -q '^Port:[[:space:]]*445$' "$server_log" || {
 }
 folder=$(grep -m1 '^Folder:' "$server_log" | sed 's/.*\\//')
 
+# A client whose handshake and FIN are processed in the same batch reaches the
+# tunnel already in CLOSE-WAIT and never appears as ESTABLISHED. Bridge slots
+# are a fixed pool, so one that is not recycled is retired for the life of the
+# process. Three times the pool, then the read below: both have to survive.
+info 'probing the bridge pool with connect-then-close clients'
+for _ in $(seq 1 24); do
+    exec 3<>/dev/tcp/169.254.255.1/445 || {
+        echo 'a connect-then-close client was refused: the bridge pool is not recycling' >&2
+        cat "$server_log" >&2
+        exit 1
+    }
+    exec 3>&-
+    sleep 0.02
+done
+
 if [[ "$platform" == Darwin ]]; then
     mount_dir="$work/mount"
     mkdir "$mount_dir"
