@@ -623,9 +623,18 @@ fn requested_level(stub: &[u8]) -> u32 {
     // Non-NULL: max_count, offset, actual_count, then actual_count UTF-16
     // characters padded to a 4-byte boundary.
     let Some(actual) = u32_at(12) else { return 1 };
-    let chars = (actual as usize).saturating_mul(2);
-    let padded = chars.div_ceil(4) * 4;
-    u32_at(16 + padded).unwrap_or(1)
+    // A declared count is client-controlled and need not describe the bytes
+    // actually sent, so every step is checked: on a 32-bit target the padding
+    // arithmetic would otherwise overflow, and there is no offset to look at
+    // when it does.
+    let Some(offset) = (actual as usize)
+        .checked_mul(2)
+        .and_then(|chars| chars.div_ceil(4).checked_mul(4))
+        .and_then(|padded| padded.checked_add(16))
+    else {
+        return 1;
+    };
+    u32_at(offset).unwrap_or(1)
 }
 
 /// Encode the NetrShareEnum reply listing the one share this server offers.

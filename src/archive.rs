@@ -4,6 +4,7 @@ mod tar;
 mod zip;
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -63,6 +64,11 @@ impl Backing for FolderBacking {
     }
 
     fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
+        if path.components().next().is_none() {
+            // The share root is the directory `stat` and `list` report it to be;
+            // saying it does not exist instead contradicts them.
+            return Err(status::FILE_IS_A_DIRECTORY);
+        }
         let inner_path = self
             .inner_path(path)
             .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
@@ -279,10 +285,14 @@ impl<T> ArchiveIndex<T> {
             return Err(status::NOT_A_DIRECTORY);
         }
 
+        // Keys sort so that every descendant of `parent_key` follows it
+        // contiguously, so the range walks only this subtree instead of the
+        // whole archive; the length test then keeps just the direct children.
         Ok(self
             .entries
-            .iter()
-            .filter(|(key, _)| key.len() == parent_key.len() + 1 && key.starts_with(&parent_key))
+            .range::<Vec<String>, _>((Bound::Excluded(&parent_key), Bound::Unbounded))
+            .take_while(|(key, _)| key.starts_with(&parent_key))
+            .filter(|(key, _)| key.len() == parent_key.len() + 1)
             .map(|(_, entry)| entry.info.clone())
             .collect())
     }
@@ -436,6 +446,15 @@ mod tests {
             .open(&smb_path(r"a1b2c3d4\docs\readme.txt"))
             .unwrap();
         assert_eq!(&file.read_at(0, 5).unwrap()[..], b"hello");
+        // Both directories `stat` and `list` report must open as directories,
+        // not as names that do not exist.
+        for directory in ["", "a1b2c3d4"] {
+            assert_eq!(
+                backing.open(&smb_path(directory)).err(),
+                Some(status::FILE_IS_A_DIRECTORY),
+                "opening {directory:?}"
+            );
+        }
         assert_eq!(backing.total_size(), 5);
         assert_eq!(backing.label(), "fixture");
     }

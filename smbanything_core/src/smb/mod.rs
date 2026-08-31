@@ -274,10 +274,15 @@ impl Ctx {
     }
 }
 
-/// Where a client should point. The share is served over loopback, so this is
-/// `127.0.0.1` and the port the listener actually bound — kept as its own type
-/// because the bound port is chosen at runtime and the UNC path a user is told
-/// to mount has to name that same endpoint.
+/// Where a client should point: the address the listener actually bound and the
+/// port it was given. Kept as its own type because the bound port is chosen at
+/// runtime and the UNC path a user is told to mount has to name that same
+/// endpoint.
+///
+/// With [`Bind::Loopback`] the host is `127.0.0.1` and is directly mountable.
+/// With [`Bind::AllInterfaces`] it is the wildcard the socket bound (`::` or
+/// `0.0.0.0`), which names no reachable machine: a caller building a UNC path
+/// has to substitute an address of its own, and `is_wildcard` says when.
 #[derive(Debug, Clone)]
 pub struct MountPoint {
     host: String,
@@ -287,6 +292,15 @@ pub struct MountPoint {
 impl MountPoint {
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// Whether `host` is a wildcard bind address rather than somewhere a client
+    /// can connect to.
+    pub fn is_wildcard(&self) -> bool {
+        matches!(
+            self.host.parse::<std::net::IpAddr>(),
+            Ok(ip) if ip.is_unspecified()
+        )
     }
 
     pub fn port(&self) -> u16 {
@@ -418,15 +432,18 @@ pub fn start(
             vec![listener]
         }
     };
-    let bound_port = listeners_std
+    let bound_addr = listeners_std
         .first()
         .ok_or_else(|| anyhow!("bind_localhost returned no listeners"))?
         .local_addr()
-        .map_err(|e| anyhow!("read bound listener address: {e}"))?
-        .port();
+        .map_err(|e| anyhow!("read bound listener address: {e}"))?;
+    let bound_port = bound_addr.port();
 
+    // Taken from the listener rather than assumed: with `Bind::AllInterfaces`
+    // this is the wildcard the socket bound, and reporting `127.0.0.1` there
+    // would hand callers a UNC path that names the wrong machine.
     let mount = MountPoint {
-        host: "127.0.0.1".to_string(),
+        host: bound_addr.ip().to_string(),
         port: bound_port,
     };
 
@@ -674,7 +691,15 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
                 conn.state.signing_key = None;
             }
         }
-        if stream.write_all(&nbss_header(resp.len())).await.is_err() {
+        let Some(hdr) = nbss_header(resp.len()) else {
+            conn_log!(
+                conn.id,
+                "dropping: {}-byte response exceeds the NetBIOS length field",
+                resp.len()
+            );
+            return;
+        };
+        if stream.write_all(&hdr).await.is_err() {
             return;
         }
         if stream.write_all(&resp).await.is_err() {

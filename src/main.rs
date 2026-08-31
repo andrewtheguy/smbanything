@@ -67,7 +67,9 @@ fn main() -> Result<()> {
         },
     )?;
 
-    let host = if args.bind_all {
+    // A wildcard bind names no reachable machine, so the UNC path printed for
+    // it has to be completed by the user.
+    let host = if handle.mount().is_wildcard() {
         "<server-ip>"
     } else {
         handle.mount().host()
