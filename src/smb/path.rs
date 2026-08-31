@@ -109,6 +109,10 @@ impl SmbPath {
     /// requires a file id that identifies a single directory entry. The
     /// archive is immutable, so a path-derived id is stable for the
     /// life of the share, which is what clients cache against.
+    ///
+    /// Hashed over the lowercased components, because the backing looks entries
+    /// up that way: `DIR\FILE` and `dir\file` reach the same file, so they must
+    /// report the same id — a client that saw two would treat one file as two.
     pub(crate) fn file_id(&self) -> u64 {
         // FNV-1a. Not for security — only for spreading paths across the id
         // space — so a non-cryptographic hash is the right tool.
@@ -116,7 +120,7 @@ impl SmbPath {
         const PRIME: u64 = 0x0000_0100_0000_01B3;
         let mut hash = OFFSET;
         for c in &self.components {
-            for b in c.as_bytes() {
+            for b in c.to_lowercase().as_bytes() {
                 hash ^= u64::from(*b);
                 hash = hash.wrapping_mul(PRIME);
             }
@@ -289,6 +293,23 @@ mod tests {
             SmbPath::parse("a").unwrap().file_id(),
             SmbPath::parse(r"a\b").unwrap().file_id()
         );
+    }
+
+    /// The backing is case-insensitive, so two spellings that open the same file
+    /// must report the same id — otherwise a client sees one file as two.
+    #[test]
+    fn file_ids_ignore_case_like_the_backing_does() {
+        for (a, b) in [
+            (r"dir\file", r"DIR\FILE"),
+            (r"Docs\ReadMe.txt", r"docs\readme.txt"),
+            ("naïve", "NAÏVE"),
+        ] {
+            assert_eq!(
+                SmbPath::parse(a).unwrap().file_id(),
+                SmbPath::parse(b).unwrap().file_id(),
+                "{a:?} and {b:?} name the same entry"
+            );
+        }
     }
 
     #[test]

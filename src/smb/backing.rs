@@ -1,6 +1,6 @@
 // Storage seam between the SMB protocol and an immutable ZIP archive.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -61,6 +61,11 @@ pub(crate) trait Backing: Send + Sync {
     fn total_size(&self) -> u64;
 }
 
+/// Where an entry's expanded copy lives, if it currently has one. Shared with
+/// `ExpandedCache` so eviction can release it without going through the map of
+/// entries.
+type CacheSlot = Arc<Mutex<Option<Arc<CachedFile>>>>;
+
 #[derive(Clone)]
 struct Entry {
     info: NodeInfo,
@@ -68,7 +73,7 @@ struct Entry {
     // The first open expands this entry into an anonymous temporary file.
     // Later SMB handles reuse it, giving true positional reads without keeping
     // a potentially enormous decompressed entry in RAM.
-    cache: Option<Arc<Mutex<Option<Arc<CachedFile>>>>>,
+    cache: Option<CacheSlot>,
 }
 
 impl Entry {
@@ -96,6 +101,12 @@ impl Entry {
     }
 }
 
+/// Total expanded bytes kept on disk before the least recently used copies are
+/// dropped. Reading every file in an archive otherwise leaves the whole thing
+/// decompressed in the temporary directory at once, which for a large archive
+/// fills the disk.
+const MAX_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// A ZIP archive indexed once when the service starts.
 ///
 /// The source file is opened read-only and kept open for the server lifetime,
@@ -110,6 +121,9 @@ pub(crate) struct ZipBacking {
     label: String,
     total_size: u64,
     file_count: usize,
+    // Bounds the expanded copies `expand` leaves behind. Separate from
+    // `entries` because eviction is ordered by use, not by path.
+    expanded: Mutex<ExpandedCache>,
 }
 
 impl ZipBacking {
@@ -209,6 +223,7 @@ impl ZipBacking {
             label: label.into(),
             total_size,
             file_count,
+            expanded: Mutex::new(ExpandedCache::new(MAX_EXPANDED_BYTES)),
         })
     }
 
@@ -222,10 +237,27 @@ impl ZipBacking {
 
     fn expand(&self, entry: &Entry, path: &SmbPath) -> Result<Arc<CachedFile>, u32> {
         let zip_index = entry.zip_index.ok_or(status::FILE_IS_A_DIRECTORY)?;
-        let cache = entry.cache.as_ref().ok_or(status::UNEXPECTED_IO_ERROR)?;
-        let mut cached = cache.lock().map_err(|_| status::UNEXPECTED_IO_ERROR)?;
-        if let Some(file) = &*cached {
-            return Ok(file.clone());
+        let slot = entry.cache.as_ref().ok_or(status::UNEXPECTED_IO_ERROR)?;
+        let key = key_for_smb_path(path);
+
+        // The slot lock is held across the decompression below, so a hit is
+        // taken and released first: a second reader of a file already expanded
+        // must not queue behind a first reader still expanding another.
+        let hit = {
+            let cached = slot.lock().map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+            (*cached).clone()
+        };
+        if let Some(file) = hit {
+            self.touch_expanded(&key);
+            return Ok(file);
+        }
+
+        let mut cached = slot.lock().map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+        // Another thread may have expanded it while this one waited.
+        if let Some(file) = (*cached).clone() {
+            drop(cached);
+            self.touch_expanded(&key);
+            return Ok(file);
         }
 
         let result = (|| -> Result<Arc<CachedFile>> {
@@ -261,12 +293,143 @@ impl ZipBacking {
         match result {
             Ok(file) => {
                 *cached = Some(file.clone());
+                // Registered only after the slot guard is released: eviction
+                // takes slot locks while holding the cache lock, so a thread
+                // holding a slot must never wait for that lock.
+                let size = file.size;
+                drop(cached);
+                self.remember_expanded(key, slot.clone(), size);
                 Ok(file)
             }
             Err(error) => {
                 smb_log!("open {:?} failed: {error:#}", path.to_smb_absolute());
                 Err(status::UNEXPECTED_IO_ERROR)
             }
+        }
+    }
+
+    fn touch_expanded(&self, key: &[String]) {
+        if let Ok(mut expanded) = self.expanded.lock() {
+            expanded.touch(key);
+        }
+    }
+
+    fn remember_expanded(&self, key: Vec<String>, slot: CacheSlot, size: u64) {
+        if let Ok(mut expanded) = self.expanded.lock() {
+            expanded.insert(key, slot, size);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_expanded_limit(&self, limit: u64) {
+        let mut expanded = self.expanded.lock().expect("cache lock");
+        expanded.limit = limit;
+        expanded.evict_down_to_limit(&[]);
+    }
+
+    #[cfg(test)]
+    fn expanded_bytes(&self) -> u64 {
+        self.expanded.lock().expect("cache lock").total
+    }
+}
+
+/// Least-recently-used accounting over the expanded copies.
+///
+/// Holds no file itself: each resident entry keeps the slot the copy lives in,
+/// and evicting one clears that slot. A handle already reading the file holds
+/// its own `Arc`, so the temporary file survives eviction until the last reader
+/// drops it — the cache stops *reusing* it, it does not pull it away.
+struct ExpandedCache {
+    limit: u64,
+    total: u64,
+    /// Monotonic use counter; the lowest value is the least recently used.
+    tick: u64,
+    order: BTreeMap<u64, Vec<String>>,
+    resident: HashMap<Vec<String>, Resident>,
+}
+
+struct Resident {
+    tick: u64,
+    size: u64,
+    slot: CacheSlot,
+}
+
+impl ExpandedCache {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            total: 0,
+            tick: 0,
+            order: BTreeMap::new(),
+            resident: HashMap::new(),
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick += 1;
+        self.tick
+    }
+
+    fn touch(&mut self, key: &[String]) {
+        let tick = self.next_tick();
+        if let Some(resident) = self.resident.get_mut(key) {
+            self.order.remove(&resident.tick);
+            resident.tick = tick;
+            self.order.insert(tick, key.to_vec());
+        }
+    }
+
+    fn insert(&mut self, key: Vec<String>, slot: CacheSlot, size: u64) {
+        if let Some(previous) = self.resident.remove(&key) {
+            self.order.remove(&previous.tick);
+            self.total = self.total.saturating_sub(previous.size);
+        }
+        let tick = self.next_tick();
+        self.order.insert(tick, key.clone());
+        self.total = self.total.saturating_add(size);
+        self.resident
+            .insert(key.clone(), Resident { tick, size, slot });
+        self.evict_down_to_limit(&key);
+    }
+
+    /// Drop least-recently-used copies until the total is back inside the
+    /// limit. `keep` is the entry just inserted: a single file larger than the
+    /// whole limit would otherwise be expanded and immediately discarded on
+    /// every open.
+    fn evict_down_to_limit(&mut self, keep: &[String]) {
+        if self.total <= self.limit {
+            return;
+        }
+        let candidates: Vec<(u64, Vec<String>)> = self
+            .order
+            .iter()
+            .map(|(tick, key)| (*tick, key.clone()))
+            .collect();
+        for (tick, key) in candidates {
+            if self.total <= self.limit {
+                break;
+            }
+            if key == keep {
+                continue;
+            }
+            let Some((size, slot)) = self
+                .resident
+                .get(&key)
+                .map(|resident| (resident.size, resident.slot.clone()))
+            else {
+                continue;
+            };
+            // An entry being expanded right now holds its slot lock. Waiting
+            // for it would block every other open behind the cache lock, so it
+            // is left for a later insert to reconsider.
+            let Ok(mut guard) = slot.try_lock() else {
+                continue;
+            };
+            *guard = None;
+            drop(guard);
+            self.resident.remove(&key);
+            self.order.remove(&tick);
+            self.total = self.total.saturating_sub(size);
         }
     }
 }
@@ -606,6 +769,65 @@ mod tests {
         assert!(file.read_at(10, 1).unwrap().is_empty());
     }
 
+    /// Expanded copies are temporary files on disk, so reading through a large
+    /// archive must not leave every entry decompressed at once.
+    #[test]
+    fn the_expanded_cache_evicts_least_recently_used_copies() {
+        let (_temp, backing) = archive(&[
+            ("a.txt", b"aaaaaaaaaa"),
+            ("b.txt", b"bbbbbbbbbb"),
+            ("c.txt", b"cccccccccc"),
+        ]);
+        // Room for two of the three ten-byte entries.
+        backing.set_expanded_limit(25);
+
+        let a = backing.open(&smb_path("a.txt")).unwrap();
+        backing.open(&smb_path("b.txt")).unwrap();
+        // Re-reading `a` makes `b` the least recently used one.
+        backing.open(&smb_path("a.txt")).unwrap();
+        backing.open(&smb_path("c.txt")).unwrap();
+
+        assert!(
+            backing.expanded_bytes() <= 25,
+            "cache grew past its limit: {}",
+            backing.expanded_bytes()
+        );
+        {
+            let expanded = backing.expanded.lock().unwrap();
+            assert!(expanded.resident.contains_key(&vec!["a.txt".to_string()]));
+            assert!(expanded.resident.contains_key(&vec!["c.txt".to_string()]));
+            assert!(
+                !expanded.resident.contains_key(&vec!["b.txt".to_string()]),
+                "the least recently used copy must be the one dropped"
+            );
+        }
+
+        // A handle taken before eviction keeps reading its own copy, and an
+        // evicted entry simply expands again.
+        assert_eq!(&a.read_at(0, 4).unwrap()[..], b"aaaa");
+        assert_eq!(
+            &backing
+                .open(&smb_path("b.txt"))
+                .unwrap()
+                .read_at(0, 4)
+                .unwrap()[..],
+            b"bbbb"
+        );
+    }
+
+    /// A file larger than the whole limit is still served: it is kept for the
+    /// open that expanded it rather than discarded on the spot and re-expanded
+    /// on every read.
+    #[test]
+    fn an_entry_larger_than_the_limit_is_still_cached() {
+        let (_temp, backing) = archive(&[("big.bin", &[7u8; 64])]);
+        backing.set_expanded_limit(8);
+        let file = backing.open(&smb_path("big.bin")).unwrap();
+        assert_eq!(file.read_at(0, 2).unwrap().len(), 2);
+        let expanded = backing.expanded.lock().unwrap();
+        assert!(expanded.resident.contains_key(&vec!["big.bin".to_string()]));
+    }
+
     #[test]
     fn unsafe_and_ambiguous_paths_are_rejected() {
         for name in ["../secret", "/absolute", "a//b", "a\\b", "bad:name"] {
@@ -658,7 +880,9 @@ mod tests {
         // or password is ever requested.
         let mut bytes = std::fs::read(temp.path()).unwrap();
         let mut marked = 0;
-        for (signature, flags_offset) in [(&b"PK\x03\x04"[..], 6usize), (&b"PK\x01\x02"[..], 8usize)] {
+        for (signature, flags_offset) in
+            [(&b"PK\x03\x04"[..], 6usize), (&b"PK\x01\x02"[..], 8usize)]
+        {
             let start = bytes
                 .windows(signature.len())
                 .position(|window| window == signature)

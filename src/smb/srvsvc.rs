@@ -181,7 +181,9 @@ pub(crate) fn close(body: &[u8], pipe: &mut Option<Pipe>) -> Result<Vec<u8>, u32
     w.u16(60); // StructureSize
     w.u16(0); // Flags
     w.u32(0); // Reserved
-    w.zeros(8 * 6 + 4 + 4); // times, sizes, attributes, reserved — all zero
+    // Six 8-byte timestamps/sizes and a 4-byte FileAttributes, all zero, which
+    // with the 8 bytes above is the 60 StructureSize declares.
+    w.zeros(8 * 6 + 4);
     Ok(w.into_vec())
 }
 
@@ -240,6 +242,12 @@ pub(crate) fn read(body: &[u8], pipe: &mut Option<Pipe>) -> Result<Vec<u8>, u32>
     r.skip(8).map_err(|_| status::INVALID_PARAMETER)?; // Offset
     check_file_id(&mut r)?;
 
+    if length == 0 {
+        // A zero-length read can never make progress: it would report success
+        // having handed over nothing, and a client draining the queue would
+        // spin on it forever.
+        return Err(status::INVALID_PARAMETER);
+    }
     if pipe.pending.is_empty() {
         // Nothing was asked, so there is nothing to collect. END_OF_FILE is how
         // a read past the end of a pipe's queued data is reported.
@@ -1072,6 +1080,39 @@ mod tests {
             read(&read_request(4096), &mut pipe).unwrap_err(),
             status::END_OF_FILE
         );
+    }
+
+    /// A read that asks for nothing cannot drain anything, so it is refused
+    /// rather than answered with an empty success a client would loop on.
+    #[test]
+    fn a_zero_length_read_is_refused() {
+        let mut pipe = Some(Pipe::default());
+        pipe.as_mut().expect("open").pending = b"queued".to_vec();
+        assert_eq!(
+            read(&read_request(0), &mut pipe).unwrap_err(),
+            status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            pipe.as_ref().expect("open").pending,
+            b"queued",
+            "the refusal must not consume the queue"
+        );
+    }
+
+    /// The CLOSE response body is 60 bytes, which is what its StructureSize
+    /// declares; a longer one is trailing rubbish the client parses as a field.
+    #[test]
+    fn the_close_response_is_sixty_bytes() {
+        let mut pipe = Some(Pipe::default());
+        let mut w = Writer::new();
+        w.u16(24); // StructureSize
+        w.u16(0); // Flags
+        w.u32(0); // Reserved
+        w.u64(PIPE_FILE_ID);
+        w.u64(PIPE_FILE_ID);
+        let resp = close(&w.into_vec(), &mut pipe).unwrap();
+        assert_eq!(resp.len(), 60);
+        assert_eq!(u16::from_le_bytes([resp[0], resp[1]]), 60);
     }
 
     #[test]

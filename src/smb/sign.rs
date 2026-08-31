@@ -52,12 +52,17 @@ fn pdu_extents(buf: &[u8]) -> Vec<(usize, usize)> {
                 .try_into()
                 .expect("4 bytes present"),
         ) as usize;
-        if next == 0 || offset + next > buf.len() || next < HEADER_LEN {
+        // Checked: `next` is a client-supplied u32, so on a 32-bit target
+        // `offset + next` can wrap and turn an out-of-bounds link into one that
+        // passes the range check. An overflow is just an invalid link.
+        let end = offset.checked_add(next);
+        if next == 0 || next < HEADER_LEN || end.is_none_or(|end| end > buf.len()) {
             out.push((offset, buf.len()));
             break;
         }
-        out.push((offset, offset + next));
-        offset += next;
+        let offset_end = end.expect("checked above");
+        out.push((offset, offset_end));
+        offset = offset_end;
     }
     out
 }

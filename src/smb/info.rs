@@ -101,9 +101,9 @@ pub(crate) fn allocation_size(size: u64) -> u64 {
 }
 
 fn write_times(w: &mut Writer, info: &NodeInfo) {
-    // SMB has a creation time and restic does not record one. ctime is the
-    // closest available: it is the inode-change time, which for a file written
-    // once and never modified equals its creation.
+    // SMB has a creation time and a ZIP archive does not record one. ctime is
+    // the closest available: it is the inode-change time, which for a file
+    // written once and never modified equals its creation.
     w.u64(to_filetime(info.ctime)); // CreationTime
     w.u64(to_filetime(info.atime)); // LastAccessTime
     w.u64(to_filetime(info.mtime)); // LastWriteTime
@@ -294,11 +294,7 @@ pub(crate) fn fs_attribute() -> Vec<u8> {
 
     let name = utf16le("smbzip");
     let mut w = Writer::with_capacity(12 + name.len());
-    w.u32(
-        FILE_CASE_PRESERVED_NAMES
-            | FILE_UNICODE_ON_DISK
-            | FILE_READ_ONLY_VOLUME,
-    ); // 0 FileSystemAttributes
+    w.u32(FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK | FILE_READ_ONLY_VOLUME); // 0 FileSystemAttributes
     w.u32(255); // 4 MaximumComponentNameLength
     w.u32(name.len() as u32); // 8 FileSystemNameLength
     w.bytes(&name);

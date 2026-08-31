@@ -273,9 +273,10 @@ impl Ctx {
     }
 }
 
-/// Where a client should point, which is not the socket the server bound when
-/// the tun transport fronts the share: there the SMB code listens on an
-/// ephemeral loopback port while clients connect to the tun address on 445.
+/// Where a client should point. The share is served over loopback, so this is
+/// `127.0.0.1` and the port the listener actually bound — kept as its own type
+/// because the bound port is chosen at runtime and the UNC path a user is told
+/// to mount has to name that same endpoint.
 #[derive(Debug, Clone)]
 pub(crate) struct MountPoint {
     pub(crate) host: String,
@@ -511,6 +512,13 @@ async fn accept_loop(
 /// it would hold its task and socket for as long as the server ran.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// How long the rest of a message may take to arrive once its NetBIOS header
+/// has. Much shorter than `IDLE_TIMEOUT`: the length is already committed, so
+/// the bytes are either in flight or never coming. Without it a client that
+/// announces a large message and then sends nothing pins a connection — and its
+/// task — for as long as it likes.
+const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Refused logons across the whole server, since the last successful one,
 /// before it stops serving.
 ///
@@ -567,9 +575,9 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
     }
     let mut nb = [0u8; NBSS_HEADER_LEN];
     loop {
-        // Only the wait for a *new* message is bounded. Once a header has
-        // arrived the rest of that message is already in flight, so timing out
-        // partway through it would drop a connection that is working fine.
+        // The wait for a *new* message is generously bounded; the body that
+        // follows a header gets `BODY_TIMEOUT`, since those bytes are already in
+        // flight and a client still not sending them is not working fine.
         match tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut nb)).await {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => return,
@@ -590,15 +598,25 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
             return;
         }
         let mut msg = vec![0u8; len];
-        if stream.read_exact(&mut msg).await.is_err() {
-            return;
+        match tokio::time::timeout(BODY_TIMEOUT, stream.read_exact(&mut msg)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => return,
+            Err(_) => {
+                conn_log!(
+                    conn.id,
+                    "dropping: message body stalled for {}s",
+                    BODY_TIMEOUT.as_secs()
+                );
+                return;
+            }
         }
-        // The file handlers call into ZIP decompression, which blocks — on a cache
-        // miss that is an S3 round trip. `block_in_place` moves the reactor to
-        // another worker for the duration instead of stalling every other
-        // connection on this one. It is applied here, at the single call site,
-        // rather than inside the handlers, so the protocol code stays sync and
-        // directly unit-testable without a runtime.
+        // The file handlers call into ZIP decompression, which blocks — on a
+        // cache miss that is reading and inflating the entry out of the local
+        // archive file. `block_in_place` moves the reactor to another worker for
+        // the duration instead of stalling every other connection on this one.
+        // It is applied here, at the single call site, rather than inside the
+        // handlers, so the protocol code stays sync and directly unit-testable
+        // without a runtime.
         // Verify with the key held *before* this message is processed: the
         // SESSION_SETUP that establishes the key is itself unsigned, and its
         // response is the first thing signed.
@@ -1626,12 +1644,7 @@ mod tests {
     fn commands_before_authentication_are_refused() {
         let mut conn = Conn::new(ctx());
         let resp = conn
-            .handle_message(&request(
-                cmd::TREE_CONNECT,
-                0,
-                0,
-                &tree_connect_body("zip"),
-            ))
+            .handle_message(&request(cmd::TREE_CONNECT, 0, 0, &tree_connect_body("zip")))
             .expect("answered");
         assert_eq!(parse_response(&resp).status, status::USER_SESSION_DELETED);
     }

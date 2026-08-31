@@ -28,10 +28,18 @@ fn bind_localhost_once(port: u16) -> Result<Vec<TcpListener>> {
         .map_err(|e| anyhow!("read bound IPv4 listener address: {e}"))?
         .port();
 
+    // A host with IPv6 disabled, or one where only the v6 loopback of this port
+    // is taken, must still get a working server: the v4 listener is already
+    // bound and serving it is strictly better than failing the whole startup.
+    // Only a v4 failure — handled above — is fatal.
     let v6_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, bound_port, 0, 0));
-    let v6 = bind_one(v6_addr, "IPv6")?;
-
-    Ok(vec![v4, v6])
+    match bind_one(v6_addr, "IPv6") {
+        Ok(v6) => Ok(vec![v4, v6]),
+        Err(e) => {
+            eprintln!("smbzip: {e}; serving IPv4 loopback only");
+            Ok(vec![v4])
+        }
+    }
 }
 
 fn bind_one(addr: SocketAddr, family: &'static str) -> Result<TcpListener> {
@@ -90,16 +98,22 @@ mod tests {
         assert!(msg.contains(&format!("127.0.0.1:{port}")), "{msg}");
     }
 
+    /// An IPv6 loopback that cannot be bound is not fatal: the IPv4 listener is
+    /// already up, and dropping it would refuse service on a host that only
+    /// happens to have `[::1]` taken — or no IPv6 at all.
     #[test]
-    fn fails_when_ipv6_port_is_in_use() {
+    fn ipv6_conflict_still_serves_ipv4() {
         let blocker = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).expect("bind IPv6 blocker");
         let port = blocker.local_addr().unwrap().port();
 
-        let err = bind_localhost(port).expect_err("IPv6 conflict should fail");
-        let msg = err.to_string();
-
-        assert!(msg.contains("already in use"), "{msg}");
-        assert!(msg.contains("IPv6"), "{msg}");
-        assert!(msg.contains(&format!("[::1]:{port}")), "{msg}");
+        let listeners = bind_localhost(port).expect("IPv4-only startup is allowed");
+        let addrs = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))]
+        );
     }
 }
