@@ -3,8 +3,8 @@
 # ci/unix/smoke.sh against that build. Runs natively on whatever Unix machine
 # invokes it: this Linux host through ci/unix/remote.sh (a Linux driver always
 # runs locally), or the macOS VM through `ci/unix/remote.sh -H macvm`. It
-# installs nothing and changes no machine state; `remote.sh doctor` checks for
-# the SMB client the smoke needs.
+# installs nothing permanently; the smoke creates one native TUN adapter and
+# two host routes, then removes them. `remote.sh doctor` checks its prerequisites.
 set -euo pipefail
 
 # Invoked over ssh the working directory is the login user's home, not the
@@ -27,8 +27,8 @@ cargo --version
 cargo clippy --version
 [ -n "${CARGO_TARGET_DIR:-}" ] && echo "   CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 
-step 'Clippy' clippy --all-targets --all-features -- -D warnings
-step 'Test' test --all-features
+step 'Clippy' clippy --workspace --all-targets --all-features -- -D warnings
+step 'Test' test --workspace --all-features
 step 'Release build' build --release
 
 echo ''

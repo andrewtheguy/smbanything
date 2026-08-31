@@ -18,20 +18,26 @@ fixture_base=https://github.com/huggingface/candle/archive/refs/tags/0.11.0
 platform=$(uname -s)
 pid=
 mount_dir=
+elevated_pid=false
 
 info() { echo "[smoke] $*"; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
 cleanup() {
-    if [[ -n "$mount_dir" ]] && mount | grep -Fq " on $mount_dir "; then
-        umount "$mount_dir"
+    if [[ -n "$mount_dir" ]]; then
+        # macOS canonicalizes /tmp to /private/tmp in `mount` output, so a
+        # textual mount-table check misses the exact mount we just created.
+        # umount already gives us the authoritative answer and this path is a
+        # per-run mktemp directory, never a broad target.
+        umount "$mount_dir" 2>/dev/null || true
     fi
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill -INT "$pid"
+    if [[ -n "$pid" ]] && { kill -0 "$pid" 2>/dev/null || $elevated_pid; }; then
+        if $elevated_pid; then sudo -n kill -INT "$pid" 2>/dev/null || true; else kill -INT "$pid"; fi
         wait "$pid"
     fi
     pid=
     mount_dir=
+    elevated_pid=false
 }
 trap cleanup EXIT
 
@@ -120,3 +126,53 @@ for archive in tmp/candle-0.11.0.zip tmp/candle-0.11.0.tar tmp/candle-0.11.0.tar
 
     info "verified $name ($actual_hash)"
 done
+
+# Exercise the packet path itself with the TAR.GZ fixture. Creating the native
+# TUN adapter and its two host routes is the one part that needs elevation; no
+# privileged TCP socket is opened, and dropping the process removes both.
+work=$(mktemp -d "${TMPDIR:-/tmp}/smbanything-tun-smoke.XXXXXX")
+runtime_tmp="$work/runtime-tmp"
+mkdir "$runtime_tmp"
+server_log="$work/server.log"
+downloaded="$work/Cargo.toml"
+
+info 'serving candle-0.11.0.tar.gz through 169.254.255.1'
+sudo -n env TMPDIR="$runtime_tmp" SMBANYTHING_PASSWORD="$password" \
+    "$binary" tmp/candle-0.11.0.tar.gz --smb-tun >"$server_log" 2>&1 &
+pid=$!
+elevated_pid=true
+
+for _ in $(seq 1 200); do
+    grep -q '^Port:' "$server_log" && break
+    sudo -n kill -0 "$pid" 2>/dev/null || { cat "$server_log" >&2; exit 1; }
+    sleep 0.05
+done
+grep -q '^Port:[[:space:]]*445$' "$server_log" || {
+    echo 'packet tunnel did not start on port 445' >&2
+    cat "$server_log" >&2
+    exit 1
+}
+folder=$(grep -m1 '^Folder:' "$server_log" | sed 's/.*\\//')
+
+if [[ "$platform" == Darwin ]]; then
+    mount_dir="$work/mount"
+    mkdir "$mount_dir"
+    mount_smbfs "//smbanything:$password@169.254.255.1/anything/$folder" "$mount_dir"
+    cp "$mount_dir/candle-0.11.0/Cargo.toml" "$downloaded"
+else
+    smbclient //169.254.255.1/anything \
+        -U "smbanything%$password" \
+        '--option=client min protocol=SMB2_10' \
+        '--option=client max protocol=SMB2_10' \
+        -c "get ${folder}\\candle-0.11.0\\Cargo.toml $downloaded" \
+        >"$work/client.log" 2>&1 \
+        || { cat "$work/client.log" >&2; exit 1; }
+fi
+
+actual_hash=$(sha256 "$downloaded" | cut -d' ' -f1)
+[[ "$actual_hash" == "$expected_hash" ]] || {
+    echo "packet-tunneled file hash mismatch: $actual_hash" >&2
+    exit 1
+}
+cleanup
+info "verified packet tunnel ($actual_hash)"

@@ -20,7 +20,7 @@ struct Args {
     archive: PathBuf,
 
     /// TCP port to listen on (0 chooses an ephemeral port)
-    #[arg(short, long, default_value_t = 4456)]
+    #[arg(short, long, default_value_t = 4456, conflicts_with = "smb_tun")]
     port: u16,
 
     /// SMB share name
@@ -32,8 +32,20 @@ struct Args {
     user: String,
 
     /// Listen on every interface instead of IPv4/IPv6 loopback
-    #[arg(long)]
+    #[arg(long, conflicts_with = "smb_tun")]
     bind_all: bool,
+
+    /// Serve port 445 through a private packet tunnel at 169.254.255.1
+    #[arg(long)]
+    smb_tun: bool,
+
+    /// Client address for --smb-tun; the next address is assigned to the adapter
+    #[arg(
+        long,
+        default_value_t = smb::DEFAULT_TUN_ADDRS,
+        requires = "smb_tun"
+    )]
+    smb_tun_ip: smb::TunAddrs,
 }
 
 fn main() -> Result<()> {
@@ -51,7 +63,12 @@ fn main() -> Result<()> {
     let total_size = smb::Backing::total_size(backing.as_ref());
     let backing = archive::FolderBacking::new(&folder_name, backing);
 
-    let bind = if args.bind_all {
+    let bind = if args.smb_tun {
+        smb::Bind::Tun(smb::TunConfig {
+            port: smb::STANDARD_SMB_PORT,
+            addrs: args.smb_tun_ip,
+        })
+    } else if args.bind_all {
         smb::Bind::AllInterfaces
     } else {
         smb::Bind::Loopback
@@ -74,7 +91,7 @@ fn main() -> Result<()> {
     } else {
         handle.mount().host()
     };
-    let port = handle.port();
+    let port = handle.mount().port();
     println!(
         "Serving {} file{} ({} bytes) from {}",
         file_count,
@@ -261,6 +278,45 @@ mod tests {
         assert_eq!(
             absolute.file_name().and_then(|name| name.to_str()),
             Some("photos.zip")
+        );
+    }
+
+    #[test]
+    fn packet_tunnel_uses_the_reserved_link_local_pair() {
+        let default = smb::DEFAULT_TUN_ADDRS;
+        assert_eq!(
+            default.virtual_ip(),
+            std::net::Ipv4Addr::new(169, 254, 255, 1)
+        );
+        assert_eq!(
+            default.adapter_ip(),
+            std::net::Ipv4Addr::new(169, 254, 255, 2)
+        );
+        for address in [default.virtual_ip(), default.adapter_ip()] {
+            assert!(address.is_link_local());
+            assert_eq!(address.octets()[2], 255);
+        }
+    }
+
+    #[test]
+    fn packet_tunnel_cli_rejects_incompatible_listener_options() {
+        assert!(Args::try_parse_from(["smbanything", "a.zip", "--smb-tun"]).is_ok());
+        assert!(
+            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun", "--bind-all"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun", "--port", "445"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "smbanything",
+                "a.zip",
+                "--smb-tun-ip",
+                "169.254.255.3"
+            ])
+            .is_err()
         );
     }
 }
