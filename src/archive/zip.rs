@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use smbanything_core::smb::{Backing, FileReader, NodeInfo, SmbPath, status};
+use tempfile::{TempDir, TempPath};
 use zip::ZipArchive;
 
 use super::{ArchiveIndex, IndexedEntry, key_for_smb_path};
@@ -33,6 +34,9 @@ pub(super) struct ZipBacking {
     index: ArchiveIndex<ZipContent>,
     label: String,
     expanded: Mutex<ExpandedCache>,
+    /// Holds every expanded entry, so the whole lot goes away together when the
+    /// last reference to any of them drops.
+    spill: Arc<TempDir>,
 }
 
 impl ZipBacking {
@@ -93,11 +97,17 @@ impl ZipBacking {
             bail!("ZIP entries contain overlapping compressed data");
         }
 
+        let spill = tempfile::Builder::new()
+            .prefix("smbanything-")
+            .tempdir()
+            .context("creating the directory for expanded ZIP entries")?;
+
         Ok(Self {
             archive: Mutex::new(archive),
             index,
             label,
             expanded: Mutex::new(ExpandedCache::new(MAX_EXPANDED_BYTES)),
+            spill: Arc::new(spill),
         })
     }
 
@@ -147,7 +157,8 @@ impl ZipBacking {
                 bail!("ZIP entry became encrypted after indexing");
             }
 
-            let mut file = tempfile::tempfile().context("creating ZIP entry cache")?;
+            let mut file = tempfile::NamedTempFile::new_in(self.spill.path())
+                .context("creating ZIP entry cache")?;
             let copied = std::io::copy(&mut source, &mut file)
                 .with_context(|| format!("decompressing {}", path.to_smb_absolute()))?;
             if copied != entry.info.size {
@@ -159,9 +170,13 @@ impl ZipBacking {
                 );
             }
             file.flush().context("flushing ZIP entry cache")?;
+            // Closes the descriptor and keeps the file: what gets cached is a
+            // path, never an open handle. See `CachedFile`.
+            let path = file.into_temp_path();
             Ok(Arc::new(CachedFile {
-                file: Mutex::new(file),
+                path,
                 size: copied,
+                _dir: Arc::clone(&self.spill),
             }))
         })();
 
@@ -241,9 +256,31 @@ impl Backing for ZipBacking {
     }
 }
 
+/// One expanded ZIP entry, kept as a file on disk rather than as an open
+/// descriptor.
+///
+/// Holding the descriptor instead ties the number of open files to the number
+/// of entries a client has ever read, which nothing bounds: `ExpandedCache`
+/// below is bounded in bytes, so an archive that fits under that limit — the
+/// normal case — never evicts anything and never gives a descriptor back. A
+/// client walking such an archive therefore runs the process out of
+/// descriptors, and every expansion after that fails permanently. macOS makes
+/// this easy to reach, its default soft limit being 256, and its SMB client
+/// turns the resulting READ failure into a successful zero-byte read, so the
+/// share silently appears to hold empty files rather than reporting an error.
+///
+/// Reopening per read costs one `open` per READ — negligible beside the round
+/// trip that asked for it — and bounds descriptor use by the reads in flight,
+/// which the connection count already bounds.
 struct CachedFile {
-    file: Mutex<File>,
+    /// Deletes the expanded copy once the cache and every handle using it are
+    /// done with it. Declared before `_dir` so the file goes before the
+    /// directory that contains it.
+    path: TempPath,
     size: u64,
+    /// Keeps the spill directory alive for as long as any expanded entry lives
+    /// in it, whatever order the backing and its open handles drop in.
+    _dir: Arc<TempDir>,
 }
 
 impl FileReader for CachedFile {
@@ -254,7 +291,7 @@ impl FileReader for CachedFile {
         let wanted = u64::from(len).min(self.size - offset);
         let wanted = usize::try_from(wanted).map_err(|_| status::INVALID_PARAMETER)?;
         let mut buffer = vec![0u8; wanted];
-        let mut file = self.file.lock().map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+        let mut file = File::open(&self.path).map_err(|_| status::UNEXPECTED_IO_ERROR)?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
 
@@ -426,6 +463,84 @@ mod tests {
         assert_eq!(&file.read_at(0, 3).unwrap()[..], b"012");
         assert_eq!(&file.read_at(8, 20).unwrap()[..], b"89");
         assert!(file.read_at(10, 1).unwrap().is_empty());
+    }
+
+    /// How many descriptors this process holds open under `dir`.
+    ///
+    /// Counted per path rather than as a process-wide total so that the other
+    /// tests, which run in parallel threads and open files of their own, cannot
+    /// perturb it. Only Linux exposes the mapping; elsewhere the correctness
+    /// half of the test below still runs, but the count is not observable.
+    #[cfg(target_os = "linux")]
+    fn descriptors_under(dir: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("/proc/self/fd")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target.starts_with(dir))
+            .count()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn descriptors_under(_dir: &std::path::Path) -> usize {
+        0
+    }
+
+    /// The expanded copies must not outlive the server, and must not be pulled
+    /// out from under a handle that is still reading one.
+    #[test]
+    fn expanded_copies_live_exactly_as_long_as_they_are_needed() {
+        let (_temp, backing) = archive(&[("a.txt", b"aaaa"), ("b.txt", b"bbbb")]);
+        let spill = backing.spill.path().to_path_buf();
+
+        let file = backing.open(&smb_path("a.txt")).unwrap();
+        backing.open(&smb_path("b.txt")).unwrap();
+        assert_eq!(std::fs::read_dir(&spill).unwrap().count(), 2);
+
+        // A handle still holding an expanded copy keeps it readable even once
+        // the backing serving it is gone.
+        drop(backing);
+        assert!(spill.is_dir());
+        assert_eq!(&file.read_at(0, 4).unwrap()[..], b"aaaa");
+
+        // The last user going away takes the whole spill directory with it.
+        drop(file);
+        assert!(!spill.exists(), "{} was left behind", spill.display());
+    }
+
+    /// Reading every entry must not leave one descriptor open per entry. That
+    /// grows without bound — the cache is bounded in bytes, so an archive under
+    /// the limit evicts nothing and returns no descriptors — until the process
+    /// runs out and every later expansion fails for good.
+    #[test]
+    fn expanding_every_entry_holds_no_descriptors() {
+        let contents: Vec<(String, Vec<u8>)> = (0..400)
+            .map(|i| {
+                (
+                    format!("f{i:03}.txt"),
+                    format!("contents of entry {i}").into_bytes(),
+                )
+            })
+            .collect();
+        let entries: Vec<(&str, &[u8])> = contents
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_slice()))
+            .collect();
+        let (_temp, backing) = archive(&entries);
+
+        for (name, body) in &contents {
+            let file = backing.open(&smb_path(name)).unwrap();
+            let read = file.read_at(0, body.len() as u32).unwrap();
+            assert_eq!(&read[..], &body[..], "{name}");
+        }
+
+        // Nothing was evicted, the archive being far below the byte limit, so
+        // this is exactly the state that used to hold one descriptor per entry.
+        assert_eq!(
+            backing.expanded.lock().unwrap().resident.len(),
+            contents.len()
+        );
+        assert_eq!(descriptors_under(backing.spill.path()), 0);
     }
 
     #[test]

@@ -121,6 +121,11 @@ fn main() -> Result<()> {
     println!();
     println!("Press Ctrl-C to stop.");
 
+    // Handles SIGTERM and SIGHUP as well as SIGINT (the `termination` feature),
+    // so that every ordinary way of stopping the server unwinds to the end of
+    // main. Expanded ZIP entries live in a temporary directory that is removed
+    // when the backing drops, and a signal that kills the process outright
+    // leaves that directory behind.
     let (stop_tx, stop_rx) = mpsc::sync_channel(1);
     ctrlc::set_handler(move || {
         let _ = stop_tx.try_send(());
