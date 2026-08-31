@@ -400,8 +400,6 @@ impl ExpandedCache {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
     use tempfile::NamedTempFile;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
