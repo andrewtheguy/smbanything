@@ -101,7 +101,7 @@ pub(crate) fn allocation_size(size: u64) -> u64 {
 }
 
 fn write_times(w: &mut Writer, info: &NodeInfo) {
-    // SMB has a creation time and a ZIP archive does not record one. ctime is
+    // SMB has a creation time and a generic backing may not record one. ctime is
     // the closest available: it is the inode-change time, which for a file
     // written once and never modified equals its creation.
     w.u64(to_filetime(info.ctime)); // CreationTime
@@ -250,7 +250,7 @@ pub(crate) fn fs_volume(label: &str, created: SystemTime, serial: u32) -> Vec<u8
 
 /// FileFsSizeInformation — MS-FSCC 2.5.8. 24 bytes.
 ///
-/// Available units are zero throughout: an immutable archive is full by definition. That
+/// Available units are zero throughout: an immutable backing is full by definition. That
 /// is not a cosmetic choice — a client that believes there is free space will
 /// offer to copy files into the share.
 pub(crate) fn fs_size(total_bytes: u64) -> Vec<u8> {
@@ -556,14 +556,14 @@ mod tests {
     }
 
     #[test]
-    fn an_archive_reports_no_free_space() {
+    fn an_immutable_backing_reports_no_free_space() {
         // Offsets 8..16 of FileFsSizeInformation are AvailableAllocationUnits.
         let s = fs_size(1_000_000);
         assert_eq!(u64::from_le_bytes(s[8..16].try_into().unwrap()), 0);
         let f = fs_full_size(1_000_000);
         assert_eq!(u64::from_le_bytes(f[8..16].try_into().unwrap()), 0);
         assert_eq!(u64::from_le_bytes(f[16..24].try_into().unwrap()), 0);
-        // Total must be non-zero even for an empty archive, or clients report
+        // Total must be non-zero even for an empty backing, or clients report
         // a broken volume.
         assert!(u64::from_le_bytes(fs_size(0)[0..8].try_into().unwrap()) >= 1);
     }

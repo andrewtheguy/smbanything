@@ -1,8 +1,7 @@
-// A read-only SMB 2.1 server for an immutable ZIP archive.
+// A read-only SMB 2.1 server for immutable backing data.
 //
-// Why this exists: a ZIP archive is immutable while this process serves it, so
-// exporting one over a real
-// network filesystem needs no invalidation, no file-level locking and no write
+// Why this exists: immutable data exported over a real network filesystem
+// needs no invalidation, no file-level locking and no write
 // path. That makes a read-only server small enough to hand-roll, and a mounted
 // filesystem is far more useful than a download link for browsing a backup.
 //
@@ -15,7 +14,7 @@
 // perform one — with a single, bounded exception: a WRITE to the `srvsvc` pipe
 // on IPC$, which is how a client asks what shares exist (see `srvsvc.rs`). It
 // buffers in memory, is gated on the tree being IPC$ and the pipe being open,
-// and has no route to the ZIP archive.
+// and has no route to disk backing data.
 //
 // One protocol detail is worth stating up front because three parts of this
 // module depend on it. A client may pack several requests into one message and
@@ -37,7 +36,7 @@
 // placeholder is worth having on its own terms: it is what stops a stale
 // 0xFF..FF from resolving onto an unrelated live handle and closing it.
 //
-// A mount is for browsing an archive, not for restoring or running one:
+// A mount is for browsing immutable data, not for modifying or running it:
 // symlinks cannot survive SMB 2.1 anyway, so nothing here pretends to be a
 // faithful copy of the original tree. Files come out 0444 and directories 0555
 // — on Linux from the mode options in the mount command below (SMB 2.1 carries
@@ -125,10 +124,12 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use crate::local_server;
-pub(crate) use backing::{Backing, FolderBacking, ZipBacking};
+pub use backing::{Backing, FileReader, NodeInfo, NodeKind};
 use files::Handles;
-use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, status, write_error_body};
-pub(crate) use session::Credentials;
+use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, write_error_body};
+pub use path::SmbPath;
+pub use proto::status;
+pub use session::Credentials;
 use session::{SessionState, TreeKind};
 use wire::{MAX_INBOUND_MESSAGE, NBSS_HEADER_LEN, Reader, Writer, nbss_header, nbss_len};
 
@@ -174,15 +175,15 @@ fn status_name(status: u32) -> String {
 const MAX_CREDITS: u16 = 512;
 
 /// The default share name clients connect to: `\\127.0.0.1\anything`.
-pub(crate) const DEFAULT_SHARE_NAME: &str = "anything";
+pub const DEFAULT_SHARE_NAME: &str = "anything";
 
 /// SMB's registered port, and the only one a Windows UNC path will ever try.
 /// A share reachable here needs no port option in any mount command, and works
 /// in Explorer's address bar rather than only as a mapped drive.
-pub(crate) const STANDARD_SMB_PORT: u16 = 445;
+pub const STANDARD_SMB_PORT: u16 = 445;
 
 /// The default account clients authenticate as; the CLI can override it.
-pub(crate) const DEFAULT_SHARE_USER: &str = "smbanything";
+pub const DEFAULT_SHARE_USER: &str = "smbanything";
 
 /// A short random password for a share.
 ///
@@ -200,7 +201,7 @@ pub(crate) const DEFAULT_SHARE_USER: &str = "smbanything";
 /// One character of each class is placed first and the result shuffled, so a
 /// password is never all one case by chance — a client or policy that demands
 /// mixed case cannot be handed a draw that happens not to have it.
-pub(crate) fn random_password() -> String {
+pub fn random_password() -> String {
     use rand::RngExt;
     use rand::seq::SliceRandom;
 
@@ -227,7 +228,7 @@ pub(crate) fn random_password() -> String {
 /// Immutable per-server state shared by every connection.
 struct Ctx {
     share_name: String,
-    /// What the share serves. Shared across connections; the ZIP is
+    /// What the share serves. Shared across connections; the backing is
     /// immutable, so concurrent readers need no coordination beyond this Arc.
     backing: Arc<dyn Backing>,
     /// The account every client must authenticate as. There is no guest path:
@@ -273,20 +274,44 @@ impl Ctx {
     }
 }
 
-/// Where a client should point. The share is served over loopback, so this is
-/// `127.0.0.1` and the port the listener actually bound — kept as its own type
-/// because the bound port is chosen at runtime and the UNC path a user is told
-/// to mount has to name that same endpoint.
+/// Where a client should point: the address the listener actually bound and the
+/// port it was given. Kept as its own type because the bound port is chosen at
+/// runtime and the UNC path a user is told to mount has to name that same
+/// endpoint.
+///
+/// With [`Bind::Loopback`] the host is `127.0.0.1` and is directly mountable.
+/// With [`Bind::AllInterfaces`] it is the wildcard the socket bound (`::` or
+/// `0.0.0.0`), which names no reachable machine: a caller building a UNC path
+/// has to substitute an address of its own, and `is_wildcard` says when.
 #[derive(Debug, Clone)]
-pub(crate) struct MountPoint {
-    pub(crate) host: String,
-    pub(crate) port: u16,
+pub struct MountPoint {
+    host: String,
+    port: u16,
 }
 
-pub(crate) struct SmbHandle {
+impl MountPoint {
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Whether `host` is a wildcard bind address rather than somewhere a client
+    /// can connect to.
+    pub fn is_wildcard(&self) -> bool {
+        matches!(
+            self.host.parse::<std::net::IpAddr>(),
+            Ok(ip) if ip.is_unspecified()
+        )
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+pub struct SmbHandle {
     /// The TCP port the SMB listener bound.
-    pub(crate) port: u16,
-    pub(crate) share_name: String,
+    port: u16,
+    share_name: String,
     mount: MountPoint,
     /// Shared with `Ctx`. Read by the owner to decide whether to stop.
     failed_logons: Arc<std::sync::atomic::AtomicU32>,
@@ -295,6 +320,14 @@ pub(crate) struct SmbHandle {
 }
 
 impl SmbHandle {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn share_name(&self) -> &str {
+        &self.share_name
+    }
+
     /// UNC path for a Linux `mount -t cifs`.
     #[cfg(test)]
     pub(crate) fn unc(&self) -> String {
@@ -302,31 +335,31 @@ impl SmbHandle {
     }
 
     /// Host and port a client mounts, as opposed to the bound listener.
-    pub(crate) fn mount(&self) -> &MountPoint {
+    pub fn mount(&self) -> &MountPoint {
         &self.mount
     }
 
     /// Whether the share is reachable on SMB's standard port, and so mountable
     /// as a plain UNC path with no port option anywhere in the command.
-    pub(crate) fn on_standard_port(&self) -> bool {
+    pub fn on_standard_port(&self) -> bool {
         self.mount.port == STANDARD_SMB_PORT
     }
 
     /// True once refused logons since the last successful one have reached
     /// `MAX_SERVER_LOGON_FAILURES`. The server has already stopped accepting
     /// logons at this point; the owner is expected to stop it outright.
-    pub(crate) fn logon_limit_reached(&self) -> bool {
+    pub fn logon_limit_reached(&self) -> bool {
         logon_limit_reached(&self.failed_logons)
     }
 
     /// Refused logons since the last successful one, for the message the owner
     /// shows when it stops.
-    pub(crate) fn failed_logons(&self) -> u32 {
+    pub fn failed_logons(&self) -> u32 {
         self.failed_logons
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub(crate) fn stop(mut self) {
+    pub fn stop(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -361,7 +394,7 @@ sudo setcap cap_net_bind_service=+ep <path-to-smbanything>\n\
 
 /// Which interfaces to accept connections on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) enum Bind {
+pub enum Bind {
     /// 127.0.0.1 and ::1 only. The default, and the only one the shipped binary
     /// ever asks for.
     #[default]
@@ -377,7 +410,7 @@ pub(crate) enum Bind {
 /// Start the server on `port` (0 picks an ephemeral one). Binding happens
 /// synchronously so that a port conflict is reported to the caller rather than
 /// swallowed by the server thread.
-pub(crate) fn start(
+pub fn start(
     port: u16,
     share_name: impl Into<String>,
     backing: Arc<dyn Backing>,
@@ -399,15 +432,18 @@ pub(crate) fn start(
             vec![listener]
         }
     };
-    let bound_port = listeners_std
+    let bound_addr = listeners_std
         .first()
         .ok_or_else(|| anyhow!("bind_localhost returned no listeners"))?
         .local_addr()
-        .map_err(|e| anyhow!("read bound listener address: {e}"))?
-        .port();
+        .map_err(|e| anyhow!("read bound listener address: {e}"))?;
+    let bound_port = bound_addr.port();
 
+    // Taken from the listener rather than assumed: with `Bind::AllInterfaces`
+    // this is the wildcard the socket bound, and reporting `127.0.0.1` there
+    // would hand callers a UNC path that names the wrong machine.
     let mount = MountPoint {
-        host: "127.0.0.1".to_string(),
+        host: bound_addr.ip().to_string(),
         port: bound_port,
     };
 
@@ -428,7 +464,7 @@ pub(crate) fn start(
     let join = thread::Builder::new()
         .name(format!("smbanything-{bound_port}"))
         .spawn(move || {
-            // Multi-thread rather than current-thread: ZIP decompression is
+            // Multi-thread rather than current-thread: a backing read may be
             // blocking, and `block_in_place` (below) requires a runtime that can
             // hand the reactor to another worker while one is stalled on a
             // backend fetch.
@@ -610,9 +646,8 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
                 return;
             }
         }
-        // The file handlers call into ZIP decompression, which blocks — on a
-        // cache miss that is reading and inflating the entry out of the local
-        // archive file. `block_in_place` moves the reactor to another worker for
+        // The file handlers call synchronous backing operations, which may block
+        // on local I/O. `block_in_place` moves the reactor to another worker for
         // the duration instead of stalling every other connection on this one.
         // It is applied here, at the single call site, rather than inside the
         // handlers, so the protocol code stays sync and directly unit-testable
@@ -656,7 +691,15 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
                 conn.state.signing_key = None;
             }
         }
-        if stream.write_all(&nbss_header(resp.len())).await.is_err() {
+        let Some(hdr) = nbss_header(resp.len()) else {
+            conn_log!(
+                conn.id,
+                "dropping: {}-byte response exceeds the NetBIOS length field",
+                resp.len()
+            );
+            return;
+        };
+        if stream.write_all(&hdr).await.is_err() {
             return;
         }
         if stream.write_all(&resp).await.is_err() {
@@ -773,7 +816,7 @@ struct Conn {
     handles: Handles,
     /// The srvsvc pipe, when one is open on this connection's IPC$ tree.
     ///
-    /// Kept out of `Handles`, which is built around archive files — paths,
+    /// Kept out of `Handles`, which is built around disk files — paths,
     /// readers, directory cursors — none of which a pipe has. A connection can
     /// hold at most one IPC$ tree and so at most one of these.
     pipe: Option<srvsvc::Pipe>,
@@ -1156,7 +1199,7 @@ impl Conn {
             // Everything else, on any tree, stays refused at the protocol level
             // so a client learns the share is read-only from the operation
             // itself rather than from a confusing failure further along. The
-            // archive tree has no writable path at all, here or below.
+            // disk tree has no writable path at all, here or below.
             cmd::WRITE if self.is_srvsvc_pipe(req.tree_id) => {
                 srvsvc::write(body, message, &mut self.pipe, &self.ctx.share_name).map(Reply::ok)
             }
@@ -1191,7 +1234,7 @@ impl Conn {
             cmd::IOCTL => Err(status::NOT_SUPPORTED),
 
             // Byte-range locks on immutable data protect nothing, and there is
-            // nothing to notify about in an archive that cannot change.
+            // nothing to notify about in a backing that cannot change.
             cmd::LOCK | cmd::CHANGE_NOTIFY | cmd::OPLOCK_BREAK => Err(status::NOT_SUPPORTED),
 
             _ => Err(status::NOT_SUPPORTED),
@@ -1237,7 +1280,7 @@ impl Conn {
     ///
     /// The gate on the WRITE and IOCTL arms above, and the whole extent of the
     /// exception to "nothing is writable": the tree must be IPC$ *and* a pipe
-    /// must already have been opened on it by CREATE. A request on the archive
+    /// must already have been opened on it by CREATE. A request on the disk
     /// tree can never satisfy this.
     fn is_srvsvc_pipe(&self, tree_id: u32) -> bool {
         matches!(self.tree_kind(tree_id), Some(TreeKind::Ipc)) && self.pipe.is_some()
@@ -1277,7 +1320,7 @@ mod tests {
         Arc::new(
             MemBacking::new()
                 .with_dir("docs")
-                .with_file("docs\\readme.txt", b"hello from a ZIP\n")
+                .with_file("docs\\readme.txt", b"hello from a backing\n")
                 .with_file("docs\\notes.md", b"# notes\n")
                 .with_file("data.bin", &[0xAB; 9000]),
         )
@@ -2411,7 +2454,7 @@ mod tests {
         };
         let got = std::fs::read(&dest).expect("downloaded file exists");
         assert_eq!(
-            got, b"hello from a ZIP\n",
+            got, b"hello from a backing\n",
             "content read over SMB must match the source"
         );
     }

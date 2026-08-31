@@ -2,7 +2,7 @@
 //
 // This is the trust boundary. Everything a client sends as a filename arrives
 // here, and the only thing standing between `..\..\..\etc\shadow` and a walk
-// over the archive index is this module. Paths are validated into a
+// over the backing index is this module. Paths are validated into a
 // component list rather than string-manipulated, so there is no normalisation
 // step whose ordering could be got wrong.
 
@@ -11,7 +11,7 @@ use super::proto::status;
 /// A validated path relative to the share root. An empty component list is the
 /// root itself.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct SmbPath {
+pub struct SmbPath {
     components: Vec<String>,
 }
 
@@ -26,7 +26,7 @@ impl SmbPath {
     /// - `/`, which cannot occur in a Unix filename and so can only be an
     ///   attempt to smuggle a separator past a backslash-only parser
     /// - NUL and the other characters Windows forbids in a filename
-    pub(crate) fn parse(raw: &str) -> Result<Self, u32> {
+    pub fn parse(raw: &str) -> Result<Self, u32> {
         // Leading and trailing separators are tolerated: clients differ on
         // whether they send them, and neither changes the meaning.
         let trimmed = raw.trim_matches('\\');
@@ -54,9 +54,9 @@ impl SmbPath {
 
     /// The components, in order, as the client spelled them.
     ///
-    /// The ZIP backing uses these components as an index key and never resolves
+    /// A backing can use these components as an index key without resolving
     /// them through the host filesystem.
-    pub(crate) fn components(&self) -> impl Iterator<Item = &str> {
+    pub fn components(&self) -> impl Iterator<Item = &str> {
         self.components.iter().map(String::as_str)
     }
 
@@ -75,12 +75,12 @@ impl SmbPath {
     /// making FileAllInformation exactly 100 bytes — and cifs.ko rejects that
     /// with "buffer length 100 smaller than minimum size 101", because its
     /// struct reserves a byte for the name. The root renders as `\`.
-    pub(crate) fn to_smb_absolute(&self) -> String {
+    pub fn to_smb_absolute(&self) -> String {
         format!("\\{}", self.components.join("\\"))
     }
 
     /// Append one already-validated component. Used to build the path of a
-    /// directory entry from its parent, where the name came from the archive
+    /// directory entry from its parent, where the name came from the backing
     /// rather than from a client.
     pub(crate) fn join(&self, name: &str) -> Self {
         let mut components = self.components.clone();
@@ -91,7 +91,7 @@ impl SmbPath {
     /// Split off the first component: `(first, rest)`, `None` for the root.
     /// Lets a backing that nests another one route a client path into the
     /// inner tree without re-parsing anything.
-    pub(crate) fn split_first(&self) -> Option<(&str, Self)> {
+    pub fn split_first(&self) -> Option<(&str, Self)> {
         let (first, rest) = self.components.split_first()?;
         Some((
             first.as_str(),
@@ -104,9 +104,9 @@ impl SmbPath {
     /// A stable 64-bit id for this path, used as both the SMB FileId and the
     /// inode number reported in directory listings.
     ///
-    /// Derived from the path because ZIP stores no portable inode, and SMB
+    /// Derived from the path because a generic backing has no portable inode, and SMB
     /// requires a file id that identifies a single directory entry. The
-    /// archive is immutable, so a path-derived id is stable for the
+    /// backing is immutable, so a path-derived id is stable for the
     /// life of the share, which is what clients cache against.
     ///
     /// Hashed over the lowercased components, because the backing looks entries
@@ -163,7 +163,7 @@ mod tests {
     /// A backslash from a client is a separator and nothing else, so the
     /// quoted spelling of a name arrives as two components rather than as the
     /// name. This is why a client cannot address a quoted name directly, and
-    /// why a client cannot address a ZIP name containing a backslash.
+    /// why a client cannot address a backing name containing a backslash.
     #[test]
     fn a_client_backslash_is_always_a_separator() {
         let quoted = format!("a{}b.txt", "\\u2002");
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn ordinary_names_with_unusual_characters_are_accepted() {
-        // None of these are traversal; refusing them would make real archives
+        // None of these are traversal; refusing them would make real backings
         // unbrowsable.
         for raw in ["file name.txt", "naïve", "日本語", "a.b.c", "-", "..."] {
             assert!(SmbPath::parse(raw).is_ok(), "input {raw:?} should parse");

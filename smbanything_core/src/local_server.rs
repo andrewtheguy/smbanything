@@ -7,20 +7,26 @@ const MAX_EPHEMERAL_BIND_RETRIES: u32 = 64;
 
 pub(crate) fn bind_localhost(port: u16) -> Result<Vec<TcpListener>> {
     if port == 0 {
-        let mut last_err = None;
+        // While a fresh ephemeral port can still be drawn, a v6 loopback that is
+        // already taken on the port v4 landed on is a reason to try another
+        // port, not to give up half the server.
         for _ in 0..MAX_EPHEMERAL_BIND_RETRIES {
-            match bind_localhost_once(0) {
-                Ok(listeners) => return Ok(listeners),
-                Err(e) => last_err = Some(e),
+            if let Ok(listeners) = bind_localhost_once(0, true) {
+                return Ok(listeners);
             }
         }
-        return Err(last_err.unwrap_or_else(|| anyhow!("failed to bind localhost port 0")));
+        // No port was free on both families. On a host with IPv6 disabled that
+        // is the expected outcome after every retry, so fall back to IPv4 only —
+        // and if even that fails, its error is the one worth reporting.
+        return bind_localhost_once(0, false);
     }
 
-    bind_localhost_once(port)
+    bind_localhost_once(port, false)
 }
 
-fn bind_localhost_once(port: u16) -> Result<Vec<TcpListener>> {
+/// Bind both loopback families on one port. With `require_v6`, a v6 failure is
+/// fatal so that the caller can retry on a different ephemeral port.
+fn bind_localhost_once(port: u16, require_v6: bool) -> Result<Vec<TcpListener>> {
     let v4_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let v4 = bind_one(v4_addr, "IPv4")?;
     let bound_port = v4
@@ -31,10 +37,11 @@ fn bind_localhost_once(port: u16) -> Result<Vec<TcpListener>> {
     // A host with IPv6 disabled, or one where only the v6 loopback of this port
     // is taken, must still get a working server: the v4 listener is already
     // bound and serving it is strictly better than failing the whole startup.
-    // Only a v4 failure — handled above — is fatal.
+    // Only a v4 failure — handled above — is unconditionally fatal.
     let v6_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, bound_port, 0, 0));
     match bind_one(v6_addr, "IPv6") {
         Ok(v6) => Ok(vec![v4, v6]),
+        Err(e) if require_v6 => Err(e),
         Err(e) => {
             eprintln!("smbanything: {e}; serving IPv4 loopback only");
             Ok(vec![v4])
@@ -63,6 +70,9 @@ fn bind_one(addr: SocketAddr, family: &'static str) -> Result<TcpListener> {
 mod tests {
     use super::*;
 
+    /// Both loopback families on one port, except on a host with no IPv6 at
+    /// all — there the documented IPv4-only fallback is what comes back, and
+    /// demanding two listeners would fail the test rather than the code.
     #[test]
     fn binds_ipv4_and_ipv6_loopback_on_same_port() {
         let listeners = bind_localhost(0).expect("bind localhost");
@@ -72,17 +82,19 @@ mod tests {
             .collect::<Vec<_>>();
         let port = addrs[0].port();
 
-        assert_eq!(listeners.len(), 2);
-        assert!(addrs.contains(&SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            port
-        ))));
-        assert!(addrs.contains(&SocketAddr::V6(SocketAddrV6::new(
-            Ipv6Addr::LOCALHOST,
-            port,
-            0,
-            0
-        ))));
+        assert!(
+            addrs.contains(&SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                port
+            ))),
+            "the IPv4 loopback listener is mandatory: {addrs:?}"
+        );
+        let v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
+        assert!(
+            addrs == vec![SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))]
+                || addrs.contains(&v6),
+            "IPv6 must be bound on the same port when it is available: {addrs:?}"
+        );
     }
 
     #[test]

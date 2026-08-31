@@ -20,11 +20,21 @@ use anyhow::{Result, bail};
 // cap inbound messages far lower — nothing a read-only client sends is large,
 // and the cap bounds per-connection allocation from an unauthenticated peer.
 pub(crate) const NBSS_HEADER_LEN: usize = 4;
+/// The largest payload the 24-bit NetBIOS length field can describe.
+pub(crate) const MAX_NBSS_PAYLOAD: usize = 0xFF_FFFF;
 pub(crate) const MAX_INBOUND_MESSAGE: usize = 1024 * 1024;
 
-pub(crate) fn nbss_header(len: usize) -> [u8; NBSS_HEADER_LEN] {
+/// Frame `len` payload bytes, or `None` if it does not fit the 24-bit NetBIOS
+/// length field. Truncating instead would put a length on the wire that
+/// disagrees with the bytes following it, desynchronising the stream for good;
+/// nothing this server builds comes close to the limit, so the caller drops the
+/// connection rather than sending a frame no client could parse.
+pub(crate) fn nbss_header(len: usize) -> Option<[u8; NBSS_HEADER_LEN]> {
+    if len > MAX_NBSS_PAYLOAD {
+        return None;
+    }
     let len = len as u32;
-    [0, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+    Some([0, (len >> 16) as u8, (len >> 8) as u8, len as u8])
 }
 
 /// Payload length from a NetBIOS session header, or `None` if the header is not
@@ -241,8 +251,18 @@ mod tests {
     #[test]
     fn nbss_length_round_trips() {
         for len in [0usize, 1, 255, 256, 65535, 65536, 0xFF_FFFF] {
-            assert_eq!(nbss_len(&nbss_header(len)), Some(len), "length {len}");
+            let hdr = nbss_header(len).expect("length fits the header");
+            assert_eq!(nbss_len(&hdr), Some(len), "length {len}");
         }
+    }
+
+    /// A payload the length field cannot describe has to be refused. Encoding
+    /// it truncated would claim a length the following bytes do not match, and
+    /// the client would read the next frame from the middle of this one.
+    #[test]
+    fn nbss_header_refuses_a_payload_past_the_length_field() {
+        assert_eq!(nbss_header(MAX_NBSS_PAYLOAD + 1), None);
+        assert_eq!(nbss_header(usize::MAX), None);
     }
 
     /// Direct-TCP SMB2 carries only session messages. An NBT type byte from a
@@ -257,7 +277,7 @@ mod tests {
 
     #[test]
     fn nbss_header_keeps_the_leading_zero_byte() {
-        assert_eq!(nbss_header(0x00_1234), [0x00, 0x00, 0x12, 0x34]);
+        assert_eq!(nbss_header(0x00_1234), Some([0x00, 0x00, 0x12, 0x34]));
     }
 
     #[test]

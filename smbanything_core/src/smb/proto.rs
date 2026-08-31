@@ -68,37 +68,37 @@ pub(crate) mod cmd {
 /// wrong NTSTATUS fails in ways that look like a bug in the file, not the
 /// server. Hence the allow — unused entries here are the point.
 #[allow(dead_code)]
-pub(crate) mod status {
-    pub(crate) const SUCCESS: u32 = 0x0000_0000;
-    pub(crate) const BUFFER_OVERFLOW: u32 = 0x8000_0005;
-    pub(crate) const NO_MORE_FILES: u32 = 0x8000_0006;
-    pub(crate) const INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
-    pub(crate) const INVALID_PARAMETER: u32 = 0xC000_000D;
-    pub(crate) const NO_SUCH_FILE: u32 = 0xC000_000F;
-    pub(crate) const END_OF_FILE: u32 = 0xC000_0011;
-    pub(crate) const MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
-    pub(crate) const ACCESS_DENIED: u32 = 0xC000_0022;
-    pub(crate) const LOGON_FAILURE: u32 = 0xC000_006D;
-    pub(crate) const EAS_NOT_SUPPORTED: u32 = 0xC000_004F;
-    pub(crate) const NO_EAS_ON_FILE: u32 = 0xC000_0052;
-    pub(crate) const OBJECT_NAME_INVALID: u32 = 0xC000_0033;
-    pub(crate) const OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
-    pub(crate) const OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
-    pub(crate) const UNEXPECTED_IO_ERROR: u32 = 0xC000_00E9;
-    pub(crate) const OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
-    pub(crate) const OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
-    pub(crate) const MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;
-    pub(crate) const NOT_SUPPORTED: u32 = 0xC000_00BB;
-    pub(crate) const NETWORK_NAME_DELETED: u32 = 0xC000_00C9;
-    pub(crate) const BAD_NETWORK_NAME: u32 = 0xC000_00CC;
-    pub(crate) const NOT_A_DIRECTORY: u32 = 0xC000_0103;
-    pub(crate) const FILE_CLOSED: u32 = 0xC000_0128;
-    pub(crate) const USER_SESSION_DELETED: u32 = 0xC000_0203;
-    pub(crate) const FS_DRIVER_REQUIRED: u32 = 0xC000_019C;
-    pub(crate) const INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
-    pub(crate) const FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
-    pub(crate) const INVALID_INFO_CLASS: u32 = 0xC000_0003;
-    pub(crate) const REQUEST_NOT_ACCEPTED: u32 = 0xC000_00D0;
+pub mod status {
+    pub const SUCCESS: u32 = 0x0000_0000;
+    pub const BUFFER_OVERFLOW: u32 = 0x8000_0005;
+    pub const NO_MORE_FILES: u32 = 0x8000_0006;
+    pub const INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+    pub const INVALID_PARAMETER: u32 = 0xC000_000D;
+    pub const NO_SUCH_FILE: u32 = 0xC000_000F;
+    pub const END_OF_FILE: u32 = 0xC000_0011;
+    pub const MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
+    pub const ACCESS_DENIED: u32 = 0xC000_0022;
+    pub const LOGON_FAILURE: u32 = 0xC000_006D;
+    pub const EAS_NOT_SUPPORTED: u32 = 0xC000_004F;
+    pub const NO_EAS_ON_FILE: u32 = 0xC000_0052;
+    pub const OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+    pub const OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+    pub const OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+    pub const UNEXPECTED_IO_ERROR: u32 = 0xC000_00E9;
+    pub const OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+    pub const OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
+    pub const MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;
+    pub const NOT_SUPPORTED: u32 = 0xC000_00BB;
+    pub const NETWORK_NAME_DELETED: u32 = 0xC000_00C9;
+    pub const BAD_NETWORK_NAME: u32 = 0xC000_00CC;
+    pub const NOT_A_DIRECTORY: u32 = 0xC000_0103;
+    pub const FILE_CLOSED: u32 = 0xC000_0128;
+    pub const USER_SESSION_DELETED: u32 = 0xC000_0203;
+    pub const FS_DRIVER_REQUIRED: u32 = 0xC000_019C;
+    pub const INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+    pub const FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
+    pub const INVALID_INFO_CLASS: u32 = 0xC000_0003;
+    pub const REQUEST_NOT_ACCEPTED: u32 = 0xC000_00D0;
 }
 
 /// Header `Flags` bits (MS-SMB2 2.2.1.2). Complete rather than trimmed, so that
