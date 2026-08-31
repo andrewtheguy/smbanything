@@ -12,6 +12,11 @@ use tempfile::TempPath;
 
 use super::ArchiveIndex;
 
+/// Decompressed bytes the gzip spill file may hold. Without a cap a small
+/// crafted archive (a gzip bomb) could fill the disk under the temporary
+/// directory before indexing even starts.
+const MAX_SPILL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 pub(super) struct TarBacking {
     file: Arc<Mutex<File>>,
     index: ArchiveIndex<u64>,
@@ -38,20 +43,33 @@ impl TarBacking {
     /// for the lifetime of the share at the cost of the decompressed size on
     /// disk.
     pub(super) fn open_gzip(path: &Path, label: String) -> Result<Self> {
+        Self::open_gzip_with_limit(path, label, MAX_SPILL_BYTES)
+    }
+
+    fn open_gzip_with_limit(path: &Path, label: String, spill_limit: u64) -> Result<Self> {
         let compressed = File::open(path)
             .with_context(|| format!("opening gzip TAR archive {}", path.display()))?;
         let archive_timestamp = compressed
             .metadata()
             .and_then(|metadata| metadata.modified())
             .unwrap_or_else(|_| SystemTime::now());
+        // On any error below the spill tempfile is dropped, which deletes the
+        // partially written file.
         let mut spill = tempfile::Builder::new()
             .prefix("smbanything-")
             .suffix(".tar")
             .tempfile()
             .context("creating the spill file for the decompressed TAR")?;
-        let mut decoder = MultiGzDecoder::new(BufReader::new(compressed));
-        std::io::copy(&mut decoder, &mut spill)
+        let mut decoder =
+            MultiGzDecoder::new(BufReader::new(compressed)).take(spill_limit.saturating_add(1));
+        let copied = std::io::copy(&mut decoder, &mut spill)
             .with_context(|| format!("decompressing gzip TAR archive {}", path.display()))?;
+        if copied > spill_limit {
+            bail!(
+                "gzip TAR archive {} expands past the {spill_limit}-byte spill limit",
+                path.display()
+            );
+        }
         let (mut file, spill_path) = spill.into_parts();
         file.seek(SeekFrom::Start(0))
             .context("rewinding the decompressed TAR spill file")?;
@@ -326,6 +344,40 @@ mod tests {
         assert_eq!(&file.read_at(8, 20).unwrap()[..], b"89");
         assert_eq!(backing.total_size(), 15);
         assert_eq!(backing.file_count(), 2);
+    }
+
+    #[test]
+    fn gzip_archives_past_the_spill_limit_are_rejected() {
+        use std::io::Write as _;
+
+        let temp = tempfile::Builder::new()
+            .suffix(".tar.gz")
+            .tempfile()
+            .expect("temporary TAR.GZ");
+        let mut writer = tar::Builder::new(flate2::write::GzEncoder::new(
+            temp.reopen().expect("reopen temporary TAR.GZ"),
+            flate2::Compression::default(),
+        ));
+        let contents = [0u8; 4096];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        writer
+            .append_data(&mut header, "zeros.bin", &contents[..])
+            .expect("write TAR entry");
+        writer
+            .into_inner()
+            .expect("finish TAR")
+            .finish()
+            .expect("finish gzip")
+            .flush()
+            .expect("flush gzip");
+
+        let error = TarBacking::open_gzip_with_limit(temp.path(), "fixture".to_string(), 1024)
+            .err()
+            .expect("oversized gzip must fail");
+        assert!(error.to_string().contains("spill limit"), "{error:#}");
     }
 
     #[test]
