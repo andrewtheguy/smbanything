@@ -27,6 +27,3 @@ zip = { version = "8.6", default-features = false, features = [
     "xz",
     "zstd",
 ] }
-
-[dev-dependencies]
-flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

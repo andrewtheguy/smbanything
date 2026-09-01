@@ -1178,7 +1178,6 @@ dependencies = [
  "bytes",
  "clap",
  "ctrlc",
- "flate2",
  "rapidgzip-core",
  "sha2",
  "smbanything_core",

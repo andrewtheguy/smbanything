@@ -438,10 +438,13 @@ impl Drop for GzipWorker {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use rapidgzip_core::DecodeError;
     use tempfile::NamedTempFile;
 
     use super::*;
+    use super::super::test_support::gzip_member;
 
     /// Extracts the decoder's typed failure, which reaches callers either
     /// directly through `finish` or boxed inside the `io::Error` that the
@@ -464,12 +467,9 @@ mod tests {
         SmbPath::parse(path).expect("valid test SMB path")
     }
 
-    fn archive(entries: &[(&str, &[u8])]) -> (NamedTempFile, TarBacking) {
-        let temp = tempfile::Builder::new()
-            .suffix(".tar")
-            .tempfile()
-            .expect("temporary TAR");
-        let mut writer = tar::Builder::new(temp.reopen().expect("reopen temporary TAR"));
+    fn tar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut writer = tar::Builder::new(&mut bytes);
         for (name, contents) in entries {
             let mut header = tar::Header::new_gnu();
             header.set_size(contents.len() as u64);
@@ -481,8 +481,30 @@ mod tests {
                 .expect("write TAR entry");
         }
         writer.finish().expect("finish TAR");
+        drop(writer);
+        bytes
+    }
+
+    fn archive(entries: &[(&str, &[u8])]) -> (NamedTempFile, TarBacking) {
+        let mut temp = tempfile::Builder::new()
+            .suffix(".tar")
+            .tempfile()
+            .expect("temporary TAR");
+        temp.write_all(&tar_bytes(entries)).expect("write TAR");
+        temp.flush().expect("flush TAR");
         let backing = TarBacking::open(temp.path(), "fixture".to_string()).expect("open TAR");
         (temp, backing)
+    }
+
+    fn gzip_archive(entries: &[(&str, &[u8])]) -> NamedTempFile {
+        let mut temp = tempfile::Builder::new()
+            .suffix(".tar.gz")
+            .tempfile()
+            .expect("temporary TAR.GZ");
+        temp.write_all(&gzip_member(&tar_bytes(entries)))
+            .expect("write TAR.GZ");
+        temp.flush().expect("flush TAR.GZ");
+        temp
     }
 
     fn archive_with_raw_path(path: &[u8]) -> NamedTempFile {
@@ -530,36 +552,10 @@ mod tests {
 
     #[test]
     fn gzip_archives_are_checkpoint_indexed_and_read_by_offset() {
-        use std::io::Write as _;
-
-        let temp = tempfile::Builder::new()
-            .suffix(".tar.gz")
-            .tempfile()
-            .expect("temporary TAR.GZ");
-        let mut writer = tar::Builder::new(flate2::write::GzEncoder::new(
-            temp.reopen().expect("reopen temporary TAR.GZ"),
-            flate2::Compression::default(),
-        ));
-        for (name, contents) in [
+        let temp = gzip_archive(&[
             ("docs/readme.txt", &b"hello"[..]),
             ("docs/deep/numbers.txt", &b"0123456789"[..]),
-        ] {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            header.set_mtime(1_600_000_000);
-            header.set_cksum();
-            writer
-                .append_data(&mut header, name, contents)
-                .expect("write TAR entry");
-        }
-        writer
-            .into_inner()
-            .expect("finish TAR")
-            .finish()
-            .expect("finish gzip")
-            .flush()
-            .expect("flush gzip");
+        ]);
 
         let backing =
             TarBacking::open_gzip(temp.path(), "fixture".to_string()).expect("open TAR.GZ");
@@ -578,31 +574,13 @@ mod tests {
 
     #[test]
     fn multi_member_gzip_archives_are_checkpoint_indexed() {
-        use std::io::Write as _;
-
-        let mut tar_bytes = Vec::new();
-        {
-            let mut writer = tar::Builder::new(&mut tar_bytes);
-            let contents = b"a gzip member boundary can split the TAR byte stream";
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            writer
-                .append_data(&mut header, "split.txt", &contents[..])
-                .expect("write TAR entry");
-            writer.finish().expect("finish TAR");
-        }
+        let contents = b"a gzip member boundary can split the TAR byte stream";
+        let tar_bytes = tar_bytes(&[("split.txt", &contents[..])]);
 
         let split = 530;
         let mut gzip_bytes = Vec::new();
         for part in [&tar_bytes[..split], &tar_bytes[split..]] {
-            let mut encoder = flate2::write::GzEncoder::new(
-                Vec::new(),
-                flate2::Compression::default(),
-            );
-            encoder.write_all(part).expect("write gzip member");
-            gzip_bytes.extend(encoder.finish().expect("finish gzip member"));
+            gzip_bytes.extend(gzip_member(part));
         }
         let mut temp = tempfile::Builder::new()
             .suffix(".tar.gz")
@@ -620,33 +598,10 @@ mod tests {
 
     #[test]
     fn gzip_reads_seek_across_interior_checkpoints() {
-        use std::io::Write as _;
-
         let contents: Vec<u8> = (0..5 * 1024 * 1024 + 257)
-            .map(|index| (index as u8).wrapping_mul(31))
+            .map(|index| ((index / 1024) as u8).wrapping_mul(31))
             .collect();
-        let temp = tempfile::Builder::new()
-            .suffix(".tar.gz")
-            .tempfile()
-            .expect("temporary TAR.GZ");
-        let mut writer = tar::Builder::new(flate2::write::GzEncoder::new(
-            temp.reopen().expect("reopen temporary TAR.GZ"),
-            flate2::Compression::fast(),
-        ));
-        let mut header = tar::Header::new_gnu();
-        header.set_size(contents.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        writer
-            .append_data(&mut header, "large.bin", &contents[..])
-            .expect("write TAR entry");
-        writer
-            .into_inner()
-            .expect("finish TAR")
-            .finish()
-            .expect("finish gzip")
-            .flush()
-            .expect("flush gzip");
+        let temp = gzip_archive(&[("large.bin", &contents)]);
 
         let backing =
             TarBacking::open_gzip(temp.path(), "fixture".to_string()).expect("open TAR.GZ");
@@ -683,31 +638,8 @@ mod tests {
 
     #[test]
     fn gzip_archives_past_the_expansion_limit_are_rejected() {
-        use std::io::Write as _;
-
-        let temp = tempfile::Builder::new()
-            .suffix(".tar.gz")
-            .tempfile()
-            .expect("temporary TAR.GZ");
-        let mut writer = tar::Builder::new(flate2::write::GzEncoder::new(
-            temp.reopen().expect("reopen temporary TAR.GZ"),
-            flate2::Compression::default(),
-        ));
         let contents = [0u8; 4096];
-        let mut header = tar::Header::new_gnu();
-        header.set_size(contents.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        writer
-            .append_data(&mut header, "zeros.bin", &contents[..])
-            .expect("write TAR entry");
-        writer
-            .into_inner()
-            .expect("finish TAR")
-            .finish()
-            .expect("finish gzip")
-            .flush()
-            .expect("flush gzip");
+        let temp = gzip_archive(&[("zeros.bin", &contents)]);
 
         let error = TarBacking::open_gzip_with_limit(temp.path(), "fixture".to_string(), 1024)
             .err()
@@ -723,8 +655,6 @@ mod tests {
 
     #[test]
     fn corrupt_gzip_archives_are_rejected() {
-        use std::io::Write as _;
-
         let mut temp = tempfile::Builder::new()
             .suffix(".tar.gz")
             .tempfile()
@@ -740,28 +670,11 @@ mod tests {
 
     #[test]
     fn gzip_checksum_mismatches_are_rejected() {
-        use std::io::Write as _;
-
         let mut temp = tempfile::Builder::new()
             .suffix(".tar.gz")
             .tempfile()
             .expect("temporary TAR.GZ");
-        let mut encoder = flate2::write::GzEncoder::new(
-            Vec::new(),
-            flate2::Compression::default(),
-        );
-        {
-            let mut writer = tar::Builder::new(&mut encoder);
-            let mut header = tar::Header::new_gnu();
-            header.set_size(5);
-            header.set_mode(0o644);
-            header.set_cksum();
-            writer
-                .append_data(&mut header, "file.txt", &b"hello"[..])
-                .expect("write TAR entry");
-            writer.finish().expect("finish TAR");
-        }
-        let mut gzip = encoder.finish().expect("finish gzip");
+        let mut gzip = gzip_member(&tar_bytes(&[("file.txt", &b"hello"[..])]));
         let checksum_byte = gzip.len() - 8;
         gzip[checksum_byte] ^= 0xff;
         temp.write_all(&gzip).expect("write corrupt gzip");
