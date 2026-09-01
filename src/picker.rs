@@ -67,7 +67,10 @@ impl Picker {
         while fs::read_dir(&dir).is_err() {
             match dir.parent() {
                 Some(parent) => dir = parent.to_path_buf(),
-                None => break,
+                None => {
+                    dir = default_dir();
+                    break;
+                }
             }
         }
         let mut picker = Self {
@@ -333,6 +336,28 @@ impl Picker {
     }
 }
 
+/// A directory that exists to start from when nothing better is known: the
+/// working directory, else the home directory, else the system's root. The
+/// working directory can be gone (deleted under the process), and an empty
+/// path would leave the picker with nothing to list and no way up.
+pub(crate) fn default_dir() -> PathBuf {
+    std::env::current_dir()
+        .ok()
+        .or_else(std::env::home_dir)
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(root_dir)
+}
+
+fn root_dir() -> PathBuf {
+    if cfg!(windows) {
+        let mut drive = std::env::var_os("SystemDrive").unwrap_or_else(|| "C:".into());
+        drive.push("\\");
+        PathBuf::from(drive)
+    } else {
+        PathBuf::from("/")
+    }
+}
+
 /// An absolute path with `.` and `..` folded away, so the directory shown is
 /// the one the user thinks of and the loaded archive's folder id (a hash of
 /// its absolute path) is the same however it was reached.
@@ -431,6 +456,15 @@ mod tests {
         let picker = Picker::open(&root.path().join("backup.tar.gz"));
         assert_eq!(picker.dir(), root.path());
         assert_eq!(picker.selected_entry().unwrap().name, "backup.tar.gz");
+    }
+
+    #[test]
+    fn the_default_directory_exists_and_an_empty_start_lands_somewhere_readable() {
+        assert!(default_dir().is_dir());
+        assert!(root_dir().is_dir());
+        let picker = Picker::open(Path::new(""));
+        assert!(picker.problem().is_none(), "{:?}", picker.problem());
+        assert!(picker.dir().is_absolute());
     }
 
     #[test]

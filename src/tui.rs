@@ -67,7 +67,7 @@ pub(crate) fn run(
 ) -> Result<()> {
     let mut app = App {
         mode: Mode::Normal,
-        picker_start: std::env::current_dir().unwrap_or_default(),
+        picker_start: picker::default_dir(),
         loaded: None,
         notice: None,
         scroll: 0,
