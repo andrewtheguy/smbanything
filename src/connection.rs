@@ -226,13 +226,21 @@ mod tests {
     fn the_commands_mount_the_base_share_and_never_an_archive_folder() {
         // The archive's folder is reported elsewhere; baking it into a mount
         // would tie the mount to one archive the user can unload at any time.
-        let text = text(&view(4456, false));
+        let server = view(4456, false);
+        let text = text(&server);
         assert!(text.contains("//127.0.0.1/share /mnt/smbanything"));
         assert!(text.contains("<8-hex-id> folder"));
-        assert!(
-            !text.contains("share/4") && !text.contains(r"share\4"),
-            "no folder belongs in a mount path:\n{text}"
-        );
+        // Any component after the share name would be an archive folder,
+        // whatever its id happens to be.
+        for detail in details(&server) {
+            if detail.kind == Kind::Command {
+                assert!(
+                    !detail.text.contains("/share/") && !detail.text.contains(r"\share\"),
+                    "no folder belongs in a mount path: {}",
+                    detail.text
+                );
+            }
+        }
     }
 
     #[test]
