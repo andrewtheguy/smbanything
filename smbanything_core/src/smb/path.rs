@@ -47,8 +47,8 @@ impl SmbPath {
         Ok(Self { components })
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_root(&self) -> bool {
+    /// Whether this is the share root — no components at all.
+    pub fn is_root(&self) -> bool {
         self.components.is_empty()
     }
 
@@ -60,11 +60,11 @@ impl SmbPath {
         self.components.iter().map(String::as_str)
     }
 
-    /// Render back to SMB form, for keying and comparison. Only the in-memory
-    /// test backing keys on paths this way — the real one walks `components`
-    /// — so it is not compiled into the server.
-    #[cfg(test)]
-    pub(crate) fn to_smb_string(&self) -> String {
+    /// Render back to SMB form, for keying and comparison. The server itself
+    /// never calls this — it walks `components` — but a `Backing` that keys an
+    /// index on whole paths (the in-memory test backings do) builds its keys
+    /// here.
+    pub fn to_smb_string(&self) -> String {
         self.components.join("\\")
     }
 

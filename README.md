@@ -4,9 +4,10 @@
 authenticated, read-only SMB 2.1 share. It is intended for browsing immutable
 archives without extracting their directory trees first.
 
-The SMB implementation is adapted from the immutable snapshot service in
-`wrustic`. It supports the operations needed to mount, list, stat, and read
-files. Write access, create/overwrite dispositions, deletion, and file
+The SMB implementation (`smbanything_core`, also embedded by `wrustic` for
+its snapshot shares) supports the operations needed to mount, list, stat, and
+read files — see [docs/smb.md](docs/smb.md) for the protocol scope, security
+model, and troubleshooting. Write access, create/overwrite dispositions, deletion, and file
 execution are rejected by the protocol layer. NTLMv2 authentication and SMB
 message signing are required.
 
@@ -105,6 +106,9 @@ The default pair is in the RFC 3927 link-local block reserved from APIPA
 autoconfiguration. Neither address is routed off the machine. Because the
 tunnel uses the standard port, clients use plain paths such as
 `\\169.254.255.1\anything\<8-hex-id>` and no `/TCPPORT` option is needed.
+The full design — why a normal socket cannot serve 445 on Windows, the routing
+trick, crash cleanup, and the Wintun driver's provenance — is in
+[docs/smb-tun.md](docs/smb-tun.md).
 
 ## Archive behavior
 

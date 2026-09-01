@@ -52,16 +52,26 @@
 //   macOS    Finder → Go → Connect to Server (Cmd+K): smb://smbanything@127.0.0.1:<p>/anything/<id>
 //   Windows  net use Z: \\127.0.0.1\anything\<id> * /user:smbanything   (add /TCPPORT:<p>)
 
+/// Turn protocol tracing on for the rest of the process, for an embedder whose
+/// own switch (a flag, its own environment variable) says to. There is no way
+/// back off: tracing is a debugging session, not a runtime mode.
+pub fn enable_log() {
+    LOG_FORCED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static LOG_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Whether to trace protocol traffic to stderr. Enabled by setting
-/// `SMBANYTHING_LOG` to anything.
+/// `SMBANYTHING_LOG` to anything, or programmatically via [`enable_log`].
 ///
 /// Worth having permanently rather than as scaffolding: when a client refuses a
 /// mount it says nothing useful (Linux reports a bare -EIO or -EINVAL, macOS
 /// just times out), and the server is the only place that can see which command
 /// was rejected and why.
-pub(crate) fn log_enabled() -> bool {
+pub fn log_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("SMBANYTHING_LOG").is_some())
+    LOG_FORCED.load(std::sync::atomic::Ordering::Relaxed)
+        || *ENABLED.get_or_init(|| std::env::var_os("SMBANYTHING_LOG").is_some())
 }
 
 /// Wall-clock stamp for a trace line, to millisecond resolution.
@@ -71,12 +81,16 @@ pub(crate) fn log_enabled() -> bool {
 /// versus one retrying on a timer — and without a clock the log cannot tell
 /// them apart. Local time, because the reader is looking at their own screen
 /// and correlating with what they just clicked.
-pub(crate) fn log_stamp() -> String {
+#[doc(hidden)] // public only because the exported macro expands to it
+pub fn log_stamp() -> String {
     jiff::Zoned::now().strftime("%H:%M:%S%.3f").to_string()
 }
 
 // Defined above the module declarations on purpose: a `macro_rules!` is in
 // scope only for what follows it, and the modules below need it too.
+// Exported so a `Backing` implemented outside this crate can write into the
+// same trace its server lines land in.
+#[macro_export]
 macro_rules! smb_log {
     ($($arg:tt)*) => {
         if $crate::smb::log_enabled() {
@@ -111,6 +125,7 @@ mod proto;
 mod session;
 mod sign;
 mod srvsvc;
+#[cfg(feature = "tun")]
 mod tun;
 mod wire;
 
@@ -129,6 +144,8 @@ pub use backing::{Backing, FileReader, NodeInfo, NodeKind};
 use files::Handles;
 use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, write_error_body};
 pub use path::SmbPath;
+#[cfg(all(windows, feature = "tun"))]
+pub use tun::verify_driver;
 pub use proto::status;
 pub use session::Credentials;
 use session::{SessionState, TreeKind};
@@ -318,6 +335,7 @@ pub struct SmbHandle {
     failed_logons: Arc<std::sync::atomic::AtomicU32>,
     /// The client-facing packet tunnel, when one fronts this server. It is
     /// taken down before the private loopback listener is stopped.
+    #[cfg(feature = "tun")]
     tun: Option<tun::TunShare>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
@@ -333,8 +351,7 @@ impl SmbHandle {
     }
 
     /// UNC path for a Linux `mount -t cifs`.
-    #[cfg(test)]
-    pub(crate) fn unc(&self) -> String {
+    pub fn unc(&self) -> String {
         format!(r"\\{}\{}", self.mount.host, self.share_name)
     }
 
@@ -364,6 +381,7 @@ impl SmbHandle {
     }
 
     pub fn stop(mut self) {
+        #[cfg(feature = "tun")]
         drop(self.tun.take());
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -376,6 +394,7 @@ impl SmbHandle {
 
 impl Drop for SmbHandle {
     fn drop(&mut self) {
+        #[cfg(feature = "tun")]
         drop(self.tun.take());
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -445,6 +464,7 @@ pub const DEFAULT_TUN_ADDRS: TunAddrs = TunAddrs {
 };
 
 /// Client-visible endpoint for [`Bind::Tun`].
+#[cfg(feature = "tun")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TunConfig {
     pub port: u16,
@@ -482,6 +502,7 @@ pub enum Bind {
     /// A native L3 packet adapter and a userspace TCP stack. This is how the
     /// process serves the standard SMB port without binding a host socket to
     /// it. Linux and macOS use their native TUN APIs; Windows uses Wintun.
+    #[cfg(feature = "tun")]
     Tun(TunConfig),
 }
 
@@ -501,6 +522,7 @@ pub fn start(
         }
         // The client never sees this private listener. The packet stack
         // proxies accepted connections to it over IPv4 loopback.
+        #[cfg(feature = "tun")]
         Bind::Tun(_) => local_server::bind_localhost(0)?,
         Bind::AllInterfaces => {
             let listener = StdTcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port))
@@ -523,6 +545,7 @@ pub fn start(
     // Create the client-facing transport before spawning the SMB thread. A
     // privilege, route, or driver failure therefore leaves no hidden server
     // running behind a tunnel that never came up.
+    #[cfg(feature = "tun")]
     let (tun, mount) = match &bind {
         Bind::Tun(config) => {
             let forward_to = std::net::SocketAddr::from((
@@ -545,6 +568,13 @@ pub fn start(
                 port: bound_port,
             },
         ),
+    };
+    #[cfg(not(feature = "tun"))]
+    let mount = MountPoint {
+        // Taken from the listener rather than assumed: with `AllInterfaces`
+        // this is the wildcard that actually bound.
+        host: bound_addr.ip().to_string(),
+        port: bound_port,
     };
 
     let share_name = share_name.into();
@@ -588,6 +618,7 @@ pub fn start(
         share_name,
         mount,
         failed_logons,
+        #[cfg(feature = "tun")]
         tun,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),

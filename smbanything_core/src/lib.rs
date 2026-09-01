@@ -1,3 +1,3 @@
-mod local_server;
+pub mod local_server;
 
 pub mod smb;

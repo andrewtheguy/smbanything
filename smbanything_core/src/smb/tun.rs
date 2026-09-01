@@ -287,7 +287,7 @@ mod windows {
         Ok(path)
     }
 
-    fn verify_dll(path: &Path) -> Result<()> {
+    pub(super) fn verify_dll(path: &Path) -> Result<()> {
         use sha2::{Digest, Sha256};
 
         let bytes = std::fs::read(path).map_err(|error| {
@@ -417,6 +417,16 @@ mod windows {
 
 #[cfg(windows)]
 use windows::PlatformTun;
+
+/// Check that the Wintun driver at `path` is byte-for-byte the one this crate
+/// pins and will load. For an embedder that vendors the DLL and ships it next
+/// to its own executable: run this over the vendored copy in a test, so a
+/// driver update that forgets one side fails the build rather than the first
+/// tun share started in the field.
+#[cfg(windows)]
+pub fn verify_driver(path: &std::path::Path) -> anyhow::Result<()> {
+    windows::verify_dll(path)
+}
 
 struct SmolDevice {
     io: PlatformTun,
