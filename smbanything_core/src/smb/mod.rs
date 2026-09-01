@@ -130,7 +130,7 @@ mod tun;
 mod wire;
 
 use std::net::TcpListener as StdTcpListener;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::thread;
 use std::time::SystemTime;
 
@@ -141,7 +141,8 @@ use tokio::sync::oneshot;
 
 use crate::local_server;
 pub use backing::{Backing, FileReader, NodeInfo, NodeKind};
-use files::Handles;
+use backing::EmptyBacking;
+use files::{Handles, OpenRegistry};
 use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, write_error_body};
 pub use path::SmbPath;
 #[cfg(all(windows, feature = "tun"))]
@@ -243,12 +244,48 @@ pub fn random_password() -> String {
     chars.into_iter().collect()
 }
 
-/// Immutable per-server state shared by every connection.
+struct Contents {
+    backing: RwLock<Arc<dyn Backing>>,
+    empty: Arc<dyn Backing>,
+    open_files: Arc<OpenRegistry>,
+}
+
+impl Contents {
+    fn new(label: impl Into<String>, now: SystemTime) -> Self {
+        let empty: Arc<dyn Backing> = Arc::new(EmptyBacking::new(label, now));
+        Self {
+            backing: RwLock::new(empty.clone()),
+            empty,
+            open_files: Arc::new(OpenRegistry::new()),
+        }
+    }
+
+    fn backing(&self) -> RwLockReadGuard<'_, Arc<dyn Backing>> {
+        self.backing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn replace(&self, backing: Arc<dyn Backing>) {
+        let mut current = self
+            .backing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.open_files.invalidate_all();
+        *current = backing;
+    }
+
+    fn unload(&self) {
+        self.replace(self.empty.clone());
+    }
+}
+
+/// Per-server state shared by every connection.
 struct Ctx {
     share_name: String,
-    /// What the share serves. Shared across connections; the backing is
-    /// immutable, so concurrent readers need no coordination beyond this Arc.
-    backing: Arc<dyn Backing>,
+    /// The currently loaded contents. Replacing it leaves the listener,
+    /// authentication, sessions and trees intact.
+    contents: Arc<Contents>,
     /// The account every client must authenticate as. There is no guest path:
     /// all three client platforms support NTLMv2, and Windows accepts nothing
     /// less.
@@ -333,6 +370,7 @@ pub struct SmbHandle {
     mount: MountPoint,
     /// Shared with `Ctx`. Read by the owner to decide whether to stop.
     failed_logons: Arc<std::sync::atomic::AtomicU32>,
+    contents: Arc<Contents>,
     /// The client-facing packet tunnel, when one fronts this server. It is
     /// taken down before the private loopback listener is stopped.
     #[cfg(feature = "tun")]
@@ -378,6 +416,23 @@ impl SmbHandle {
     pub fn failed_logons(&self) -> u32 {
         self.failed_logons
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Replace the complete contents of the running share.
+    ///
+    /// Any file and directory handles opened against the previous contents are
+    /// invalidated. Active backing operations finish first; when this method
+    /// returns, no cached file reader keeps the previous backing open.
+    pub fn load(&self, backing: Arc<dyn Backing>) {
+        self.contents.replace(backing);
+    }
+
+    /// Leave the running share mounted but empty.
+    ///
+    /// Like [`load`](Self::load), this invalidates all open disk handles and
+    /// releases cached readers before returning.
+    pub fn unload(&self) {
+        self.contents.unload();
     }
 
     pub fn stop(mut self) {
@@ -506,13 +561,13 @@ pub enum Bind {
     Tun(TunConfig),
 }
 
-/// Start the server on `port` (0 picks an ephemeral one). Binding happens
+/// Start an empty server on `port` (0 picks an ephemeral one). Binding happens
 /// synchronously so that a port conflict is reported to the caller rather than
-/// swallowed by the server thread.
+/// swallowed by the server thread. Use [`SmbHandle::load`] and
+/// [`SmbHandle::unload`] to change the root without restarting it.
 pub fn start(
     port: u16,
     share_name: impl Into<String>,
-    backing: Arc<dyn Backing>,
     bind: Bind,
     credentials: Credentials,
 ) -> Result<SmbHandle> {
@@ -578,14 +633,16 @@ pub fn start(
     };
 
     let share_name = share_name.into();
+    let boot_time = SystemTime::now();
+    let contents = Arc::new(Contents::new(&share_name, boot_time));
     let failed_logons = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let ctx = Arc::new(Ctx {
         share_name: share_name.clone(),
-        backing,
+        contents: contents.clone(),
         credentials,
         volume_serial: rand::random::<u32>(),
         server_guid: rand::random::<[u8; 16]>(),
-        boot_time: SystemTime::now(),
+        boot_time,
         failed_logons: failed_logons.clone(),
     });
 
@@ -618,6 +675,7 @@ pub fn start(
         share_name,
         mount,
         failed_logons,
+        contents,
         #[cfg(feature = "tun")]
         tun,
         shutdown_tx: Some(shutdown_tx),
@@ -964,11 +1022,12 @@ fn next_conn_id() -> u64 {
 impl Conn {
     fn new(ctx: Arc<Ctx>) -> Self {
         let id = next_conn_id();
+        let handles = Handles::registered(ctx.contents.open_files.clone());
         Self {
             ctx,
             id,
             state: SessionState::new(id),
-            handles: Handles::default(),
+            handles,
             pipe: None,
         }
     }
@@ -1365,8 +1424,10 @@ impl Conn {
             }
             cmd::IOCTL => Err(status::NOT_SUPPORTED),
 
-            // Byte-range locks on immutable data protect nothing, and there is
-            // nothing to notify about in a backing that cannot change.
+            // Byte-range locks on read-only data protect nothing. Contents
+            // replacement invalidates open handles synchronously rather than
+            // maintaining long-lived directory watches, so CHANGE_NOTIFY is
+            // outside this server's scope too.
             cmd::LOCK | cmd::CHANGE_NOTIFY | cmd::OPLOCK_BREAK => Err(status::NOT_SUPPORTED),
 
             _ => Err(status::NOT_SUPPORTED),
@@ -1378,13 +1439,16 @@ impl Conn {
     /// Dispatch to the file handlers. Split out so the tree check above stays
     /// legible and so every one of these shares a single entry point.
     fn file_command(&mut self, req: &Request<'_>) -> Result<Reply, u32> {
-        let backing = self.ctx.backing.as_ref();
         let (body, message, related) = (req.body, req.message, req.related);
+        if req.hdr.command == cmd::CLOSE {
+            return files::close(body, &mut self.handles, related).map(Reply::ok);
+        }
+        let contents = self.ctx.contents.backing();
+        let backing = contents.as_ref();
         match req.hdr.command {
             cmd::CREATE => {
                 files::create(body, message, backing, &mut self.handles, req.tree_id).map(Reply::ok)
             }
-            cmd::CLOSE => files::close(body, &mut self.handles, related).map(Reply::ok),
             cmd::READ => files::read(body, backing, &mut self.handles, related).map(Reply::ok),
             cmd::QUERY_DIRECTORY => files::query_directory(
                 body,
@@ -1469,15 +1533,51 @@ mod tests {
     }
 
     fn ctx() -> Arc<Ctx> {
+        let contents = Arc::new(Contents::new(
+            DEFAULT_SHARE_NAME,
+            SystemTime::UNIX_EPOCH,
+        ));
+        contents.replace(test_backing());
         Arc::new(Ctx {
             share_name: DEFAULT_SHARE_NAME.to_string(),
-            backing: test_backing(),
+            contents,
             credentials: test_credentials(),
             volume_serial: 0x1234_5678,
             server_guid: [7u8; 16],
             boot_time: SystemTime::UNIX_EPOCH,
             failed_logons: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
+    }
+
+    fn start_test_server(port: u16) -> SmbHandle {
+        let handle = start(
+            port,
+            DEFAULT_SHARE_NAME,
+            Bind::Loopback,
+            test_credentials(),
+        )
+        .expect("server starts");
+        handle.load(test_backing());
+        handle
+    }
+
+    #[test]
+    fn unloading_releases_the_backing_and_restores_an_empty_root() {
+        let contents = Contents::new(DEFAULT_SHARE_NAME, SystemTime::UNIX_EPOCH);
+        let backing = test_backing();
+        let weak = Arc::downgrade(&backing);
+        contents.replace(backing);
+
+        contents.unload();
+
+        assert!(weak.upgrade().is_none(), "the old backing must be dropped");
+        assert!(
+            contents
+                .backing()
+                .list(&SmbPath::default())
+                .expect("empty root lists")
+                .is_empty()
+        );
     }
 
     /// Build one SMB2 request message: header followed by `body`.
@@ -2433,14 +2533,7 @@ mod tests {
 
     #[test]
     fn server_starts_on_an_ephemeral_port_and_stops() {
-        let handle = start(
-            0,
-            DEFAULT_SHARE_NAME,
-            test_backing(),
-            Bind::Loopback,
-            test_credentials(),
-        )
-        .expect("server starts");
+        let handle = start_test_server(0);
         assert_ne!(handle.port, 0);
         assert_eq!(handle.unc(), r"\\127.0.0.1\anything");
         handle.stop();
@@ -2461,14 +2554,7 @@ mod tests {
             return;
         }
 
-        let handle = start(
-            0,
-            DEFAULT_SHARE_NAME,
-            test_backing(),
-            Bind::Loopback,
-            test_credentials(),
-        )
-        .expect("server starts");
+        let handle = start_test_server(0);
         let target = format!("//127.0.0.1/{}", handle.share_name);
 
         let out = Command::new("smbclient")
@@ -2503,14 +2589,7 @@ mod tests {
             return None;
         }
 
-        let handle = start(
-            0,
-            DEFAULT_SHARE_NAME,
-            test_backing(),
-            Bind::Loopback,
-            test_credentials(),
-        )
-        .expect("server starts");
+        let handle = start_test_server(0);
         let target = format!("//127.0.0.1/{}", handle.share_name);
         let out = Command::new("smbclient")
             .arg(&target)
@@ -2541,14 +2620,7 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4455);
-        let handle = start(
-            port,
-            DEFAULT_SHARE_NAME,
-            test_backing(),
-            Bind::Loopback,
-            test_credentials(),
-        )
-        .expect("server starts");
+        let handle = start_test_server(port);
         eprintln!(
             "serving \\\\127.0.0.1\\anything on port {}",
             handle.port
@@ -2598,14 +2670,7 @@ mod tests {
         if Command::new("smbclient").arg("--version").output().is_err() {
             return;
         }
-        let handle = start(
-            0,
-            DEFAULT_SHARE_NAME,
-            test_backing(),
-            Bind::Loopback,
-            test_credentials(),
-        )
-        .expect("server starts");
+        let handle = start_test_server(0);
         let target = format!("//127.0.0.1/{}", handle.share_name);
 
         let src = ScratchDir::new("smb-write");

@@ -1,5 +1,7 @@
 mod archive;
+mod tui;
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -7,17 +9,24 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use ratatui::crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
+    execute,
+};
 use sha2::{Digest, Sha256};
-use smbanything_core::smb;
+use smbanything_core::smb::{self, Backing};
+
+use crate::archive::{ArchiveBacking, FolderBacking};
 
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Serve a ZIP or TAR archive as an authenticated, read-only SMB 2.1 share"
+    about = "Browse ZIP and TAR archives through a persistent, authenticated, read-only SMB 2.1 share"
 )]
 struct Args {
-    /// ZIP, TAR, or gzip-compressed TAR archive to serve
-    archive: PathBuf,
+    /// ZIP, TAR, or gzip-compressed TAR archive to serve; with none, the
+    /// browser starts on an empty share and archives are loaded from its UI
+    archive: Option<PathBuf>,
 
     /// TCP port to listen on (0 chooses an ephemeral port)
     #[arg(short, long, default_value_t = 4456, conflicts_with = "smb_tun")]
@@ -55,14 +64,6 @@ fn main() -> Result<()> {
 
     let password = password()?;
     let generated_password = std::env::var_os("SMBANYTHING_PASSWORD").is_none();
-    let archive = absolute_archive_path(&args.archive)?;
-    let folder_name = archive_folder_name(&archive);
-    let label = archive_label(&archive);
-    let backing = Arc::new(archive::ArchiveBacking::open(&archive, label)?);
-    let file_count = backing.file_count();
-    let total_size = smb::Backing::total_size(backing.as_ref());
-    let backing = archive::FolderBacking::new(&folder_name, backing);
-
     let bind = if args.smb_tun {
         smb::Bind::Tun(smb::TunConfig {
             port: smb::STANDARD_SMB_PORT,
@@ -76,7 +77,6 @@ fn main() -> Result<()> {
     let handle = smb::start(
         args.port,
         &args.share,
-        Arc::new(backing),
         bind,
         smb::Credentials {
             user: args.user.clone(),
@@ -84,69 +84,85 @@ fn main() -> Result<()> {
         },
     )?;
 
-    // A wildcard bind names no reachable machine, so the UNC path printed for
-    // it has to be completed by the user.
     let host = if handle.mount().is_wildcard() {
-        "<server-ip>"
+        "<server-ip>".to_string()
     } else {
-        handle.mount().host()
+        handle.mount().host().to_string()
     };
-    let port = handle.mount().port();
-    println!(
-        "Serving {} file{} ({} bytes) from {}",
-        file_count,
-        if file_count == 1 { "" } else { "s" },
-        total_size,
-        archive.display()
-    );
-    println!(
-        "Folder:   \\\\{host}\\{}\\{folder_name}",
-        handle.share_name()
-    );
-    println!("Port:     {port}");
-    println!("Username: {}", args.user);
-    println!("Password: {password}");
-    if generated_password {
-        println!("(generated for this run; set SMBANYTHING_PASSWORD to choose it)");
-    }
-    if args.bind_all {
-        println!();
-        println!("WARNING: file data is signed but not encrypted and is visible in transit.");
-    }
+    let server = tui::ServerView {
+        host,
+        port: handle.mount().port(),
+        share: handle.share_name().to_string(),
+        user: args.user,
+        password,
+        generated_password,
+        bind_all: args.bind_all,
+        standard_port: handle.on_standard_port(),
+    };
 
-    println!();
-    println!("Mount examples (the clients prompt for the password):");
-    println!(
-        "  Linux:  sudo mount -t cifs -o port={port},vers=2.1,username={},ro,file_mode=0444,dir_mode=0555 //{host}/{}/{folder_name} /mnt/smbanything",
-        args.user, handle.share_name()
-    );
-    println!(
-        "  macOS:  smb://{}@{host}:{port}/{}/{folder_name}",
-        args.user, handle.share_name()
-    );
-    if handle.on_standard_port() {
-        println!(
-            "  Windows: net use Z: \\\\{host}\\{}\\{folder_name} * /user:{}",
-            handle.share_name(), args.user
-        );
-    } else {
-        println!(
-            "  Windows: net use Z: \\\\{host}\\{}\\{folder_name} * /user:{} /TCPPORT:{port}",
-            handle.share_name(), args.user
-        );
-    }
-    println!();
-    println!("Press Ctrl-C to stop.");
-
-    // Handles SIGTERM and SIGHUP as well as SIGINT (the `termination` feature),
-    // so that every ordinary way of stopping the server unwinds to the end of
-    // main. Expanded ZIP entries live in a temporary directory that is removed
-    // when the backing drops, and a signal that kills the process outright
-    // leaves that directory behind.
+    // The termination handler only wakes the loop below. Cleanup remains on
+    // the main thread, where the terminal is restored before the SMB transport
+    // is stopped and its thread joined.
     let (stop_tx, stop_rx) = mpsc::sync_channel(1);
     ctrlc::set_handler(move || {
         let _ = stop_tx.try_send(());
     })?;
+
+    let result = match args.archive {
+        Some(archive) => serve(&handle, &server, &archive, &stop_rx),
+        None => browse(&handle, &server, stop_rx),
+    };
+    handle.stop();
+    result
+}
+
+/// Serve one archive named on the command line: print where it is mounted and
+/// wait for a termination signal. Scripts drive the server this way, and they
+/// have no terminal for the browser UI to draw on.
+fn serve(
+    handle: &smb::SmbHandle,
+    server: &tui::ServerView,
+    archive: &Path,
+    stop_rx: &mpsc::Receiver<()>,
+) -> Result<()> {
+    let opened = open_archive(archive)?;
+    let folder = opened.folder.clone();
+    handle.load(opened.share_backing());
+
+    let (host, share, port, user) = (&server.host, &server.share, server.port, &server.user);
+    println!(
+        "Serving {} file{} ({} bytes) from {}",
+        opened.file_count,
+        if opened.file_count == 1 { "" } else { "s" },
+        opened.total_size,
+        opened.path.display()
+    );
+    println!("Folder:   \\\\{host}\\{share}\\{folder}");
+    println!("Port:     {port}");
+    println!("Username: {user}");
+    println!("Password: {}", server.password);
+    if server.generated_password {
+        println!("(generated for this run; set SMBANYTHING_PASSWORD to choose it)");
+    }
+    if server.bind_all {
+        println!();
+        println!("WARNING: file data is signed but not encrypted and is visible in transit.");
+    }
+    println!();
+    println!("Mount examples (the clients prompt for the password):");
+    println!(
+        "  Linux:  sudo mount -t cifs -o port={port},vers=2.1,username={user},ro,file_mode=0444,dir_mode=0555 //{host}/{share}/{folder} /mnt/smbanything"
+    );
+    println!("  macOS:  smb://{user}@{host}:{port}/{share}/{folder}");
+    if server.standard_port {
+        println!("  Windows: net use Z: \\\\{host}\\{share}\\{folder} * /user:{user}");
+    } else {
+        println!(
+            "  Windows: net use Z: \\\\{host}\\{share}\\{folder} * /user:{user} /TCPPORT:{port}"
+        );
+    }
+    println!();
+    println!("Press Ctrl-C to stop.");
 
     loop {
         match stop_rx.recv_timeout(Duration::from_secs(1)) {
@@ -160,16 +176,70 @@ fn main() -> Result<()> {
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
-    handle.stop();
     Ok(())
 }
 
-fn absolute_archive_path(path: &Path) -> Result<PathBuf> {
+/// Run the interactive browser, which starts on an empty share and loads and
+/// unloads archives while the server keeps running.
+fn browse(
+    handle: &smb::SmbHandle,
+    server: &tui::ServerView,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<()> {
+    let mut terminal = ratatui::init();
+    // ratatui::init() enables raw mode and the alternate screen but not
+    // bracketed paste, without which a pasted archive path arrives as a burst
+    // of key presses instead of the one Event::Paste the editor reads.
+    let bracketed_paste = execute!(io::stdout(), EnableBracketedPaste).is_ok();
+    let result = tui::run(&mut terminal, handle, server, stop_rx);
+    if bracketed_paste {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+    }
+    ratatui::restore();
+    result
+}
+
+/// An archive opened and indexed, ready to be published to the share.
+pub(crate) struct OpenedArchive {
+    pub(crate) path: PathBuf,
+    pub(crate) folder: String,
+    pub(crate) file_count: usize,
+    pub(crate) total_size: u64,
+    backing: Arc<ArchiveBacking>,
+}
+
+impl OpenedArchive {
+    /// The share-visible backing: the archive under its own folder.
+    pub(crate) fn share_backing(&self) -> Arc<dyn Backing> {
+        Arc::new(FolderBacking::new(
+            &self.folder,
+            Arc::clone(&self.backing) as Arc<dyn Backing>,
+        ))
+    }
+}
+
+/// Open and index an archive. This reads the whole archive directory and is
+/// slow enough on a large one that callers with a UI run it off their event
+/// thread.
+pub(crate) fn open_archive(path: &Path) -> Result<OpenedArchive> {
+    let path = absolute_archive_path(path)?;
+    let folder = archive_folder_name(&path);
+    let backing = Arc::new(ArchiveBacking::open(&path, archive_label(&path))?);
+    Ok(OpenedArchive {
+        file_count: backing.file_count(),
+        total_size: backing.total_size(),
+        path,
+        folder,
+        backing,
+    })
+}
+
+pub(crate) fn absolute_archive_path(path: &Path) -> Result<PathBuf> {
     std::path::absolute(path)
         .with_context(|| format!("making archive path absolute: {}", path.display()))
 }
 
-fn archive_folder_name(absolute_path: &Path) -> String {
+pub(crate) fn archive_folder_name(absolute_path: &Path) -> String {
     use std::fmt::Write as _;
 
     debug_assert!(absolute_path.is_absolute());
@@ -209,7 +279,7 @@ fn validate_simple_name(kind: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn archive_label(path: &Path) -> String {
+pub(crate) fn archive_label(path: &Path) -> String {
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -257,10 +327,6 @@ mod tests {
 
     #[test]
     fn archive_folder_is_the_sha256_prefix_of_the_absolute_path() {
-        // The digest covers the path's own bytes, so the fixture has to be
-        // spelled the way the platform spells an absolute path — `/tmp/...` is
-        // rooted but not absolute on Windows, which needs a drive prefix — and
-        // each spelling hashes to its own folder name.
         #[cfg(unix)]
         let (path, expected) = ("/tmp/photos.zip", "488b0141");
         #[cfg(windows)]
@@ -300,23 +366,16 @@ mod tests {
 
     #[test]
     fn packet_tunnel_cli_rejects_incompatible_listener_options() {
+        // The archive is optional: named, it is served without a UI; omitted,
+        // the browser starts empty.
         assert!(Args::try_parse_from(["smbanything", "a.zip", "--smb-tun"]).is_ok());
+        assert!(Args::try_parse_from(["smbanything", "--smb-tun"]).is_ok());
+        assert!(Args::try_parse_from(["smbanything", "a.zip", "--smb-tun", "--bind-all"]).is_err());
         assert!(
-            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun", "--bind-all"])
-                .is_err()
+            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun", "--port", "445"]).is_err()
         );
         assert!(
-            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun", "--port", "445"])
-                .is_err()
-        );
-        assert!(
-            Args::try_parse_from([
-                "smbanything",
-                "a.zip",
-                "--smb-tun-ip",
-                "169.254.255.3"
-            ])
-            .is_err()
+            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun-ip", "169.254.255.3"]).is_err()
         );
     }
 }

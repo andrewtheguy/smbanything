@@ -106,8 +106,9 @@ impl SmbPath {
     ///
     /// Derived from the path because a generic backing has no portable inode, and SMB
     /// requires a file id that identifies a single directory entry. The
-    /// backing is immutable, so a path-derived id is stable for the
-    /// life of the share, which is what clients cache against.
+    /// loaded backing is immutable, so a path-derived id is stable until the
+    /// server replaces its contents. Replacement invalidates every open handle
+    /// before paths from the next backing can be resolved.
     ///
     /// Hashed over the lowercased components, because the backing looks entries
     /// up that way: `DIR\FILE` and `dir\file` reach the same file, so they must

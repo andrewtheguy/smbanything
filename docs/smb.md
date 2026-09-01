@@ -125,13 +125,17 @@ refused with a specific NTSTATUS.
   FIFO as, the distinction cannot survive the protocol. Regular files and
   directories round-trip exactly.
 - **No reparse points, no extended attributes, no alternate data streams.**
-- **One backing per server.** The share is bound at startup.
+- **One loaded backing at a time.** A server starts with an empty root.
+  `SmbHandle::load` replaces the complete root and `SmbHandle::unload` restores
+  the empty root without rebuilding the listener, transport, authentication,
+  sessions, or connected trees. Both operations invalidate open disk handles
+  and release cached file readers before returning.
 - **A filename SMB2 cannot express must not reach the wire intact.** SMB2
   filenames carry no path separator, and the Windows redirector answers a
   listing that carries one by discarding the *whole response* — one such file
   hides every other file in its directory. Keeping names legal is the backing
-  implementation's responsibility: the archive backing rejects them at
-  startup, wrustic's snapshot backing substitutes U+FFFD and logs.
+  implementation's responsibility: the archive backing rejects them during
+  load, wrustic's snapshot backing substitutes U+FFFD and logs.
 
 ## Module map
 

@@ -4,6 +4,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 
 use super::path::SmbPath;
+use super::proto::status;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
@@ -50,6 +51,53 @@ pub trait Backing: Send + Sync {
     fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32>;
     fn label(&self) -> &str;
     fn total_size(&self) -> u64;
+}
+
+/// The root presented while a running server has no contents loaded.
+pub(super) struct EmptyBacking {
+    root: NodeInfo,
+    label: String,
+}
+
+impl EmptyBacking {
+    pub(super) fn new(label: impl Into<String>, now: SystemTime) -> Self {
+        Self {
+            root: NodeInfo::synthetic_dir("", now),
+            label: label.into(),
+        }
+    }
+}
+
+impl Backing for EmptyBacking {
+    fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32> {
+        path.is_root()
+            .then(|| self.root.clone())
+            .ok_or(status::OBJECT_NAME_NOT_FOUND)
+    }
+
+    fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
+        if path.is_root() {
+            Ok(Vec::new())
+        } else {
+            Err(status::OBJECT_PATH_NOT_FOUND)
+        }
+    }
+
+    fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
+        if path.is_root() {
+            Err(status::FILE_IS_A_DIRECTORY)
+        } else {
+            Err(status::OBJECT_NAME_NOT_FOUND)
+        }
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
+
+    fn total_size(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(test)]
