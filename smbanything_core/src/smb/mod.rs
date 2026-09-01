@@ -144,6 +144,8 @@ pub use backing::{Backing, FileReader, NodeInfo, NodeKind};
 use files::Handles;
 use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, write_error_body};
 pub use path::SmbPath;
+#[cfg(all(windows, feature = "tun"))]
+pub use tun::verify_driver;
 pub use proto::status;
 pub use session::Credentials;
 use session::{SessionState, TreeKind};
