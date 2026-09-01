@@ -1,4 +1,5 @@
 mod archive;
+mod connection;
 mod tui;
 
 use std::io;
@@ -17,6 +18,7 @@ use sha2::{Digest, Sha256};
 use smbanything_core::smb::{self, Backing};
 
 use crate::archive::{ArchiveBacking, FolderBacking};
+use crate::connection::{Kind, ServerView};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -84,13 +86,15 @@ fn main() -> Result<()> {
         },
     )?;
 
-    let host = if handle.mount().is_wildcard() {
+    let wildcard_host = handle.mount().is_wildcard();
+    let host = if wildcard_host {
         "<server-ip>".to_string()
     } else {
         handle.mount().host().to_string()
     };
-    let server = tui::ServerView {
+    let server = ServerView {
         host,
+        wildcard_host,
         port: handle.mount().port(),
         share: handle.share_name().to_string(),
         user: args.user,
@@ -98,6 +102,7 @@ fn main() -> Result<()> {
         generated_password,
         bind_all: args.bind_all,
         standard_port: handle.on_standard_port(),
+        tun: args.smb_tun.then_some(args.smb_tun_ip),
     };
 
     // The termination handler only wakes the loop below. Cleanup remains on
@@ -121,7 +126,7 @@ fn main() -> Result<()> {
 /// have no terminal for the browser UI to draw on.
 fn serve(
     handle: &smb::SmbHandle,
-    server: &tui::ServerView,
+    server: &ServerView,
     archive: &Path,
     stop_rx: &mpsc::Receiver<()>,
 ) -> Result<()> {
@@ -129,7 +134,6 @@ fn serve(
     let folder = opened.folder.clone();
     handle.load(opened.share_backing());
 
-    let (host, share, port, user) = (&server.host, &server.share, server.port, &server.user);
     println!(
         "Serving {} file{} ({} bytes) from {}",
         opened.file_count,
@@ -137,29 +141,46 @@ fn serve(
         opened.total_size,
         opened.path.display()
     );
-    println!("Folder:   \\\\{host}\\{share}\\{folder}");
-    println!("Port:     {port}");
-    println!("Username: {user}");
-    println!("Password: {}", server.password);
-    if server.generated_password {
-        println!("(generated for this run; set SMBANYTHING_PASSWORD to choose it)");
+    // No path here: the listener is what this reports, and every path a client
+    // can use is in the mount commands below in its own platform's spelling.
+    let reach = if server.bind_all {
+        "read-only, every interface"
+    } else {
+        "read-only, this machine only"
+    };
+    println!(
+        "Server:   listening on {}:{}  ({reach})",
+        server.host, server.port
+    );
+    println!("Folder:   {folder}");
+    if let Some(addrs) = server.tun {
+        println!(
+            "Tun:      private adapter, standard SMB port. The machine's own file sharing is \
+             untouched; {}/32 and {}/32 route here until this process stops.",
+            addrs.virtual_ip(),
+            addrs.adapter_ip()
+        );
     }
     if server.bind_all {
-        println!();
-        println!("WARNING: file data is signed but not encrypted and is visible in transit.");
+        println!("Warning:  file data is signed but not encrypted and is visible in transit.");
+    }
+    println!("Username: {}", server.user);
+    if server.generated_password {
+        println!(
+            "Password: {}  (generated for this run; set SMBANYTHING_PASSWORD to choose it)",
+            server.password
+        );
+    } else {
+        println!("Password: {}", server.password);
     }
     println!();
-    println!("Mount examples (the clients prompt for the password):");
-    println!(
-        "  Linux:  sudo mount -t cifs -o port={port},vers=2.1,username={user},ro,file_mode=0444,dir_mode=0555 //{host}/{share}/{folder} /mnt/smbanything"
-    );
-    println!("  macOS:  smb://{user}@{host}:{port}/{share}/{folder}");
-    if server.standard_port {
-        println!("  Windows: net use Z: \\\\{host}\\{share}\\{folder} * /user:{user}");
-    } else {
-        println!(
-            "  Windows: net use Z: \\\\{host}\\{share}\\{folder} * /user:{user} /TCPPORT:{port}"
-        );
+    // The same mount details the browser UI shows, so the two descriptions
+    // cannot drift apart.
+    for detail in connection::details(server, Some(&folder)) {
+        match detail.kind {
+            Kind::Heading => println!("{}:", detail.text),
+            _ => println!("{}", detail.text),
+        }
     }
     println!();
     println!("Press Ctrl-C to stop.");
@@ -183,7 +204,7 @@ fn serve(
 /// unloads archives while the server keeps running.
 fn browse(
     handle: &smb::SmbHandle,
-    server: &tui::ServerView,
+    server: &ServerView,
     stop_rx: mpsc::Receiver<()>,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
