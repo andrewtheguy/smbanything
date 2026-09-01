@@ -18,10 +18,11 @@ Wintun driver. Creating a network adapter needs elevation on every platform.
 
 ## Why a normal socket cannot do this on Windows
 
-Port 445 cannot be bound through the Windows socket layer at all. `srvnet.sys`
-holds it as an exclusive, system-wide reservation, so a bind fails with
-`WSAEACCES` rather than the `WSAEADDRINUSE` you would expect — on `127.0.0.1`
-and on every other local address alike.
+While `srvnet.sys` is loaded — the normal state of every Windows install —
+port 445 cannot be bound through the socket layer. The driver holds it as an
+exclusive, system-wide reservation, so a bind fails with `WSAEACCES` rather
+than the `WSAEADDRINUSE` you would expect — on `127.0.0.1` and on every other
+local address alike.
 
 Measured on Windows 11 (build 26200), in order of increasing desperation:
 
@@ -157,9 +158,11 @@ stale or corrupted copy, not against an attacker who is already inside that
 trust boundary.
 
 **Updating the driver:** verify the new archive against the SHA2-256 published
-on wintun.net *and* its Authenticode signature, then update both
-`vendor/wintun/wintun-amd64.dll` and `WINTUN_DLL_SHA256`. The test will fail
-until they agree, which is the point.
+on wintun.net *and* its Authenticode signature, then replace
+`vendor/wintun/wintun-amd64.dll` with the archive's `bin/amd64/wintun.dll` —
+renamed, because `tun.rs` loads exactly the name `wintun-amd64.dll` — and
+update `WINTUN_DLL_SHA256`. The test will fail until they agree, which is the
+point.
 
 ## Known limitations
 
