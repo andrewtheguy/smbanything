@@ -93,9 +93,18 @@ enum ArchiveKind {
     Tar(TarBacking),
 }
 
-impl ArchiveBacking {
-    pub(crate) fn open(path: &Path, label: impl Into<String>) -> Result<Self> {
-        let label = label.into();
+/// The archive formats served, told apart by file name alone so that a
+/// directory listing can pick out archives without opening them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Format {
+    Zip,
+    Tar,
+    TarGz,
+}
+
+impl Format {
+    /// The format an archive path names, or `None` for anything else.
+    pub(crate) fn of(path: &Path) -> Option<Self> {
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -106,16 +115,30 @@ impl ArchiveBacking {
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| stem.to_ascii_lowercase().ends_with(".tar"));
         match extension.as_deref() {
-            Some("zip") => Ok(Self(ArchiveKind::Zip(ZipBacking::open(path, label)?))),
-            Some("tar") => Ok(Self(ArchiveKind::Tar(TarBacking::open(path, label)?))),
-            Some("tgz") => Ok(Self(ArchiveKind::Tar(TarBacking::open_gzip(path, label)?))),
-            Some("gz") if tar_gz => {
+            Some("zip") => Some(Self::Zip),
+            Some("tar") => Some(Self::Tar),
+            Some("tgz") => Some(Self::TarGz),
+            Some("gz") if tar_gz => Some(Self::TarGz),
+            _ => None,
+        }
+    }
+}
+
+impl ArchiveBacking {
+    pub(crate) fn open(path: &Path, label: impl Into<String>) -> Result<Self> {
+        let label = label.into();
+        match Format::of(path) {
+            Some(Format::Zip) => Ok(Self(ArchiveKind::Zip(ZipBacking::open(path, label)?))),
+            Some(Format::Tar) => Ok(Self(ArchiveKind::Tar(TarBacking::open(path, label)?))),
+            Some(Format::TarGz) => {
                 Ok(Self(ArchiveKind::Tar(TarBacking::open_gzip(path, label)?)))
             }
-            Some(extension) => bail!(
-                "unsupported archive extension .{extension}; expected .zip, .tar, .tar.gz, or .tgz"
-            ),
-            None => bail!("archive path must end in .zip, .tar, .tar.gz, or .tgz"),
+            None => match path.extension().and_then(|extension| extension.to_str()) {
+                Some(extension) => bail!(
+                    "unsupported archive extension .{extension}; expected .zip, .tar, .tar.gz, or .tgz"
+                ),
+                None => bail!("archive path must end in .zip, .tar, .tar.gz, or .tgz"),
+            },
         }
     }
 

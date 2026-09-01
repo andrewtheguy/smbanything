@@ -15,6 +15,7 @@ use ratatui::{
 use smbanything_core::smb;
 
 use crate::connection::{self, Kind, ServerView};
+use crate::picker::{self, Choice, Picker};
 use crate::{OpenedArchive, open_archive};
 
 struct LoadedArchive {
@@ -24,15 +25,17 @@ struct LoadedArchive {
     total_size: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
-    Editing,
+    /// Choosing an archive in the directory picker.
+    Picking(Picker),
 }
 
 struct App {
     mode: Mode,
-    input: String,
+    /// Where the picker opens next: the loaded archive, or wherever it was
+    /// last left, so a cancelled pick does not start over from the top.
+    picker_start: PathBuf,
     loaded: Option<LoadedArchive>,
     notice: Option<Notice>,
     /// First visible line of the mount details, which are longer than the
@@ -50,7 +53,7 @@ struct Notice {
 
 enum Action {
     None,
-    Load,
+    Load(PathBuf),
     Unload,
     ScrollBy(i32),
     Quit,
@@ -64,7 +67,7 @@ pub(crate) fn run(
 ) -> Result<()> {
     let mut app = App {
         mode: Mode::Normal,
-        input: String::new(),
+        picker_start: picker::default_dir(),
         loaded: None,
         notice: None,
         scroll: 0,
@@ -115,8 +118,12 @@ pub(crate) fn run(
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 handle_key(&mut app, key)
             }
-            Event::Paste(text) if app.mode == Mode::Editing => {
-                app.input.extend(text.chars().filter(|ch| !ch.is_control()));
+            // A dropped or pasted path lands in the filter as one event, so
+            // a newline on its end cannot fire Enter halfway through it.
+            Event::Paste(text) => {
+                if let Mode::Picking(picker) = &mut app.mode {
+                    picker.push_filter_str(&text);
+                }
                 Action::None
             }
             _ => Action::None,
@@ -140,27 +147,27 @@ pub(crate) fn run(
                     text: "Archive unloaded; the SMB share is still running.".to_string(),
                 });
             }
-            Action::Load if opening.is_none() => {
-                if app.input.is_empty() {
+            Action::Load(path) => {
+                close_picker(&mut app);
+                // A second load while one is still opening: the first wins.
+                if opening.is_some() {
                     app.notice = Some(Notice {
                         error: true,
-                        text: "enter an archive path".to_string(),
+                        text: "an archive is still loading".to_string(),
                     });
                     continue;
                 }
-                let input = PathBuf::from(app.input.clone());
-                let (tx, rx) = mpsc::channel();
-                thread::spawn(move || {
-                    let _ = tx.send(open_archive(&input));
-                });
-                opening = Some(rx);
                 app.notice = Some(Notice {
                     error: false,
-                    text: "Loading archive...".to_string(),
+                    text: format!("Loading {}...", path.display()),
                 });
+                app.picker_start = path.clone();
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let _ = tx.send(open_archive(&path));
+                });
+                opening = Some(rx);
             }
-            // A second load while one is still opening: the first one wins.
-            Action::Load => {}
         }
     }
 }
@@ -169,8 +176,6 @@ fn finish_load(app: &mut App, handle: &smb::SmbHandle, opened: Result<OpenedArch
     match opened {
         Ok(opened) => {
             handle.load(opened.share_backing());
-            app.input = opened.path.display().to_string();
-            app.mode = Mode::Normal;
             app.scroll = 0;
             app.notice = Some(Notice {
                 error: false,
@@ -192,19 +197,29 @@ fn finish_load(app: &mut App, handle: &smb::SmbHandle, opened: Result<OpenedArch
     }
 }
 
+/// Leave the picker, remembering where it was for next time.
+fn close_picker(app: &mut App) {
+    if let Mode::Picking(picker) = &app.mode {
+        app.picker_start = picker.dir().to_path_buf();
+        app.mode = Mode::Normal;
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) -> Action {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.code == KeyCode::Char('c') && control {
         return Action::Quit;
     }
 
-    match app.mode {
+    match &mut app.mode {
         Mode::Normal => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
             KeyCode::Char('l') | KeyCode::Enter => {
-                if let Some(loaded) = &app.loaded {
-                    app.input = loaded.path.display().to_string();
-                }
-                app.mode = Mode::Editing;
+                let start = app
+                    .loaded
+                    .as_ref()
+                    .map_or(app.picker_start.clone(), |loaded| loaded.path.clone());
+                app.mode = Mode::Picking(Picker::open(&start));
                 app.notice = None;
                 Action::None
             }
@@ -217,22 +232,79 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             KeyCode::End => Action::ScrollBy(i32::MAX / 2),
             _ => Action::None,
         },
-        Mode::Editing => match key.code {
+        Mode::Picking(picker) => match key.code {
             KeyCode::Esc => {
-                app.mode = Mode::Normal;
+                close_picker(app);
                 Action::None
             }
-            KeyCode::Enter => Action::Load,
+            KeyCode::Enter => match picker.enter() {
+                Choice::Load(path) => Action::Load(path),
+                Choice::Rejected(reason) => {
+                    app.notice = Some(Notice {
+                        error: true,
+                        text: reason,
+                    });
+                    Action::None
+                }
+                Choice::None | Choice::Moved => Action::None,
+            },
+            KeyCode::Up => {
+                picker.move_by(-1);
+                Action::None
+            }
+            KeyCode::Down => {
+                picker.move_by(1);
+                Action::None
+            }
+            KeyCode::PageUp => {
+                picker.move_by(-10);
+                Action::None
+            }
+            KeyCode::PageDown => {
+                picker.move_by(10);
+                Action::None
+            }
+            KeyCode::Home => {
+                picker.move_by(i64::MIN / 2);
+                Action::None
+            }
+            KeyCode::End => {
+                picker.move_by(i64::MAX / 2);
+                Action::None
+            }
+            KeyCode::Left => {
+                picker.parent();
+                Action::None
+            }
+            KeyCode::Right => {
+                picker.descend();
+                Action::None
+            }
             KeyCode::Backspace => {
-                app.input.pop();
+                picker.backspace();
                 Action::None
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.input.clear();
+            KeyCode::Tab => {
+                picker.toggle_hidden();
                 Action::None
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.input.push(ch);
+            KeyCode::F(5) => {
+                picker.refresh();
+                Action::None
+            }
+            KeyCode::Char('u') if control => {
+                picker.clear_filter();
+                Action::None
+            }
+            KeyCode::Char('r') if control => {
+                picker.refresh();
+                Action::None
+            }
+            // Alt-anything is left alone: a terminal spells it as Esc then
+            // the key, and a stray letter in the filter is worse than a lost
+            // key press when the two were meant separately.
+            KeyCode::Char(ch) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+                picker.push_filter(ch);
                 Action::None
             }
             _ => Action::None,
@@ -241,22 +313,23 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
 }
 
 fn render(frame: &mut Frame, app: &mut App, server: &ServerView) {
-    // Every panel above the details is sized to the text it actually holds,
-    // wrapping included, so the mount commands get every row the terminal can
-    // spare.
+    // Every panel above the middle is sized to the text it actually holds,
+    // wrapping included, so the mount commands or the picker get every row
+    // the terminal can spare.
     let width = frame.area().width.saturating_sub(2);
     let server_lines = server_lines(server);
     let contents_lines = contents_lines(app);
     let notice_lines = app.notice.as_ref().map_or(0, |notice| {
         wrapped_rows(&notice.text, width + 2).min(3)
     });
+    let picking = matches!(app.mode, Mode::Picking(_));
 
-    let [server_area, contents_area, details_area, input_area, notice_area, footer_area] =
+    let [server_area, contents_area, middle_area, filter_area, notice_area, footer_area] =
         Layout::vertical([
             Constraint::Length(boxed_height(&server_lines, width)),
             Constraint::Length(boxed_height(&contents_lines, width)),
             Constraint::Fill(1),
-            Constraint::Length(3),
+            Constraint::Length(if picking { 3 } else { 0 }),
             Constraint::Length(notice_lines),
             Constraint::Length(1),
         ])
@@ -264,14 +337,18 @@ fn render(frame: &mut Frame, app: &mut App, server: &ServerView) {
 
     render_block(frame, server_lines, " SMB server ", server_area);
     render_block(frame, contents_lines, " Contents ", contents_area);
-    render_details(frame, app, server, details_area);
-    render_input(frame, app, input_area);
-    render_notice(frame, app, notice_area);
-    let footer = if app.mode == Mode::Editing {
-        "Enter load/replace  Esc cancel  Ctrl-U clear"
-    } else {
-        "l/Enter load or replace  u unload  ↑/↓ PgUp/PgDn scroll  q/Esc quit"
+    let footer = match &mut app.mode {
+        Mode::Picking(picker) => {
+            render_picker(frame, picker, middle_area);
+            render_filter(frame, picker, filter_area);
+            "↑/↓ choose  Enter open/load  ←/Backspace up  type to filter  Tab hidden  Esc cancel"
+        }
+        Mode::Normal => {
+            render_details(frame, app, server, middle_area);
+            "l/Enter load or replace  u unload  ↑/↓ PgUp/PgDn scroll  q/Esc quit"
+        }
     };
+    render_notice(frame, app, notice_area);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         footer_area,
@@ -430,30 +507,142 @@ fn wrapped_rows(text: &str, width: u16) -> u16 {
     rows
 }
 
-fn render_input(frame: &mut Frame, app: &App, area: Rect) {
-    let title = if app.mode == Mode::Editing {
-        " Archive path (editing) "
-    } else {
-        " Archive path "
+/// The directory listing: folders first, then archives with their sizes, the
+/// selection in reverse video.
+fn render_picker(frame: &mut Frame, picker: &mut Picker, area: Rect) {
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
     };
+    // A long directory keeps its end, which is the part that changes.
+    let label = if picker.show_hidden() {
+        " Choose an archive (hidden shown)  "
+    } else {
+        " Choose an archive  "
+    };
+    let room = usize::from(area.width.saturating_sub(2)).saturating_sub(label.chars().count() + 1);
+    let title = format!(
+        "{label}{} ",
+        tail(&picker.dir().display().to_string(), room)
+    );
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(if app.mode == Mode::Editing {
-            Style::default().fg(Color::Cyan)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(problem) = picker.problem() {
+        lines.push(Line::styled(
+            tail(problem, usize::from(inner.width)),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let rows = usize::from(inner.height).saturating_sub(lines.len());
+    picker.scroll_to_fit(rows);
+    let window = picker.window(rows);
+    if window.is_empty() {
+        let text = if picker.filter().is_empty() {
+            "No folders or archives here.".to_string()
         } else {
+            format!("Nothing here matches \"{}\".", picker.filter())
+        };
+        lines.push(Line::styled(text, Style::default().fg(Color::DarkGray)));
+    }
+    for (entry, selected) in window {
+        let (label, style) = match entry.kind {
+            picker::Kind::Parent => ("../".to_string(), Style::default().fg(Color::Gray)),
+            picker::Kind::Dir => (format!("{}/", entry.name), Style::default().fg(Color::Cyan)),
+            picker::Kind::Archive => (entry.name.clone(), Style::default().fg(Color::White)),
+        };
+        let size = entry.size.map(human_size).unwrap_or_default();
+        let width = usize::from(inner.width);
+        let label_width = width.saturating_sub(size.chars().count() + 2);
+        let mut label: String = label.chars().take(label_width).collect();
+        let pad = width
+            .saturating_sub(label.chars().count())
+            .saturating_sub(size.chars().count());
+        label.push_str(&" ".repeat(pad));
+        label.push_str(&size);
+        let style = if selected {
+            style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            style
+        };
+        lines.push(Line::styled(label, style));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The filter row. The cursor is a reverse-video cell drawn here rather than
+/// the terminal's own, which some terminals lose track of across the
+/// alternate screen; nothing in this UI ever moves the real cursor.
+fn render_filter(frame: &mut Frame, picker: &Picker, area: Rect) {
+    let block = Block::default()
+        .title(" Filter, or a path to open ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let width = usize::from(inner.width);
+    let text = picker.filter();
+    let cursor = text.chars().count();
+    if text.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" type to narrow the list, or paste a path")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+    } else {
+        let skip = cursor.saturating_sub(width - 1);
+        let shown: String = text.chars().skip(skip).collect();
+        frame.render_widget(Paragraph::new(shown), inner);
+    }
+    let column = cursor.min(width - 1) as u16;
+    if let Some(cell) = frame
+        .buffer_mut()
+        .cell_mut((inner.x + column, inner.y))
+    {
+        cell.set_style(
             Style::default()
-        });
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let cursor = app.input.chars().count();
-    let scroll = cursor.saturating_sub(inner_width.saturating_sub(1)) as u16;
-    frame.render_widget(
-        Paragraph::new(app.input.as_str()).block(block).scroll((0, scroll)),
-        area,
-    );
-    if app.mode == Mode::Editing && area.width > 2 && area.height > 2 {
-        let visible = cursor.saturating_sub(scroll as usize).min(inner_width);
-        frame.set_cursor_position((area.x + 1 + visible as u16, area.y + 1));
+                .fg(Color::Black)
+                .bg(Color::White)
+                .remove_modifier(Modifier::DIM),
+        );
+    }
+}
+
+/// The last `width` characters of `text`, marked when cut.
+fn tail(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let mut out = String::from("…");
+    out.extend(text.chars().skip(count - keep));
+    out
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -506,6 +695,16 @@ mod tests {
         // per-platform paths belong in the mount commands regardless.
         assert!(!text.contains(r"\\127.0.0.1"), "no path belongs here:\n{text}");
         assert!(!text.contains("//127.0.0.1"), "no path belongs here:\n{text}");
+    }
+
+    #[test]
+    fn sizes_and_titles_are_kept_short() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1536), "1.5 KiB");
+        assert_eq!(human_size(3 << 30), "3.0 GiB");
+        assert_eq!(tail("abcdef", 10), "abcdef");
+        assert_eq!(tail("abcdef", 4), "…def");
     }
 
     #[test]

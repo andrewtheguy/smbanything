@@ -21,10 +21,14 @@ cargo build --release
 
 The default listener is IPv4 and IPv6 loopback on port 4456, with share name
 `anything` and username `smbanything`. The base share starts immediately with
-an empty root. Press `l` (or Enter), type an archive path, and press Enter to
-load it. Press `u` to unload it while leaving the listener, authentication,
-sessions, and base share running. Loading another archive replaces the complete
-contents in the same way.
+an empty root. Press `l` (or Enter) to open the archive picker: a listing of
+the current directory's folders and `.zip`, `.tar`, `.tar.gz`, and `.tgz`
+files. Move with `↑`/`↓`, step into a folder or load an archive with Enter,
+go up with `←` or Backspace, type to narrow the list, and press Tab to show
+dot-files. A path typed or pasted into the filter row (a file dropped onto
+the terminal, say) is followed on Enter. Press `u` to unload the archive
+while leaving the listener, authentication, sessions, and base share running.
+Loading another archive replaces the complete contents in the same way.
 
 Naming an archive on the command line skips the UI and serves that one archive
 until Ctrl-C, printing the mount details on stdout. That is the form for
