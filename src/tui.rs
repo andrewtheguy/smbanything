@@ -368,8 +368,7 @@ fn contents_lines(app: &App) -> Vec<Line<'static>> {
 /// The per-OS mount commands. They rarely fit, so the panel scrolls and says
 /// how much is left below.
 fn render_details(frame: &mut Frame, app: &mut App, server: &ServerView, area: Rect) {
-    let folder = app.loaded.as_ref().map(|loaded| loaded.folder.as_str());
-    let lines: Vec<Line> = connection::details(server, folder)
+    let lines: Vec<Line> = connection::details(server)
         .into_iter()
         .map(|detail| {
             let style = match detail.kind {

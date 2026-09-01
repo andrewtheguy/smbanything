@@ -43,40 +43,31 @@ fn line(kind: Kind, text: impl Into<String>) -> DetailLine {
 }
 
 impl ServerView {
-    /// The share path a client mounts, with the loaded archive's folder when
-    /// there is one. Slash-separated, for `mount -t cifs` and `smb://` URLs.
-    fn share_path(&self, folder: Option<&str>) -> String {
-        match folder {
-            Some(folder) => format!("{}/{}", self.share, folder),
-            None => self.share.clone(),
-        }
-    }
-
-    /// The same path as a UNC, for Explorer and `net use`.
-    fn unc(&self, folder: Option<&str>) -> String {
-        format!(r"\\{}\{}", self.host, self.share_path(folder).replace('/', r"\"))
+    /// The share as a UNC, for Explorer and `net use`.
+    fn unc(&self) -> String {
+        format!(r"\\{}\{}", self.host, self.share)
     }
 }
 
 /// Per-OS mount instructions for the share, and what the reader has to know
 /// about them: which of them the current listener supports, what the tunnel
 /// changes, and what the server refuses.
-pub(crate) fn details(server: &ServerView, folder: Option<&str>) -> Vec<DetailLine> {
+pub(crate) fn details(server: &ServerView) -> Vec<DetailLine> {
     let ServerView {
         host, port, user, ..
     } = server;
-    let path = server.share_path(folder);
-    let unc = server.unc(folder);
+    let path = &server.share;
+    let unc = server.unc();
     let mut lines = Vec::new();
 
-    if folder.is_none() {
-        lines.push(line(
-            Kind::Note,
-            "No archive is loaded: these mount the base share, whose root stays empty \
-             until one is.",
-        ));
-        lines.push(line(Kind::Note, ""));
-    }
+    // Always the base share, never an archive's folder: the mount outlives any
+    // one archive, and a loaded archive simply appears inside it.
+    lines.push(line(
+        Kind::Note,
+        "These mount the base share. A loaded archive appears inside it under its own \
+         <8-hex-id> folder, so loading and unloading need no remount.",
+    ));
+    lines.push(line(Kind::Note, ""));
     if server.wildcard_host {
         lines.push(line(
             Kind::Warning,
@@ -195,8 +186,8 @@ mod tests {
         }
     }
 
-    fn text(server: &ServerView, folder: Option<&str>) -> String {
-        details(server, folder)
+    fn text(server: &ServerView) -> String {
+        details(server)
             .into_iter()
             .map(|detail| detail.text)
             .collect::<Vec<_>>()
@@ -205,18 +196,18 @@ mod tests {
 
     #[test]
     fn every_client_platform_gets_a_command() {
-        let text = text(&view(4456, false), Some("488b0141"));
+        let text = text(&view(4456, false));
         for heading in ["Linux", "macOS", "Windows"] {
             assert!(text.contains(heading), "{heading} missing from:\n{text}");
         }
         assert!(text.contains("mount -t cifs"));
-        assert!(text.contains("smb://smbanything@127.0.0.1:4456/anything/488b0141"));
-        assert!(text.contains(r"net use Z: \\127.0.0.1\anything\488b0141"));
+        assert!(text.contains("smb://smbanything@127.0.0.1:4456/anything"));
+        assert!(text.contains(r"net use Z: \\127.0.0.1\anything"));
     }
 
     #[test]
     fn a_custom_port_is_carried_by_every_command_that_needs_it() {
-        let text = text(&view(4456, false), Some("488b0141"));
+        let text = text(&view(4456, false));
         assert!(text.contains("port=4456,vers=2.1"));
         assert!(text.contains("/TCPPORT:4456"));
         assert!(text.contains("24H2"), "the Windows version floor is worth saying");
@@ -224,18 +215,24 @@ mod tests {
 
     #[test]
     fn the_standard_port_drops_the_port_options_and_offers_a_unc_path() {
-        let text = text(&view(445, true), Some("488b0141"));
+        let text = text(&view(445, true));
         assert!(!text.contains("port="), "no port option belongs on 445:\n{text}");
         assert!(!text.contains("/TCPPORT"));
-        assert!(text.contains("smb://smbanything@127.0.0.1/anything/488b0141"));
+        assert!(text.contains("smb://smbanything@127.0.0.1/anything"));
         assert!(text.contains("Explorer's address bar"));
     }
 
     #[test]
-    fn without_an_archive_the_commands_mount_the_empty_base_share() {
-        let text = text(&view(4456, false), None);
+    fn the_commands_mount_the_base_share_and_never_an_archive_folder() {
+        // The archive's folder is reported elsewhere; baking it into a mount
+        // would tie the mount to one archive the user can unload at any time.
+        let text = text(&view(4456, false));
         assert!(text.contains("//127.0.0.1/anything /mnt/smbanything"));
-        assert!(text.contains("No archive is loaded"));
+        assert!(text.contains("<8-hex-id> folder"));
+        assert!(
+            !text.contains("anything/4") && !text.contains(r"anything\4"),
+            "no folder belongs in a mount path:\n{text}"
+        );
     }
 
     #[test]
@@ -243,7 +240,7 @@ mod tests {
         let mut server = view(4456, false);
         server.host = "<server-ip>".to_string();
         server.wildcard_host = true;
-        let lines = details(&server, None);
+        let lines = details(&server);
         let warning = lines
             .iter()
             .find(|detail| detail.kind == Kind::Warning)

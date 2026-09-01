@@ -176,7 +176,7 @@ fn serve(
     println!();
     // The same mount details the browser UI shows, so the two descriptions
     // cannot drift apart.
-    for detail in connection::details(server, Some(&folder)) {
+    for detail in connection::details(server) {
         match detail.kind {
             Kind::Heading => println!("{}:", detail.text),
             _ => println!("{}", detail.text),
