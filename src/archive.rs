@@ -2,7 +2,7 @@
 
 mod tar;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 mod zip;
 
 use std::collections::BTreeMap;
@@ -18,73 +18,6 @@ use smbanything_core::smb::{
 
 use self::tar::TarBacking;
 use self::zip::ZipBacking;
-
-/// Places one archive beneath a single directory at the share root.
-pub(crate) struct FolderBacking {
-    folder: NodeInfo,
-    inner: Arc<dyn Backing>,
-}
-
-impl FolderBacking {
-    pub(crate) fn new(name: impl Into<String>, inner: Arc<dyn Backing>) -> Self {
-        Self {
-            folder: NodeInfo::synthetic_dir(&name.into(), SystemTime::now()),
-            inner,
-        }
-    }
-
-    fn inner_path(&self, path: &SmbPath) -> Option<SmbPath> {
-        let (first, rest) = path.split_first()?;
-        first
-            .eq_ignore_ascii_case(&self.folder.name)
-            .then_some(rest)
-    }
-}
-
-impl Backing for FolderBacking {
-    fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32> {
-        if path.components().next().is_none() {
-            return Ok(NodeInfo::synthetic_dir("", self.folder.mtime));
-        }
-        let inner_path = self
-            .inner_path(path)
-            .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
-        if inner_path.components().next().is_none() {
-            return Ok(self.folder.clone());
-        }
-        self.inner.stat(&inner_path)
-    }
-
-    fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
-        if path.components().next().is_none() {
-            return Ok(vec![self.folder.clone()]);
-        }
-        let inner_path = self
-            .inner_path(path)
-            .ok_or(status::OBJECT_PATH_NOT_FOUND)?;
-        self.inner.list(&inner_path)
-    }
-
-    fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
-        if path.components().next().is_none() {
-            // The share root is the directory `stat` and `list` report it to be;
-            // saying it does not exist instead contradicts them.
-            return Err(status::FILE_IS_A_DIRECTORY);
-        }
-        let inner_path = self
-            .inner_path(path)
-            .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
-        self.inner.open(&inner_path)
-    }
-
-    fn label(&self) -> &str {
-        self.inner.label()
-    }
-
-    fn total_size(&self) -> u64 {
-        self.inner.total_size()
-    }
-}
 
 pub(crate) struct ArchiveBacking(ArchiveKind);
 
@@ -386,114 +319,9 @@ fn display_components(components: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
-    use std::sync::Mutex;
-    use std::time::UNIX_EPOCH;
-
-    use bytes::Bytes;
 
     use super::*;
-    use super::test_support::gzip_member;
-
-    fn smb_path(path: &str) -> SmbPath {
-        SmbPath::parse(path).expect("valid test SMB path")
-    }
-
-    struct TestBacking {
-        index: ArchiveIndex<Vec<u8>>,
-    }
-
-    impl TestBacking {
-        fn new() -> Self {
-            let mut index = ArchiveIndex::new(UNIX_EPOCH);
-            index
-                .insert(
-                    "docs/readme.txt",
-                    false,
-                    5,
-                    UNIX_EPOCH,
-                    "test",
-                    Some(b"hello".to_vec()),
-                )
-                .unwrap();
-            Self { index }
-        }
-    }
-
-    impl Backing for TestBacking {
-        fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32> {
-            self.index.stat(path)
-        }
-
-        fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
-            self.index.list(path)
-        }
-
-        fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
-            let entry = self
-                .index
-                .entry(path)
-                .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
-            let content = entry
-                .content
-                .as_ref()
-                .ok_or(status::FILE_IS_A_DIRECTORY)?;
-            Ok(Arc::new(TestFile(Mutex::new(content.clone()))))
-        }
-
-        fn label(&self) -> &str {
-            "fixture"
-        }
-
-        fn total_size(&self) -> u64 {
-            self.index.total_size()
-        }
-    }
-
-    struct TestFile(Mutex<Vec<u8>>);
-
-    impl FileReader for TestFile {
-        fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, u32> {
-            let content = self.0.lock().map_err(|_| status::UNEXPECTED_IO_ERROR)?;
-            let offset = usize::try_from(offset).map_err(|_| status::INVALID_PARAMETER)?;
-            if offset >= content.len() {
-                return Ok(Bytes::new());
-            }
-            let end = offset.saturating_add(len as usize).min(content.len());
-            Ok(Bytes::copy_from_slice(&content[offset..end]))
-        }
-    }
-
-    #[test]
-    fn folder_backing_exposes_the_archive_only_beneath_its_folder() {
-        let inner: Arc<dyn Backing> = Arc::new(TestBacking::new());
-        let backing = FolderBacking::new("a1b2c3d4", inner);
-
-        let root = backing.list(&smb_path("")).unwrap();
-        assert_eq!(root.len(), 1);
-        assert_eq!(root[0].name, "a1b2c3d4");
-        assert!(root[0].kind.is_dir());
-
-        let archive_root = backing.list(&smb_path("A1B2C3D4")).unwrap();
-        assert_eq!(archive_root.len(), 1);
-        assert_eq!(archive_root[0].name, "docs");
-        assert!(backing.list(&smb_path("docs")).is_err());
-
-        let file = backing
-            .open(&smb_path(r"a1b2c3d4\docs\readme.txt"))
-            .unwrap();
-        assert_eq!(&file.read_at(0, 5).unwrap()[..], b"hello");
-        // Both directories `stat` and `list` report must open as directories,
-        // not as names that do not exist.
-        for directory in ["", "a1b2c3d4"] {
-            assert_eq!(
-                backing.open(&smb_path(directory)).err(),
-                Some(status::FILE_IS_A_DIRECTORY),
-                "opening {directory:?}"
-            );
-        }
-        assert_eq!(backing.total_size(), 5);
-        assert_eq!(backing.label(), "fixture");
-    }
+    use super::test_support::{gzip_member, smb_path};
 
     #[test]
     fn unknown_extensions_are_rejected() {

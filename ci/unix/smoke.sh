@@ -104,10 +104,10 @@ for archive in tmp/candle-0.11.0.zip tmp/candle-0.11.0.tar tmp/candle-0.11.0.tar
     if [[ "$platform" == Darwin ]]; then
         mount_dir="$work/mount"
         mkdir "$mount_dir"
-        mount_smbfs "//smbanything:$password@127.0.0.1:$port/anything/$folder" "$mount_dir"
+        mount_smbfs "//smbanything:$password@127.0.0.1:$port/share/$folder" "$mount_dir"
         cp "$mount_dir/candle-0.11.0/Cargo.toml" "$downloaded"
     else
-        smbclient //127.0.0.1/anything \
+        smbclient //127.0.0.1/share \
             -p "$port" \
             -U "smbanything%$password" \
             '--option=client min protocol=SMB2_10' \
@@ -184,10 +184,10 @@ done
 if [[ "$platform" == Darwin ]]; then
     mount_dir="$work/mount"
     mkdir "$mount_dir"
-    mount_smbfs "//smbanything:$password@169.254.255.1/anything/$folder" "$mount_dir"
+    mount_smbfs "//smbanything:$password@169.254.255.1/share/$folder" "$mount_dir"
     cp "$mount_dir/candle-0.11.0/Cargo.toml" "$downloaded"
 else
-    smbclient //169.254.255.1/anything \
+    smbclient //169.254.255.1/share \
         -U "smbanything%$password" \
         '--option=client min protocol=SMB2_10' \
         '--option=client max protocol=SMB2_10' \

@@ -1,3 +1,81 @@
+use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
+
+use bytes::Bytes;
+use smbanything_core::smb::{Backing, FileReader, NodeInfo, SmbPath, status};
+
+use super::ArchiveIndex;
+
+pub(crate) fn smb_path(path: &str) -> SmbPath {
+    SmbPath::parse(path).expect("valid test SMB path")
+}
+
+/// One file, `docs/readme.txt`, holding `hello`.
+pub(crate) struct TestBacking {
+    index: ArchiveIndex<Vec<u8>>,
+}
+
+impl TestBacking {
+    pub(crate) fn new() -> Self {
+        let mut index = ArchiveIndex::new(UNIX_EPOCH);
+        index
+            .insert(
+                "docs/readme.txt",
+                false,
+                5,
+                UNIX_EPOCH,
+                "test",
+                Some(b"hello".to_vec()),
+            )
+            .unwrap();
+        Self { index }
+    }
+}
+
+impl Backing for TestBacking {
+    fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32> {
+        self.index.stat(path)
+    }
+
+    fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
+        self.index.list(path)
+    }
+
+    fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
+        let entry = self
+            .index
+            .entry(path)
+            .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
+        let content = entry
+            .content
+            .as_ref()
+            .ok_or(status::FILE_IS_A_DIRECTORY)?;
+        Ok(Arc::new(TestFile(Mutex::new(content.clone()))))
+    }
+
+    fn label(&self) -> &str {
+        "fixture"
+    }
+
+    fn total_size(&self) -> u64 {
+        self.index.total_size()
+    }
+}
+
+struct TestFile(Mutex<Vec<u8>>);
+
+impl FileReader for TestFile {
+    fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, u32> {
+        let content = self.0.lock().map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+        let offset = usize::try_from(offset).map_err(|_| status::INVALID_PARAMETER)?;
+        if offset >= content.len() {
+            return Ok(Bytes::new());
+        }
+        let end = offset.saturating_add(len as usize).min(content.len());
+        Ok(Bytes::copy_from_slice(&content[offset..end]))
+    }
+}
+
 const DEFLATE_BLOCK_SIZE: usize = 64 * 1024;
 const LENGTH_BASES: [usize; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99,

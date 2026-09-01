@@ -1,6 +1,7 @@
 mod archive;
 mod connection;
 mod picker;
+mod root;
 mod tui;
 
 use std::io;
@@ -27,8 +28,9 @@ use ratatui::{
 use sha2::{Digest, Sha256};
 use smbanything_core::smb::{self, Backing};
 
-use crate::archive::{ArchiveBacking, FolderBacking};
+use crate::archive::ArchiveBacking;
 use crate::connection::{Kind, ServerView};
+use crate::root::{Control, RootBacking};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -95,6 +97,14 @@ fn main() -> Result<()> {
             password: password.clone(),
         },
     )?;
+    // The share is never empty: a README says what is loaded and how the
+    // share behaves, so a client that mounts early sees a working server.
+    let control = if args.archive.is_some() {
+        Control::CommandLine
+    } else {
+        Control::Ui
+    };
+    handle.load(Arc::new(RootBacking::empty(control)));
 
     let wildcard_host = handle.mount().is_wildcard();
     let host = if wildcard_host {
@@ -142,7 +152,10 @@ fn serve(
 ) -> Result<()> {
     let opened = open_archive(archive)?;
     let folder = opened.folder.clone();
-    handle.load(opened.share_backing());
+    handle.load(Arc::new(RootBacking::with_archive(
+        &opened,
+        Control::CommandLine,
+    )));
 
     println!(
         "Serving {} file{} ({} bytes) from {}",
@@ -265,17 +278,7 @@ pub(crate) struct OpenedArchive {
     pub(crate) folder: String,
     pub(crate) file_count: usize,
     pub(crate) total_size: u64,
-    backing: Arc<ArchiveBacking>,
-}
-
-impl OpenedArchive {
-    /// The share-visible backing: the archive under its own folder.
-    pub(crate) fn share_backing(&self) -> Arc<dyn Backing> {
-        Arc::new(FolderBacking::new(
-            &self.folder,
-            Arc::clone(&self.backing) as Arc<dyn Backing>,
-        ))
-    }
+    backing: Arc<dyn Backing>,
 }
 
 /// Open and index an archive. This reads the whole archive directory and is
@@ -284,13 +287,13 @@ impl OpenedArchive {
 pub(crate) fn open_archive(path: &Path) -> Result<OpenedArchive> {
     let path = absolute_archive_path(path)?;
     let folder = archive_folder_name(&path);
-    let backing = Arc::new(ArchiveBacking::open(&path, archive_label(&path))?);
+    let backing = ArchiveBacking::open(&path, archive_label(&path))?;
     Ok(OpenedArchive {
         file_count: backing.file_count(),
         total_size: backing.total_size(),
         path,
         folder,
-        backing,
+        backing: Arc::new(backing),
     })
 }
 
