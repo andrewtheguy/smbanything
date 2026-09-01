@@ -1,6 +1,8 @@
 // Format-independent archive dispatch, indexing, and SMB folder placement.
 
 mod tar;
+#[cfg(test)]
+mod test_support;
 mod zip;
 
 use std::collections::BTreeMap;
@@ -360,12 +362,14 @@ fn display_components(components: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
     use std::sync::Mutex;
     use std::time::UNIX_EPOCH;
 
     use bytes::Bytes;
 
     use super::*;
+    use super::test_support::gzip_member;
 
     fn smb_path(path: &str) -> SmbPath {
         SmbPath::parse(path).expect("valid test SMB path")
@@ -486,8 +490,6 @@ mod tests {
 
     #[test]
     fn gzip_tar_extensions_dispatch_to_the_tar_backing() {
-        use std::io::Write as _;
-
         for suffix in [".tar.gz", ".TAR.GZ", ".tgz"] {
             let mut tar_bytes = Vec::new();
             let mut writer = ::tar::Builder::new(&mut tar_bytes);
@@ -499,13 +501,9 @@ mod tests {
             writer.finish().unwrap();
             drop(writer);
 
-            let temp = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
-            let mut encoder = flate2::write::GzEncoder::new(
-                temp.reopen().unwrap(),
-                flate2::Compression::default(),
-            );
-            encoder.write_all(&tar_bytes).unwrap();
-            encoder.finish().unwrap();
+            let mut temp = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+            temp.write_all(&gzip_member(&tar_bytes)).unwrap();
+            temp.flush().unwrap();
 
             let backing = ArchiveBacking::open(temp.path(), "fixture").unwrap();
             assert_eq!(backing.file_count(), 1, "{suffix}");

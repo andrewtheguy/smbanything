@@ -1,6 +1,6 @@
 [package]
 name = "smbanything"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 
 [workspace]
@@ -27,6 +27,3 @@ zip = { version = "8.6", default-features = false, features = [
     "xz",
     "zstd",
 ] }
-
-[dev-dependencies]
-flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
