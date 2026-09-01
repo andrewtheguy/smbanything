@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 
 const MAX_EPHEMERAL_BIND_RETRIES: u32 = 64;
 
-pub(crate) fn bind_localhost(port: u16) -> Result<Vec<TcpListener>> {
+pub fn bind_localhost(port: u16) -> Result<Vec<TcpListener>> {
     if port == 0 {
         // While a fresh ephemeral port can still be drawn, a v6 loopback that is
         // already taken on the port v4 landed on is a reason to try another

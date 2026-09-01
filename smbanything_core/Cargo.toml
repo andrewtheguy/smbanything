@@ -1,7 +1,17 @@
 [package]
 name = "smbanything_core"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
+
+[features]
+default = ["tun"]
+# The packet-tunnel transport (`Bind::Tun`): a native L3 adapter plus a
+# userspace TCP stack, which is how the server claims the standard SMB port
+# without binding a host socket to it. On by default because the smbanything
+# binary always offers it; an embedder that only serves loopback or real
+# interfaces turns it off and drops the whole adapter/driver stack from its
+# build.
+tun = ["dep:libc", "dep:smoltcp", "dep:tun", "dep:windows-sys", "dep:wintun"]
 
 [dependencies]
 anyhow = "1"
@@ -19,21 +29,22 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync"
 [target.'cfg(unix)'.dependencies]
 # Linux uses /dev/net/tun and macOS uses utun. The crate configures those
 # native interfaces; neither platform has or needs a sidecar driver.
-libc = "0.2"
-tun = "0.8.14"
+libc = { version = "0.2", optional = true }
+tun = { version = "0.8.14", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # Windows has no native TUN API. Wintun supplies the L3 device that lets the
 # userspace stack serve port 445 without competing with srvnet.sys.
-windows-sys = { version = "0.61", features = [
+windows-sys = { version = "0.61", optional = true, features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
 ] }
-wintun = "0.5"
+wintun = { version = "0.5", optional = true }
 
 [dependencies.smoltcp]
 version = "0.13"
+optional = true
 default-features = false
 features = [
     "std",
