@@ -176,7 +176,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             wildcard_host: false,
             port,
-            share: "anything".to_string(),
+            share: "share".to_string(),
             user: "smbanything".to_string(),
             password: "hunter2".to_string(),
             generated_password: true,
@@ -201,8 +201,8 @@ mod tests {
             assert!(text.contains(heading), "{heading} missing from:\n{text}");
         }
         assert!(text.contains("mount -t cifs"));
-        assert!(text.contains("smb://smbanything@127.0.0.1:4456/anything"));
-        assert!(text.contains(r"net use Z: \\127.0.0.1\anything"));
+        assert!(text.contains("smb://smbanything@127.0.0.1:4456/share"));
+        assert!(text.contains(r"net use Z: \\127.0.0.1\share"));
     }
 
     #[test]
@@ -218,7 +218,7 @@ mod tests {
         let text = text(&view(445, true));
         assert!(!text.contains("port="), "no port option belongs on 445:\n{text}");
         assert!(!text.contains("/TCPPORT"));
-        assert!(text.contains("smb://smbanything@127.0.0.1/anything"));
+        assert!(text.contains("smb://smbanything@127.0.0.1/share"));
         assert!(text.contains("Explorer's address bar"));
     }
 
@@ -227,10 +227,10 @@ mod tests {
         // The archive's folder is reported elsewhere; baking it into a mount
         // would tie the mount to one archive the user can unload at any time.
         let text = text(&view(4456, false));
-        assert!(text.contains("//127.0.0.1/anything /mnt/smbanything"));
+        assert!(text.contains("//127.0.0.1/share /mnt/smbanything"));
         assert!(text.contains("<8-hex-id> folder"));
         assert!(
-            !text.contains("anything/4") && !text.contains(r"anything\4"),
+            !text.contains("share/4") && !text.contains(r"share\4"),
             "no folder belongs in a mount path:\n{text}"
         );
     }

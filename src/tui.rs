@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -16,6 +17,7 @@ use smbanything_core::smb;
 
 use crate::connection::{self, Kind, ServerView};
 use crate::picker::{self, Choice, Picker};
+use crate::root::{Control, RootBacking};
 use crate::{OpenedArchive, open_archive};
 
 struct LoadedArchive {
@@ -139,7 +141,7 @@ pub(crate) fn run(
                 // Also abandons an archive still opening: its result arrives
                 // on a receiver nobody holds, so it is never published.
                 opening = None;
-                handle.unload();
+                handle.load(Arc::new(RootBacking::empty(Control::Ui)));
                 app.loaded = None;
                 app.scroll = 0;
                 app.notice = Some(Notice {
@@ -175,7 +177,7 @@ pub(crate) fn run(
 fn finish_load(app: &mut App, handle: &smb::SmbHandle, opened: Result<OpenedArchive>) {
     match opened {
         Ok(opened) => {
-            handle.load(opened.share_backing());
+            handle.load(Arc::new(RootBacking::with_archive(&opened, Control::Ui)));
             app.scroll = 0;
             app.notice = Some(Notice {
                 error: false,
@@ -436,7 +438,7 @@ fn contents_lines(app: &App) -> Vec<Line<'static>> {
         None => vec![
             Line::styled("Empty", Style::default().fg(Color::Yellow)),
             Line::from(
-                "The SMB base share is running. Load an archive to add its <8-hex-id> folder.",
+                "The SMB base share is running with only README.txt. Load an archive to add its <8-hex-id> folder.",
             ),
         ],
     }
@@ -668,7 +670,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             wildcard_host: false,
             port,
-            share: "anything".to_string(),
+            share: "share".to_string(),
             user: "smbanything".to_string(),
             password: "hunter2".to_string(),
             generated_password: false,

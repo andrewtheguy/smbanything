@@ -20,11 +20,13 @@ cargo build --release
 ```
 
 The default listener is IPv4 and IPv6 loopback on port 4456, with share name
-`anything` and username `smbanything`. The base share starts immediately with
-an empty root. Press `l` (or Enter) to open the archive picker: a listing of
-the current directory's folders and `.zip`, `.tar`, `.tar.gz`, and `.tgz`
-files. Move with `↑`/`↓`, step into a folder or load an archive with Enter,
-go up with `←` or Backspace, type to narrow the list, and press Tab to show
+`share` and username `smbanything`. The base share starts immediately, holding
+a `README.txt` that names the loaded archive (or says none is) and explains
+how the share behaves; it is rewritten on every load and unload. Press `l`
+(or Enter) to open the archive picker: a listing of the current directory's
+folders and `.zip`, `.tar`, `.tar.gz`, and `.tgz` files. Move with `↑`/`↓`,
+step into a folder or load an archive with Enter, go up with `←` or
+Backspace, type to narrow the list, and press Tab to show
 dot-files. A path typed or pasted into the filter row (a file dropped onto
 the terminal, say) is followed on Enter. Press `u` to unload the archive
 while leaving the listener, authentication, sessions, and base share running.
@@ -40,7 +42,7 @@ scripts, which have no terminal for the UI to draw on:
 
 The loaded archive is placed in a directory named with the first eight
 hexadecimal characters of the SHA-256 of its absolute path, so its SMB path is
-`//127.0.0.1/anything/<8-hex-id>`. A random password is shown in the TUI for
+`//127.0.0.1/share/<8-hex-id>`. A random password is shown in the TUI for
 each run. To use a stable password, pass it through the environment rather than
 the process list:
 
@@ -53,7 +55,7 @@ Useful options:
 
 ```text
 -p, --port <PORT>    Listen port; 0 chooses an ephemeral port
--s, --share <NAME>   SMB share name (default: anything)
+-s, --share <NAME>   SMB share name (default: share)
 -u, --user <NAME>    SMB username (default: smbanything)
     --bind-all       Listen on every network interface
     --smb-tun        Serve port 445 through a private packet tunnel
@@ -76,19 +78,19 @@ Linux:
 ```sh
 sudo mount -t cifs \
   -o port=4456,vers=2.1,username=smbanything,ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 \
-  //127.0.0.1/anything/<8-hex-id> /mnt/smbanything
+  //127.0.0.1/share/<8-hex-id> /mnt/smbanything
 ```
 
 macOS, using Finder → Go → Connect to Server:
 
 ```text
-smb://smbanything@127.0.0.1:4456/anything/<8-hex-id>
+smb://smbanything@127.0.0.1:4456/share/<8-hex-id>
 ```
 
 Windows 11 24H2 or newer:
 
 ```bat
-net use Z: \\127.0.0.1\anything\<8-hex-id> * /user:smbanything /TCPPORT:4456
+net use Z: \\127.0.0.1\share\<8-hex-id> * /user:smbanything /TCPPORT:4456
 ```
 
 Older Windows clients require SMB's standard port 445. On Unix, binding that
@@ -122,7 +124,7 @@ loaded.
 The default pair is in the RFC 3927 link-local block reserved from APIPA
 autoconfiguration. Neither address is routed off the machine. Because the
 tunnel uses the standard port, clients use plain paths such as
-`\\169.254.255.1\anything\<8-hex-id>` and no `/TCPPORT` option is needed.
+`\\169.254.255.1\share\<8-hex-id>` and no `/TCPPORT` option is needed.
 The full design — why a normal socket cannot serve 445 on Windows, the routing
 trick, crash cleanup, and the Wintun driver's provenance — is in
 [docs/smb-tun.md](docs/smb-tun.md).

@@ -126,10 +126,10 @@ refused with a specific NTSTATUS.
   directories round-trip exactly.
 - **No reparse points, no extended attributes, no alternate data streams.**
 - **One loaded backing at a time.** A server starts with an empty root.
-  `SmbHandle::load` replaces the complete root and `SmbHandle::unload` restores
-  the empty root without rebuilding the listener, transport, authentication,
-  sessions, or connected trees. Both operations invalidate open disk handles
-  and release cached file readers before returning.
+  `SmbHandle::load` replaces the complete root without rebuilding the
+  listener, transport, authentication, sessions, or connected trees. It
+  invalidates open disk handles and releases cached file readers before
+  returning.
 - **A filename SMB2 cannot express must not reach the wire intact.** SMB2
   filenames carry no path separator, and the Windows redirector answers a
   listing that carries one by discarding the *whole response* — one such file

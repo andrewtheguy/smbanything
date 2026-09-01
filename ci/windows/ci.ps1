@@ -90,7 +90,7 @@ try {
         if (Test-Path $stdout) {
             $serverText = Get-Content -Raw $stdout
             if ($serverText -match 'Port:\s+(\d+)') { $port = [int] $Matches[1] }
-            if ($serverText -match 'Folder:\s+\\\\[^\\]+\\anything\\([0-9a-f]{8})') { $folder = $Matches[1] }
+            if ($serverText -match 'Folder:\s+\\\\[^\\]+\\share\\([0-9a-f]{8})') { $folder = $Matches[1] }
         }
         if ($port -and $folder) { break }
         if ($server.HasExited) {
@@ -141,7 +141,7 @@ try {
         Start-Sleep -Milliseconds 20
     }
 
-    $unc = "\\169.254.255.1\anything\$folder"
+    $unc = "\\169.254.255.1\share\$folder"
     $mapOutput = & net.exe use "${drive}:" $unc 'ci-smoke-password' /user:smbanything 2>&1
     $mapCode = $LASTEXITCODE
     $mapOutput | ForEach-Object { Write-Host "$_" }

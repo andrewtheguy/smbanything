@@ -48,9 +48,9 @@
 // argument: a command line is readable by every other process while it runs,
 // and lands in shell (or console) history afterwards.
 //   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=smbanything,ro,\
-//                       file_mode=0444,dir_mode=0555 //127.0.0.1/anything/<id> /mnt/smbanything
-//   macOS    Finder → Go → Connect to Server (Cmd+K): smb://smbanything@127.0.0.1:<p>/anything/<id>
-//   Windows  net use Z: \\127.0.0.1\anything\<id> * /user:smbanything   (add /TCPPORT:<p>)
+//                       file_mode=0444,dir_mode=0555 //127.0.0.1/share/<id> /mnt/smbanything
+//   macOS    Finder → Go → Connect to Server (Cmd+K): smb://smbanything@127.0.0.1:<p>/share/<id>
+//   Windows  net use Z: \\127.0.0.1\share\<id> * /user:smbanything   (add /TCPPORT:<p>)
 
 /// Turn protocol tracing on for the rest of the process, for an embedder whose
 /// own switch (a flag, its own environment variable) says to. There is no way
@@ -193,8 +193,8 @@ fn status_name(status: u32) -> String {
 /// keep a client from claiming an unbounded window.
 const MAX_CREDITS: u16 = 512;
 
-/// The default share name clients connect to: `\\127.0.0.1\anything`.
-pub const DEFAULT_SHARE_NAME: &str = "anything";
+/// The default share name clients connect to: `\\127.0.0.1\share`.
+pub const DEFAULT_SHARE_NAME: &str = "share";
 
 /// SMB's registered port, and the only one a Windows UNC path will ever try.
 /// A share reachable here needs no port option in any mount command, and works
@@ -246,16 +246,14 @@ pub fn random_password() -> String {
 
 struct Contents {
     backing: RwLock<Arc<dyn Backing>>,
-    empty: Arc<dyn Backing>,
     open_files: Arc<OpenRegistry>,
 }
 
 impl Contents {
+    /// Starts with an empty root until the owner loads something.
     fn new(label: impl Into<String>, now: SystemTime) -> Self {
-        let empty: Arc<dyn Backing> = Arc::new(EmptyBacking::new(label, now));
         Self {
-            backing: RwLock::new(empty.clone()),
-            empty,
+            backing: RwLock::new(Arc::new(EmptyBacking::new(label, now))),
             open_files: Arc::new(OpenRegistry::new()),
         }
     }
@@ -273,10 +271,6 @@ impl Contents {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.open_files.invalidate_all();
         *current = backing;
-    }
-
-    fn unload(&self) {
-        self.replace(self.empty.clone());
     }
 }
 
@@ -427,14 +421,6 @@ impl SmbHandle {
         self.contents.replace(backing);
     }
 
-    /// Leave the running share mounted but empty.
-    ///
-    /// Like [`load`](Self::load), this invalidates all open disk handles and
-    /// releases cached readers before returning.
-    pub fn unload(&self) {
-        self.contents.unload();
-    }
-
     pub fn stop(mut self) {
         #[cfg(feature = "tun")]
         drop(self.tun.take());
@@ -563,8 +549,8 @@ pub enum Bind {
 
 /// Start an empty server on `port` (0 picks an ephemeral one). Binding happens
 /// synchronously so that a port conflict is reported to the caller rather than
-/// swallowed by the server thread. Use [`SmbHandle::load`] and
-/// [`SmbHandle::unload`] to change the root without restarting it.
+/// swallowed by the server thread. Use [`SmbHandle::load`] to change the root
+/// without restarting it.
 pub fn start(
     port: u16,
     share_name: impl Into<String>,
@@ -1562,15 +1548,8 @@ mod tests {
     }
 
     #[test]
-    fn unloading_releases_the_backing_and_restores_an_empty_root() {
+    fn a_server_starts_empty_and_replacing_releases_the_previous_backing() {
         let contents = Contents::new(DEFAULT_SHARE_NAME, SystemTime::UNIX_EPOCH);
-        let backing = test_backing();
-        let weak = Arc::downgrade(&backing);
-        contents.replace(backing);
-
-        contents.unload();
-
-        assert!(weak.upgrade().is_none(), "the old backing must be dropped");
         assert!(
             contents
                 .backing()
@@ -1578,6 +1557,13 @@ mod tests {
                 .expect("empty root lists")
                 .is_empty()
         );
+
+        let backing = test_backing();
+        let weak = Arc::downgrade(&backing);
+        contents.replace(backing);
+        contents.replace(test_backing());
+
+        assert!(weak.upgrade().is_none(), "the old backing must be dropped");
     }
 
     /// Build one SMB2 request message: header followed by `body`.
@@ -1907,7 +1893,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\anything"),
+                &tree_connect_body(r"\\127.0.0.1\share"),
             ))
             .expect("tree connect answered");
         let h = parse_response(&resp);
@@ -1923,7 +1909,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 0,
                 0,
-                &tree_connect_body("anything"),
+                &tree_connect_body(DEFAULT_SHARE_NAME),
             ))
             .expect("answered");
         assert_eq!(parse_response(&resp).status, status::USER_SESSION_DELETED);
@@ -1937,7 +1923,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id ^ 0xFFFF,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\anything"),
+                &tree_connect_body(r"\\127.0.0.1\share"),
             ))
             .expect("answered");
         assert_eq!(parse_response(&resp).status, status::USER_SESSION_DELETED);
@@ -1980,7 +1966,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\anything"),
+                &tree_connect_body(r"\\127.0.0.1\share"),
             ))
             .expect("answered");
         assert_eq!(parse_response(&resp).status, status::USER_SESSION_DELETED);
@@ -2262,7 +2248,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\anything"),
+                &tree_connect_body(r"\\127.0.0.1\share"),
             ))
             .expect("tree connect answered");
         parse_response(&resp).tree_id
@@ -2376,7 +2362,7 @@ mod tests {
             &[
                 (
                     cmd::TREE_CONNECT,
-                    tree_connect_body(r"\\127.0.0.1\anything"),
+                    tree_connect_body(r"\\127.0.0.1\share"),
                     false,
                 ),
                 (cmd::CREATE, create_body_for("docs"), true),
@@ -2457,7 +2443,7 @@ mod tests {
                 cmd::TREE_CONNECT,
                 session_id,
                 0,
-                &tree_connect_body(r"\\127.0.0.1\anything"),
+                &tree_connect_body(r"\\127.0.0.1\share"),
             ))
             .unwrap();
         let tree_id = parse_response(&resp).tree_id;
@@ -2535,7 +2521,7 @@ mod tests {
     fn server_starts_on_an_ephemeral_port_and_stops() {
         let handle = start_test_server(0);
         assert_ne!(handle.port, 0);
-        assert_eq!(handle.unc(), r"\\127.0.0.1\anything");
+        assert_eq!(handle.unc(), r"\\127.0.0.1\share");
         handle.stop();
     }
 
