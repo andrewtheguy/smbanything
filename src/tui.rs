@@ -14,18 +14,8 @@ use ratatui::{
 };
 use smbanything_core::smb;
 
+use crate::connection::{self, Kind, ServerView};
 use crate::{OpenedArchive, open_archive};
-
-pub(crate) struct ServerView {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) share: String,
-    pub(crate) user: String,
-    pub(crate) password: String,
-    pub(crate) generated_password: bool,
-    pub(crate) bind_all: bool,
-    pub(crate) standard_port: bool,
-}
 
 struct LoadedArchive {
     path: PathBuf,
@@ -45,6 +35,12 @@ struct App {
     input: String,
     loaded: Option<LoadedArchive>,
     notice: Option<Notice>,
+    /// First visible line of the mount details, which are longer than the
+    /// panel on most terminals.
+    scroll: u16,
+    /// Lines the details panel could not show at the last draw, so scrolling
+    /// stops at the end of the text instead of running past it.
+    scroll_max: u16,
 }
 
 struct Notice {
@@ -56,6 +52,7 @@ enum Action {
     None,
     Load,
     Unload,
+    ScrollBy(i32),
     Quit,
 }
 
@@ -70,6 +67,8 @@ pub(crate) fn run(
         input: String::new(),
         loaded: None,
         notice: None,
+        scroll: 0,
+        scroll_max: 0,
     };
     // Opening an archive indexes the whole of it, which on a large one takes
     // long enough to freeze the UI. A worker does it and hands the result
@@ -78,7 +77,7 @@ pub(crate) fn run(
     let mut opening: Option<Receiver<Result<OpenedArchive>>> = None;
 
     loop {
-        terminal.draw(|frame| render(frame, &app, server))?;
+        terminal.draw(|frame| render(frame, &mut app, server))?;
 
         match stop_rx.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => return Ok(()),
@@ -124,6 +123,10 @@ pub(crate) fn run(
         };
         match action {
             Action::None => {}
+            Action::ScrollBy(delta) => {
+                let target = i64::from(app.scroll) + i64::from(delta);
+                app.scroll = target.clamp(0, i64::from(app.scroll_max)) as u16;
+            }
             Action::Quit => return Ok(()),
             Action::Unload => {
                 // Also abandons an archive still opening: its result arrives
@@ -131,6 +134,7 @@ pub(crate) fn run(
                 opening = None;
                 handle.unload();
                 app.loaded = None;
+                app.scroll = 0;
                 app.notice = Some(Notice {
                     error: false,
                     text: "Archive unloaded; the SMB share is still running.".to_string(),
@@ -167,6 +171,7 @@ fn finish_load(app: &mut App, handle: &smb::SmbHandle, opened: Result<OpenedArch
             handle.load(opened.share_backing());
             app.input = opened.path.display().to_string();
             app.mode = Mode::Normal;
+            app.scroll = 0;
             app.notice = Some(Notice {
                 error: false,
                 text: format!("Loaded folder {}.", opened.folder),
@@ -204,6 +209,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
                 Action::None
             }
             KeyCode::Char('u') => Action::Unload,
+            KeyCode::Down | KeyCode::Char('j') => Action::ScrollBy(1),
+            KeyCode::Up | KeyCode::Char('k') => Action::ScrollBy(-1),
+            KeyCode::PageDown => Action::ScrollBy(10),
+            KeyCode::PageUp => Action::ScrollBy(-10),
+            KeyCode::Home => Action::ScrollBy(i32::MIN / 2),
+            KeyCode::End => Action::ScrollBy(i32::MAX / 2),
             _ => Action::None,
         },
         Mode::Editing => match key.code {
@@ -229,24 +240,37 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     }
 }
 
-fn render(frame: &mut Frame, app: &App, server: &ServerView) {
-    let [server_area, contents_area, input_area, notice_area, footer_area] = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(3),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+fn render(frame: &mut Frame, app: &mut App, server: &ServerView) {
+    // Every panel above the details is sized to the text it actually holds,
+    // wrapping included, so the mount commands get every row the terminal can
+    // spare.
+    let width = frame.area().width.saturating_sub(2);
+    let server_lines = server_lines(server);
+    let contents_lines = contents_lines(app);
+    let notice_lines = app.notice.as_ref().map_or(0, |notice| {
+        wrapped_rows(&notice.text, width + 2).min(3)
+    });
 
-    render_server(frame, server, server_area);
-    render_contents(frame, app, server, contents_area);
+    let [server_area, contents_area, details_area, input_area, notice_area, footer_area] =
+        Layout::vertical([
+            Constraint::Length(boxed_height(&server_lines, width)),
+            Constraint::Length(boxed_height(&contents_lines, width)),
+            Constraint::Fill(1),
+            Constraint::Length(3),
+            Constraint::Length(notice_lines),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+    render_block(frame, server_lines, " SMB server ", server_area);
+    render_block(frame, contents_lines, " Contents ", contents_area);
+    render_details(frame, app, server, details_area);
     render_input(frame, app, input_area);
     render_notice(frame, app, notice_area);
     let footer = if app.mode == Mode::Editing {
         "Enter load/replace  Esc cancel  Ctrl-U clear"
     } else {
-        "l/Enter load or replace  u unload  q/Esc quit"
+        "l/Enter load or replace  u unload  ↑/↓ PgUp/PgDn scroll  q/Esc quit"
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
@@ -254,44 +278,75 @@ fn render(frame: &mut Frame, app: &App, server: &ServerView) {
     );
 }
 
-fn render_server(frame: &mut Frame, server: &ServerView, area: Rect) {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Running  ",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(r"\\{}\{}", server.host, server.share)),
-        ]),
-        Line::from(format!("Port: {}", server.port)),
-        Line::from(format!("Username: {}", server.user)),
-        Line::from(format!("Password: {}", server.password)),
-    ];
-    if server.generated_password {
-        lines.push(Line::from(
-            "Password generated for this run (set SMBANYTHING_PASSWORD to choose it).",
-        ));
-    }
-    if server.bind_all {
-        lines.push(Line::styled(
-            "WARNING: file data is signed but not encrypted and is visible in transit.",
-            Style::default().fg(Color::Yellow),
-        ));
-    } else if server.standard_port {
-        lines.push(Line::from(
-            "Standard SMB port: plain UNC paths work without a port option.",
-        ));
-    }
+/// Rows a bordered panel needs to show `lines` in full at `width`.
+fn boxed_height(lines: &[Line<'_>], width: u16) -> u16 {
+    lines
+        .iter()
+        .map(|line| wrapped_rows(&line.to_string(), width))
+        .sum::<u16>()
+        .saturating_add(2)
+}
+
+fn render_block(frame: &mut Frame, lines: Vec<Line>, title: &str, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title(" SMB server ").borders(Borders::ALL))
+            .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
-fn render_contents(frame: &mut Frame, app: &App, server: &ServerView, area: Rect) {
-    let lines = match &app.loaded {
+fn server_lines(server: &ServerView) -> Vec<Line<'static>> {
+    // No path here: the listener is what this box reports, and every path a
+    // client can actually use is in the mount commands below, spelled the way
+    // its own platform wants it. A headline UNC would be wrong on any port but
+    // 445 anyway, since no UNC syntax can carry one.
+    let reach = if server.bind_all {
+        "read-only, every interface"
+    } else {
+        "read-only, this machine only"
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw("Server:   "),
+            Span::styled(
+                format!("listening on {}:{}", server.host, server.port),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  ({reach})")),
+        ]),
+    ];
+    // Keyed on the transport actually in use, not on the port number: --port
+    // 445 reaches the standard port with no tunnel anywhere, and claiming a
+    // private adapter exists when none does would simply be wrong.
+    if let Some(addrs) = server.tun {
+        lines.push(Line::from(format!(
+            "Tun:      private adapter, standard SMB port. The machine's own file sharing is \
+             untouched; {}/32 and {}/32 route here until this process stops.",
+            addrs.virtual_ip(),
+            addrs.adapter_ip()
+        )));
+    }
+    if server.bind_all {
+        lines.push(Line::styled(
+            "Warning:  file data is signed but not encrypted and is visible in transit.",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines.push(Line::from(format!("Username: {}", server.user)));
+    lines.push(Line::from(if server.generated_password {
+        format!(
+            "Password: {}  (generated for this run; set SMBANYTHING_PASSWORD to choose it)",
+            server.password
+        )
+    } else {
+        format!("Password: {}", server.password)
+    }));
+    lines
+}
+
+fn contents_lines(app: &App) -> Vec<Line<'static>> {
+    match &app.loaded {
         Some(loaded) => vec![
             Line::styled("Archive loaded", Style::default().fg(Color::Green)),
             Line::from(format!("Source: {}", loaded.path.display())),
@@ -300,10 +355,6 @@ fn render_contents(frame: &mut Frame, app: &App, server: &ServerView, area: Rect
                 "Files: {}    Total size: {} bytes",
                 loaded.file_count, loaded.total_size
             )),
-            Line::from(format!(
-                r"UNC: \\{}\{}\{}",
-                server.host, server.share, loaded.folder
-            )),
         ],
         None => vec![
             Line::styled("Empty", Style::default().fg(Color::Yellow)),
@@ -311,13 +362,73 @@ fn render_contents(frame: &mut Frame, app: &App, server: &ServerView, area: Rect
                 "The SMB base share is running. Load an archive to add its <8-hex-id> folder.",
             ),
         ],
+    }
+}
+
+/// The per-OS mount commands. They rarely fit, so the panel scrolls and says
+/// how much is left below.
+fn render_details(frame: &mut Frame, app: &mut App, server: &ServerView, area: Rect) {
+    let folder = app.loaded.as_ref().map(|loaded| loaded.folder.as_str());
+    let lines: Vec<Line> = connection::details(server, folder)
+        .into_iter()
+        .map(|detail| {
+            let style = match detail.kind {
+                Kind::Heading => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Kind::Command => Style::default().fg(Color::White),
+                Kind::Note => Style::default().fg(Color::Gray),
+                Kind::Warning => Style::default().fg(Color::Yellow),
+            };
+            Line::styled(detail.text, style)
+        })
+        .collect();
+
+    let inner_height = area.height.saturating_sub(2);
+    let inner_width = area.width.saturating_sub(2);
+    let wrapped: u16 = lines
+        .iter()
+        .map(|line| wrapped_rows(&line.to_string(), inner_width))
+        .sum();
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    app.scroll_max = wrapped.saturating_sub(inner_height);
+    app.scroll = app.scroll.min(app.scroll_max);
+    let hidden = app.scroll_max - app.scroll;
+    let title = match hidden {
+        0 => " Connecting ".to_string(),
+        1 => " Connecting  (1 more line below) ".to_string(),
+        n => format!(" Connecting  ({n} more lines below) "),
     };
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().title(" Contents ").borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
+        paragraph
+            .block(Block::default().title(title).borders(Borders::ALL))
+            .scroll((app.scroll, 0)),
         area,
     );
+}
+
+/// Rows one line of text occupies once wrapped at `width`, matching how the
+/// paragraph widget breaks at spaces. Ratatui keeps its own line count behind
+/// an unstable feature, and the scroll limit needs a number.
+fn wrapped_rows(text: &str, width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let mut rows = 1u16;
+    let mut col = 0usize;
+    for (index, word) in text.split(' ').enumerate() {
+        let word_width = word.chars().count();
+        let needed = if index == 0 { word_width } else { word_width + 1 };
+        if col > 0 && col + needed > width {
+            rows = rows.saturating_add(1);
+            col = word_width;
+        } else {
+            col += needed;
+        }
+        // A word longer than the panel is broken across as many rows as it
+        // needs rather than pushed onto one.
+        while col > width {
+            col -= width;
+            rows = rows.saturating_add(1);
+        }
+    }
+    rows
 }
 
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -358,4 +469,53 @@ fn render_notice(frame: &mut Frame, app: &App, area: Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(port: u16, standard_port: bool) -> ServerView {
+        ServerView {
+            host: "127.0.0.1".to_string(),
+            wildcard_host: false,
+            port,
+            share: "anything".to_string(),
+            user: "smbanything".to_string(),
+            password: "hunter2".to_string(),
+            generated_password: false,
+            bind_all: false,
+            standard_port,
+            tun: None,
+        }
+    }
+
+    fn text(server: &ServerView) -> String {
+        server_lines(server)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_server_box_reports_the_listener_and_leaves_paths_to_the_commands() {
+        let text = text(&view(4456, false));
+        assert!(text.contains("Server:   listening on 127.0.0.1:4456"));
+        assert!(text.contains("read-only, this machine only"));
+        // A UNC in the header would name port 445 on any other port, and the
+        // per-platform paths belong in the mount commands regardless.
+        assert!(!text.contains(r"\\127.0.0.1"), "no path belongs here:\n{text}");
+        assert!(!text.contains("//127.0.0.1"), "no path belongs here:\n{text}");
+    }
+
+    #[test]
+    fn wrapped_rows_counts_the_rows_a_line_takes() {
+        assert_eq!(wrapped_rows("", 10), 1);
+        assert_eq!(wrapped_rows("short", 10), 1);
+        assert_eq!(wrapped_rows("one two three", 7), 2);
+        assert_eq!(wrapped_rows("one two three", 5), 3);
+        // A command with no spaces long enough to break is still counted.
+        assert_eq!(wrapped_rows(&"x".repeat(25), 10), 3);
+    }
 }

@@ -61,15 +61,17 @@ Run `smbanything --help` for the complete command-line help. Set
 
 ## Mounting
 
-The TUI shows the actual host, port, share, username, password, and loaded
-`<8-hex-id>` folder. The client commands below prompt for the password instead
-of putting it in shell history.
+The TUI's Connecting panel shows the ready-to-paste command for each client
+platform, filled in with the actual host, port, share, username, and loaded
+`<8-hex-id>` folder (`↑`/`↓` and `PgUp`/`PgDn` scroll it); serving one archive
+from the command line prints the same text. The commands prompt for the
+password instead of putting it in shell history.
 
 Linux:
 
 ```sh
 sudo mount -t cifs \
-  -o port=4456,vers=2.1,username=smbanything,ro,file_mode=0444,dir_mode=0555 \
+  -o port=4456,vers=2.1,username=smbanything,ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 \
   //127.0.0.1/anything/<8-hex-id> /mnt/smbanything
 ```
 
