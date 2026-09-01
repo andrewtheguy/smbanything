@@ -26,6 +26,14 @@ load it. Press `u` to unload it while leaving the listener, authentication,
 sessions, and base share running. Loading another archive replaces the complete
 contents in the same way.
 
+Naming an archive on the command line skips the UI and serves that one archive
+until Ctrl-C, printing the mount details on stdout. That is the form for
+scripts, which have no terminal for the UI to draw on:
+
+```sh
+./target/release/smbanything archive.tar.gz
+```
+
 The loaded archive is placed in a directory named with the first eight
 hexadecimal characters of the SHA-256 of its absolute path, so its SMB path is
 `//127.0.0.1/anything/<8-hex-id>`. A random password is shown in the TUI for

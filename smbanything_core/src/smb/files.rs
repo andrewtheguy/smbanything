@@ -129,10 +129,19 @@ impl OpenRegistry {
     }
 
     fn register(&self, state: &Arc<OpenState>) {
-        self.states
+        let mut states = self
+            .states
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(Arc::downgrade(state));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Handles closed since the last registration leave a dangling weak
+        // entry behind, and nothing else removes one until the backing
+        // changes. Drop them whenever the vector would otherwise have to grow:
+        // that bounds the registry by the live handle count without turning
+        // every registration into a full scan.
+        if states.len() == states.capacity() {
+            states.retain(|state| state.strong_count() > 0);
+        }
+        states.push(Arc::downgrade(state));
     }
 
     pub(super) fn invalidate_all(&self) {

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -12,10 +12,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use smbanything_core::smb::{self, Backing};
+use smbanything_core::smb;
 
-use crate::archive::{ArchiveBacking, FolderBacking};
-use crate::{absolute_archive_path, archive_folder_name, archive_label};
+use crate::{OpenedArchive, open_archive};
 
 pub(crate) struct ServerView {
     pub(crate) host: String,
@@ -72,6 +71,11 @@ pub(crate) fn run(
         loaded: None,
         notice: None,
     };
+    // Opening an archive indexes the whole of it, which on a large one takes
+    // long enough to freeze the UI. A worker does it and hands the result
+    // back here, so the loop keeps drawing and keeps answering quit and the
+    // termination signal while the archive opens.
+    let mut opening: Option<Receiver<Result<OpenedArchive>>> = None;
 
     loop {
         terminal.draw(|frame| render(frame, &app, server))?;
@@ -86,6 +90,24 @@ pub(crate) fn run(
                 handle.failed_logons()
             );
         }
+
+        if let Some(rx) = &opening {
+            match rx.try_recv() {
+                Ok(opened) => {
+                    opening = None;
+                    finish_load(&mut app, handle, opened);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    opening = None;
+                    app.notice = Some(Notice {
+                        error: true,
+                        text: "the archive loader stopped without a result".to_string(),
+                    });
+                }
+            }
+        }
+
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
@@ -104,6 +126,9 @@ pub(crate) fn run(
             Action::None => {}
             Action::Quit => return Ok(()),
             Action::Unload => {
+                // Also abandons an archive still opening: its result arrives
+                // on a receiver nobody holds, so it is never published.
+                opening = None;
                 handle.unload();
                 app.loaded = None;
                 app.notice = Some(Notice {
@@ -111,31 +136,53 @@ pub(crate) fn run(
                     text: "Archive unloaded; the SMB share is still running.".to_string(),
                 });
             }
-            Action::Load => {
+            Action::Load if opening.is_none() => {
+                if app.input.is_empty() {
+                    app.notice = Some(Notice {
+                        error: true,
+                        text: "enter an archive path".to_string(),
+                    });
+                    continue;
+                }
+                let input = PathBuf::from(app.input.clone());
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let _ = tx.send(open_archive(&input));
+                });
+                opening = Some(rx);
                 app.notice = Some(Notice {
                     error: false,
                     text: "Loading archive...".to_string(),
                 });
-                terminal.draw(|frame| render(frame, &app, server))?;
-                match load_archive(handle, &app.input) {
-                    Ok(loaded) => {
-                        let folder = loaded.folder.clone();
-                        app.input = loaded.path.display().to_string();
-                        app.loaded = Some(loaded);
-                        app.mode = Mode::Normal;
-                        app.notice = Some(Notice {
-                            error: false,
-                            text: format!("Loaded folder {folder}."),
-                        });
-                    }
-                    Err(e) => {
-                        app.notice = Some(Notice {
-                            error: true,
-                            text: format!("{e:#}"),
-                        });
-                    }
-                }
             }
+            // A second load while one is still opening: the first one wins.
+            Action::Load => {}
+        }
+    }
+}
+
+fn finish_load(app: &mut App, handle: &smb::SmbHandle, opened: Result<OpenedArchive>) {
+    match opened {
+        Ok(opened) => {
+            handle.load(opened.share_backing());
+            app.input = opened.path.display().to_string();
+            app.mode = Mode::Normal;
+            app.notice = Some(Notice {
+                error: false,
+                text: format!("Loaded folder {}.", opened.folder),
+            });
+            app.loaded = Some(LoadedArchive {
+                path: opened.path,
+                folder: opened.folder,
+                file_count: opened.file_count,
+                total_size: opened.total_size,
+            });
+        }
+        Err(e) => {
+            app.notice = Some(Notice {
+                error: true,
+                text: format!("{e:#}"),
+            });
         }
     }
 }
@@ -180,24 +227,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             _ => Action::None,
         },
     }
-}
-
-fn load_archive(handle: &smb::SmbHandle, input: &str) -> Result<LoadedArchive> {
-    if input.is_empty() {
-        bail!("enter an archive path");
-    }
-    let path = absolute_archive_path(&PathBuf::from(input))?;
-    let folder = archive_folder_name(&path);
-    let backing = Arc::new(ArchiveBacking::open(&path, archive_label(&path))?);
-    let file_count = backing.file_count();
-    let total_size = backing.total_size();
-    handle.load(Arc::new(FolderBacking::new(&folder, backing)));
-    Ok(LoadedArchive {
-        path,
-        folder,
-        file_count,
-        total_size,
-    })
 }
 
 fn render(frame: &mut Frame, app: &App, server: &ServerView) {

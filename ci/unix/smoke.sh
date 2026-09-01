@@ -32,7 +32,19 @@ cleanup() {
         umount "$mount_dir" 2>/dev/null || true
     fi
     if [[ -n "$pid" ]] && { kill -0 "$pid" 2>/dev/null || $elevated_pid; }; then
-        if $elevated_pid; then sudo -n kill -INT "$pid" 2>/dev/null || true; else kill -INT "$pid"; fi
+        if $elevated_pid; then
+            # $pid is sudo, which runs the server as a child rather than
+            # exec'ing it in place and does not relay SIGINT to it on macOS —
+            # signalling sudo there leaves the server running and the wait
+            # below never returns. Signal that child directly; waiting on sudo
+            # then still waits for the server, because sudo exits once its
+            # child does, which is what the post-shutdown checks rely on.
+            sudo -n pkill -INT -P "$pid" 2>/dev/null \
+                || sudo -n kill -INT "$pid" 2>/dev/null \
+                || true
+        else
+            kill -INT "$pid"
+        fi
         wait "$pid"
     fi
     pid=

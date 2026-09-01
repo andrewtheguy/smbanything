@@ -1,13 +1,22 @@
 mod archive;
 mod tui;
 
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use ratatui::crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
+    execute,
+};
 use sha2::{Digest, Sha256};
-use smbanything_core::smb;
+use smbanything_core::smb::{self, Backing};
+
+use crate::archive::{ArchiveBacking, FolderBacking};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -15,6 +24,10 @@ use smbanything_core::smb;
     about = "Browse ZIP and TAR archives through a persistent, authenticated, read-only SMB 2.1 share"
 )]
 struct Args {
+    /// ZIP, TAR, or gzip-compressed TAR archive to serve; with none, the
+    /// browser starts on an empty share and archives are loaded from its UI
+    archive: Option<PathBuf>,
+
     /// TCP port to listen on (0 chooses an ephemeral port)
     #[arg(short, long, default_value_t = 4456, conflicts_with = "smb_tun")]
     port: u16,
@@ -87,19 +100,138 @@ fn main() -> Result<()> {
         standard_port: handle.on_standard_port(),
     };
 
-    // The termination handler only wakes the UI loop. Cleanup remains on the
-    // main thread, where the terminal is restored before the SMB transport is
-    // stopped and its thread joined.
+    // The termination handler only wakes the loop below. Cleanup remains on
+    // the main thread, where the terminal is restored before the SMB transport
+    // is stopped and its thread joined.
     let (stop_tx, stop_rx) = mpsc::sync_channel(1);
     ctrlc::set_handler(move || {
         let _ = stop_tx.try_send(());
     })?;
 
-    let mut terminal = ratatui::init();
-    let result = tui::run(&mut terminal, &handle, &server, stop_rx);
-    ratatui::restore();
+    let result = match args.archive {
+        Some(archive) => serve(&handle, &server, &archive, &stop_rx),
+        None => browse(&handle, &server, stop_rx),
+    };
     handle.stop();
     result
+}
+
+/// Serve one archive named on the command line: print where it is mounted and
+/// wait for a termination signal. Scripts drive the server this way, and they
+/// have no terminal for the browser UI to draw on.
+fn serve(
+    handle: &smb::SmbHandle,
+    server: &tui::ServerView,
+    archive: &Path,
+    stop_rx: &mpsc::Receiver<()>,
+) -> Result<()> {
+    let opened = open_archive(archive)?;
+    let folder = opened.folder.clone();
+    handle.load(opened.share_backing());
+
+    let (host, share, port, user) = (&server.host, &server.share, server.port, &server.user);
+    println!(
+        "Serving {} file{} ({} bytes) from {}",
+        opened.file_count,
+        if opened.file_count == 1 { "" } else { "s" },
+        opened.total_size,
+        opened.path.display()
+    );
+    println!("Folder:   \\\\{host}\\{share}\\{folder}");
+    println!("Port:     {port}");
+    println!("Username: {user}");
+    println!("Password: {}", server.password);
+    if server.generated_password {
+        println!("(generated for this run; set SMBANYTHING_PASSWORD to choose it)");
+    }
+    if server.bind_all {
+        println!();
+        println!("WARNING: file data is signed but not encrypted and is visible in transit.");
+    }
+    println!();
+    println!("Mount examples (the clients prompt for the password):");
+    println!(
+        "  Linux:  sudo mount -t cifs -o port={port},vers=2.1,username={user},ro,file_mode=0444,dir_mode=0555 //{host}/{share}/{folder} /mnt/smbanything"
+    );
+    println!("  macOS:  smb://{user}@{host}:{port}/{share}/{folder}");
+    if server.standard_port {
+        println!("  Windows: net use Z: \\\\{host}\\{share}\\{folder} * /user:{user}");
+    } else {
+        println!(
+            "  Windows: net use Z: \\\\{host}\\{share}\\{folder} * /user:{user} /TCPPORT:{port}"
+        );
+    }
+    println!();
+    println!("Press Ctrl-C to stop.");
+
+    loop {
+        match stop_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) if handle.logon_limit_reached() => {
+                bail!(
+                    "stopping after {} consecutive refused logons",
+                    handle.failed_logons()
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Run the interactive browser, which starts on an empty share and loads and
+/// unloads archives while the server keeps running.
+fn browse(
+    handle: &smb::SmbHandle,
+    server: &tui::ServerView,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<()> {
+    let mut terminal = ratatui::init();
+    // ratatui::init() enables raw mode and the alternate screen but not
+    // bracketed paste, without which a pasted archive path arrives as a burst
+    // of key presses instead of the one Event::Paste the editor reads.
+    let bracketed_paste = execute!(io::stdout(), EnableBracketedPaste).is_ok();
+    let result = tui::run(&mut terminal, handle, server, stop_rx);
+    if bracketed_paste {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+    }
+    ratatui::restore();
+    result
+}
+
+/// An archive opened and indexed, ready to be published to the share.
+pub(crate) struct OpenedArchive {
+    pub(crate) path: PathBuf,
+    pub(crate) folder: String,
+    pub(crate) file_count: usize,
+    pub(crate) total_size: u64,
+    backing: Arc<ArchiveBacking>,
+}
+
+impl OpenedArchive {
+    /// The share-visible backing: the archive under its own folder.
+    pub(crate) fn share_backing(&self) -> Arc<dyn Backing> {
+        Arc::new(FolderBacking::new(
+            &self.folder,
+            Arc::clone(&self.backing) as Arc<dyn Backing>,
+        ))
+    }
+}
+
+/// Open and index an archive. This reads the whole archive directory and is
+/// slow enough on a large one that callers with a UI run it off their event
+/// thread.
+pub(crate) fn open_archive(path: &Path) -> Result<OpenedArchive> {
+    let path = absolute_archive_path(path)?;
+    let folder = archive_folder_name(&path);
+    let backing = Arc::new(ArchiveBacking::open(&path, archive_label(&path))?);
+    Ok(OpenedArchive {
+        file_count: backing.file_count(),
+        total_size: backing.total_size(),
+        path,
+        folder,
+        backing,
+    })
 }
 
 pub(crate) fn absolute_archive_path(path: &Path) -> Result<PathBuf> {
@@ -234,14 +366,16 @@ mod tests {
 
     #[test]
     fn packet_tunnel_cli_rejects_incompatible_listener_options() {
-        assert!(Args::try_parse_from(["smbanything", "archive.zip"]).is_err());
+        // The archive is optional: named, it is served without a UI; omitted,
+        // the browser starts empty.
+        assert!(Args::try_parse_from(["smbanything", "a.zip", "--smb-tun"]).is_ok());
         assert!(Args::try_parse_from(["smbanything", "--smb-tun"]).is_ok());
-        assert!(Args::try_parse_from(["smbanything", "--smb-tun", "--bind-all"]).is_err());
+        assert!(Args::try_parse_from(["smbanything", "a.zip", "--smb-tun", "--bind-all"]).is_err());
         assert!(
-            Args::try_parse_from(["smbanything", "--smb-tun", "--port", "445"]).is_err()
+            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun", "--port", "445"]).is_err()
         );
         assert!(
-            Args::try_parse_from(["smbanything", "--smb-tun-ip", "169.254.255.3"]).is_err()
+            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun-ip", "169.254.255.3"]).is_err()
         );
     }
 }
