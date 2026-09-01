@@ -1,18 +1,28 @@
 mod archive;
 mod connection;
+mod picker;
 mod tui;
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use ratatui::crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
-    execute,
+use ratatui::{
+    Terminal,
+    crossterm::{
+        cursor::Show,
+        event::{DisableBracketedPaste, EnableBracketedPaste},
+        execute,
+        terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        },
+    },
+    prelude::CrosstermBackend,
 };
 use sha2::{Digest, Sha256};
 use smbanything_core::smb::{self, Backing};
@@ -207,17 +217,46 @@ fn browse(
     server: &ServerView,
     stop_rx: mpsc::Receiver<()>,
 ) -> Result<()> {
-    let mut terminal = ratatui::init();
-    // ratatui::init() enables raw mode and the alternate screen but not
-    // bracketed paste, without which a pasted archive path arrives as a burst
-    // of key presses instead of the one Event::Paste the editor reads.
+    enable_raw_mode().context("entering raw mode")?;
+    let entered = execute!(io::stdout(), EnterAlternateScreen).context("entering the UI screen");
+    if let Err(e) = entered {
+        let _ = disable_raw_mode();
+        return Err(e);
+    }
+    // Bracketed paste makes a dropped or pasted archive path arrive as one
+    // event instead of a burst of key presses, so a trailing newline in it
+    // cannot act as Enter. Terminals without it still deliver the text.
     let bracketed_paste = execute!(io::stdout(), EnableBracketedPaste).is_ok();
-    let result = tui::run(&mut terminal, handle, server, stop_rx);
+    // A panic on the UI thread must leave the terminal usable, cursor
+    // included. One on the archive loader thread must not: the UI is still
+    // running there, and pulling the screen out from under it is worse than
+    // the "loader stopped" notice it already reports.
+    let ui_thread = thread::current().id();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if thread::current().id() == ui_thread {
+            restore_terminal(bracketed_paste);
+        }
+        hook(info);
+    }));
+
+    let result = Terminal::new(CrosstermBackend::new(io::stdout()))
+        .context("starting the UI")
+        .and_then(|mut terminal| tui::run(&mut terminal, handle, server, stop_rx));
+    restore_terminal(bracketed_paste);
+    result
+}
+
+/// Put the terminal back the way it was found. Raw mode goes first, having
+/// the most side effects; the cursor is shown last and unconditionally, since
+/// the UI never draws with the real cursor and some terminals leave it hidden
+/// on leaving the alternate screen.
+fn restore_terminal(bracketed_paste: bool) {
+    let _ = disable_raw_mode();
     if bracketed_paste {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
-    ratatui::restore();
-    result
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
 }
 
 /// An archive opened and indexed, ready to be published to the share.
