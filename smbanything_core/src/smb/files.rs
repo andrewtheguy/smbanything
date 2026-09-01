@@ -7,7 +7,8 @@
 // the write it announced, and fail somewhere far less obvious.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use super::backing::{Backing, FileReader, NodeInfo};
@@ -59,16 +60,8 @@ pub(crate) struct OpenHandle {
     tree_id: u32,
     pub(crate) path: SmbPath,
     pub(crate) info: NodeInfo,
-    /// Lazily opened: a client frequently opens a file only to stat it, and
-    /// the first read may need to decompress the entry into its cache.
-    reader: Option<Arc<dyn FileReader>>,
-    /// Directory listing, captured on the first QUERY_DIRECTORY.
-    ///
-    /// The backing cannot change under us, so this is a cache rather than a
-    /// consistency device — but SMB directory enumeration is explicitly
-    /// stateful (each call resumes where the last stopped), so the position has
-    /// to live with the handle regardless.
-    dir_entries: Option<Vec<(NodeInfo, u64)>>,
+    /// Cached backing resources, shared with the reload invalidator.
+    state: Arc<OpenState>,
     dir_pos: usize,
     /// Whether a QUERY_DIRECTORY on this handle has already returned entries.
     /// Distinguishes "this search matched nothing" from "the enumeration is
@@ -77,12 +70,93 @@ pub(crate) struct OpenHandle {
     scanned: bool,
 }
 
+/// Resources tied to one open file. Reload invalidates this state and clears
+/// every cache synchronously, so no data from an old archive remains retained
+/// after the operation returns.
+struct OpenState {
+    valid: AtomicBool,
+    resources: Mutex<OpenResources>,
+}
+
+struct OpenResources {
+    /// Lazily opened: a client frequently opens a file only to stat it, and the
+    /// first read may need to decompress the entry into its cache.
+    reader: Option<Arc<dyn FileReader>>,
+    /// Captured on the first QUERY_DIRECTORY. A replacement invalidates the
+    /// whole handle, so this is a stateful enumeration cursor cache rather than
+    /// a consistency device.
+    dir_entries: Option<Vec<(NodeInfo, u64)>>,
+}
+
+impl OpenState {
+    fn new() -> Self {
+        Self {
+            valid: AtomicBool::new(true),
+            resources: Mutex::new(OpenResources {
+                reader: None,
+                dir_entries: None,
+            }),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::Acquire)
+    }
+
+    fn invalidate(&self) {
+        self.valid.store(false, Ordering::Release);
+        let mut resources = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resources.reader.take();
+        resources.dir_entries.take();
+    }
+}
+
+/// All open-file resources belonging to the current contents generation.
+/// Connections keep their own SMB handle tables; this registry contains only
+/// weak references, so it neither prolongs a connection nor an open handle.
+pub(super) struct OpenRegistry {
+    states: Mutex<Vec<Weak<OpenState>>>,
+}
+
+impl OpenRegistry {
+    pub(super) fn new() -> Self {
+        Self {
+            states: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn register(&self, state: &Arc<OpenState>) {
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::downgrade(state));
+    }
+
+    pub(super) fn invalidate_all(&self) {
+        let states = std::mem::take(
+            &mut *self
+                .states
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for state in states {
+            if let Some(state) = state.upgrade() {
+                state.invalidate();
+            }
+        }
+    }
+}
+
 /// Per-connection open handles.
 pub(crate) struct Handles {
     open: BTreeMap<u64, OpenHandle>,
     next_id: u64,
     /// The handle opened by the most recent CREATE, for related compounds.
     last_created: Option<u64>,
+    registry: Option<Arc<OpenRegistry>>,
 }
 
 impl Default for Handles {
@@ -92,12 +166,23 @@ impl Default for Handles {
             // Start above zero; 0 and u64::MAX are both reserved.
             next_id: 1,
             last_created: None,
+            registry: None,
         }
     }
 }
 
 impl Handles {
+    pub(crate) fn registered(registry: Arc<OpenRegistry>) -> Self {
+        Self {
+            registry: Some(registry),
+            ..Self::default()
+        }
+    }
+
     fn insert(&mut self, handle: OpenHandle) -> u64 {
+        if let Some(registry) = &self.registry {
+            registry.register(&handle.state);
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.open.insert(id, handle);
@@ -313,8 +398,7 @@ pub(crate) fn create(
         tree_id,
         path,
         info: info.clone(),
-        reader: None,
-        dir_entries: None,
+        state: Arc::new(OpenState::new()),
         dir_pos: 0,
         scanned: false,
     });
@@ -460,15 +544,23 @@ pub(crate) fn read(
     let handle = handles
         .get_mut(file_id, related)
         .ok_or(status::FILE_CLOSED)?;
+    if !handle.state.is_valid() {
+        return Err(status::FILE_CLOSED);
+    }
     if handle.info.kind.is_dir() {
         return Err(status::INVALID_DEVICE_REQUEST);
     }
 
     // Open on first read rather than at CREATE: many opens never read.
-    if handle.reader.is_none() {
-        handle.reader = Some(backing.open(&handle.path)?);
+    let mut reader = handle
+        .state
+        .resources
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if reader.reader.is_none() {
+        reader.reader = Some(backing.open(&handle.path)?);
     }
-    let reader = handle.reader.as_ref().expect("just opened");
+    let reader = reader.reader.as_ref().expect("just opened");
     let data = reader.read_at(offset, length)?;
 
     // No data where some was asked for means end of file; a client that got
@@ -695,12 +787,24 @@ pub(crate) fn query_directory(
     // Everything the listing needs, read under one immutable borrow, which then
     // ends: `backing.list` can be a storage call, and the mutable borrow for the
     // cursor cannot be taken until after it.
-    let (path, needs_listing) = {
+    let (path, state, needs_listing) = {
         let handle = handles.get(file_id, related).ok_or(status::FILE_CLOSED)?;
+        if !handle.state.is_valid() {
+            return Err(status::FILE_CLOSED);
+        }
         if !handle.info.kind.is_dir() {
             return Err(status::NOT_A_DIRECTORY);
         }
-        (handle.path.clone(), handle.dir_entries.is_none())
+        let resources = handle
+            .state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            handle.path.clone(),
+            handle.state.clone(),
+            resources.dir_entries.is_none(),
+        )
     };
 
     let listing = if needs_listing {
@@ -721,15 +825,22 @@ pub(crate) fn query_directory(
     let handle = handles
         .get_mut(file_id, related)
         .ok_or(status::FILE_CLOSED)?;
+    if !handle.state.is_valid() {
+        return Err(status::FILE_CLOSED);
+    }
+    let mut resources = state
+        .resources
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(listing) = listing {
-        handle.dir_entries = Some(listing);
+        resources.dir_entries = Some(listing);
     }
     if flags & (query_dir_flags::RESTART_SCANS | query_dir_flags::REOPEN) != 0 {
         handle.dir_pos = 0;
         handle.scanned = false;
     }
 
-    let all = handle.dir_entries.as_ref().expect("populated above");
+    let all = resources.dir_entries.as_ref().expect("populated above");
     // Each match carries its position in the *unfiltered* listing, because that
     // is what `dir_pos` indexes. Advancing the cursor by the number of encoded
     // matches instead would skip over the entries the pattern rejected: with
@@ -842,6 +953,9 @@ pub(crate) fn query_info(
     let file_id = read_file_id(&mut r)?;
 
     let handle = handles.get(file_id, related).ok_or(status::FILE_CLOSED)?;
+    if !handle.state.is_valid() {
+        return Err(status::FILE_CLOSED);
+    }
 
     let buf = match ty {
         info_type::FILE => {
@@ -945,11 +1059,13 @@ pub(crate) fn query_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     // Only the tests name directory classes explicitly; the handler passes the
     // client's class straight through to the encoder.
     use crate::smb::backing::test_support::MemBacking;
     use crate::smb::info::dir_class;
     use crate::smb::wire::utf16le;
+    use std::sync::atomic::AtomicUsize;
     use std::time::UNIX_EPOCH;
 
     fn message(body: &[u8]) -> Vec<u8> {
@@ -1039,6 +1155,96 @@ mod tests {
             .with_file("dir\\a.txt", b"hello world")
             .with_file("dir\\b.log", b"xy")
             .with_file("top.bin", &[0u8; 5000])
+    }
+
+    struct TrackedBacking {
+        reader_drops: Arc<AtomicUsize>,
+    }
+
+    impl Backing for TrackedBacking {
+        fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32> {
+            if path.is_root() {
+                return Ok(NodeInfo::synthetic_dir("", UNIX_EPOCH));
+            }
+            if path.to_smb_string() == "file" {
+                return Ok(NodeInfo {
+                    name: "file".to_string(),
+                    kind: super::super::NodeKind::File,
+                    size: 1,
+                    mtime: UNIX_EPOCH,
+                    atime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                });
+            }
+            Err(status::OBJECT_NAME_NOT_FOUND)
+        }
+
+        fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
+            if path.is_root() {
+                Ok(vec![self.stat(&SmbPath::parse("file").expect("test path"))?])
+            } else {
+                Err(status::OBJECT_PATH_NOT_FOUND)
+            }
+        }
+
+        fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
+            if path.to_smb_string() != "file" {
+                return Err(status::OBJECT_NAME_NOT_FOUND);
+            }
+            Ok(Arc::new(TrackedReader {
+                drops: self.reader_drops.clone(),
+            }))
+        }
+
+        fn label(&self) -> &str {
+            "tracked"
+        }
+
+        fn total_size(&self) -> u64 {
+            1
+        }
+    }
+
+    struct TrackedReader {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TrackedReader {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl FileReader for TrackedReader {
+        fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, u32> {
+            if offset == 0 && len > 0 {
+                Ok(Bytes::from_static(b"x"))
+            } else {
+                Ok(Bytes::new())
+            }
+        }
+    }
+
+    #[test]
+    fn invalidating_open_files_drops_cached_readers_and_closes_the_handles() {
+        let reader_drops = Arc::new(AtomicUsize::new(0));
+        let backing = TrackedBacking {
+            reader_drops: reader_drops.clone(),
+        };
+        let registry = Arc::new(OpenRegistry::new());
+        let mut handles = Handles::registered(registry.clone());
+        let id = open_path(&backing, &mut handles, "file").expect("open file");
+
+        read(&read_body(id, 0, 1), &backing, &mut handles).expect("populate reader cache");
+        assert_eq!(reader_drops.load(Ordering::SeqCst), 0);
+
+        registry.invalidate_all();
+
+        assert_eq!(reader_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            read(&read_body(id, 0, 1), &backing, &mut handles).unwrap_err(),
+            status::FILE_CLOSED
+        );
     }
 
     #[test]

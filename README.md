@@ -1,8 +1,9 @@
 # smbanything
 
-`smbanything` serves one ZIP, TAR, or gzip-compressed TAR archive as an
-authenticated, read-only SMB 2.1 share. It is intended for browsing immutable
-archives without extracting their directory trees first.
+`smbanything` runs a persistent, authenticated, read-only SMB 2.1 share and
+loads or unloads one ZIP, TAR, or gzip-compressed TAR archive from a terminal
+UI. It is intended for browsing immutable archives without extracting their
+directory trees first or rebuilding the SMB listener between archives.
 
 The SMB implementation (`smbanything_core`, also embedded by `wrustic` for
 its snapshot shares) supports the operations needed to mount, list, stat, and
@@ -15,24 +16,25 @@ message signing are required.
 
 ```sh
 cargo build --release
-./target/release/smbanything archive.zip
-# or
-./target/release/smbanything archive.tar
-# or
-./target/release/smbanything archive.tar.gz
+./target/release/smbanything
 ```
 
 The default listener is IPv4 and IPv6 loopback on port 4456, with share name
-`anything` and username `smbanything`. The archive is placed in a directory
-named with the first eight hexadecimal characters of the SHA-256 of its
-absolute path, so its SMB path is
-`//127.0.0.1/anything/<8-hex-id>`. A random password is printed for each run. To
-use a stable password, pass it through the environment rather than the process
-list:
+`anything` and username `smbanything`. The base share starts immediately with
+an empty root. Press `l` (or Enter), type an archive path, and press Enter to
+load it. Press `u` to unload it while leaving the listener, authentication,
+sessions, and base share running. Loading another archive replaces the complete
+contents in the same way.
+
+The loaded archive is placed in a directory named with the first eight
+hexadecimal characters of the SHA-256 of its absolute path, so its SMB path is
+`//127.0.0.1/anything/<8-hex-id>`. A random password is shown in the TUI for
+each run. To use a stable password, pass it through the environment rather than
+the process list:
 
 ```sh
 SMBANYTHING_PASSWORD='choose-a-strong-password' \
-  ./target/release/smbanything archive.zip
+  ./target/release/smbanything
 ```
 
 Useful options:
@@ -51,8 +53,9 @@ Run `smbanything --help` for the complete command-line help. Set
 
 ## Mounting
 
-The server prints commands containing the actual port, share, and username.
-Each command prompts for the password instead of putting it in shell history.
+The TUI shows the actual host, port, share, username, password, and loaded
+`<8-hex-id>` folder. The client commands below prompt for the password instead
+of putting it in shell history.
 
 Linux:
 
@@ -89,10 +92,10 @@ process stops.
 
 ```sh
 # Linux and macOS: /dev/net/tun and utun are native OS facilities.
-sudo -E ./target/release/smbanything archive.tar.gz --smb-tun
+sudo -E ./target/release/smbanything --smb-tun
 
 # Choose another pair when the default is already in use.
-sudo -E ./target/release/smbanything archive.tar.gz \
+sudo -E ./target/release/smbanything \
   --smb-tun --smb-tun-ip 169.254.255.3
 ```
 
@@ -117,16 +120,20 @@ trick, crash cleanup, and the Wintun driver's provenance — is in
 - Parent directories omitted from the archive are synthesized automatically.
 - Paths must be valid UTF-8. Unsafe paths, names SMB cannot represent,
   duplicate paths, and case-insensitive collisions are rejected.
+- A replacement is fully opened and validated before it becomes visible. If it
+  fails, the currently loaded archive remains available.
+- Load and unload invalidate existing disk file handles and release cached
+  readers before returning; clients reopen paths against the new contents.
 - The source archive is opened read-only and never modified. Do not modify it
-  in place while it is being served.
+  in place while it is loaded.
 
 ZIP-specific behavior:
 
-- Only unencrypted entries are accepted. If any entry is encrypted, startup
-  fails before the listener is created.
+- Only unencrypted entries are accepted. If any entry is encrypted, the load
+  fails before the current share contents are replaced.
 - Stored, Deflate, Deflate64, Bzip2, LZMA, PPMd, XZ, Zstandard, and legacy ZIP
   compression methods supported by the Rust `zip` library are enabled.
-- The central directory is indexed at startup, and overlapping compressed data
+- The central directory is indexed when loaded, and overlapping compressed data
   is rejected.
 - File data is decompressed lazily on first open into an anonymous temporary
   file. This gives efficient positional reads while bounding RAM use. Cached
@@ -134,14 +141,14 @@ ZIP-specific behavior:
 
 TAR-specific behavior:
 
-- Uncompressed TAR headers are indexed at startup. File reads go directly to
+- Uncompressed TAR headers are indexed when loaded. File reads go directly to
   the entry's byte range, without extracting or copying its contents.
 - Gzip-compressed archives (`.tar.gz`, `.tgz`, including multi-member gzip
-  streams) are decompressed once at startup to index the TAR headers and build
+  streams) are decompressed once when loaded to index the TAR headers and build
   an in-memory DEFLATE checkpoint index. The complete decompressed TAR is never
   written to disk or retained in RAM. Reads resume from the nearest checkpoint,
   trading some repeated decompression for bounded storage. Every gzip member's
-  CRC and uncompressed size are validated during startup.
+  CRC and uncompressed size are validated during the load.
 - Regular files and directories are supported. Symbolic links, hard links,
   sparse files, devices, FIFOs, and other special entry types are rejected.
 
