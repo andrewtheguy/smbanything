@@ -4,7 +4,9 @@
 # when missing — and reading a known file back through the 169.254.255.1
 # packet tunnel. The TAR.GZ backing must spill nothing into the runtime temp
 # directory while serving or after shutdown. Wintun is the Windows-only
-# driver sidecar; Linux and macOS use their native TUN interfaces.
+# driver sidecar; Linux and macOS use their native TUN interfaces. Last, the
+# release MSI is built, installed, run and removed, as the release workflow's
+# Windows row does.
 #
 # Runs natively on whatever Windows machine invokes it: the CI VM (see
 # ci\windows\remote.ps1) or a dev box. Every cargo step checks $LASTEXITCODE
@@ -38,6 +40,7 @@ Write-Host '== toolchain =='
 & rustc --version
 & cargo --version
 & cargo clippy --version
+& wix --version
 if ($env:CARGO_TARGET_DIR) { Write-Host "   CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR" }
 
 Invoke-Step 'Clippy' @('clippy', '--workspace', '--all-targets', '--all-features', '--', '-D', 'warnings')
@@ -89,8 +92,8 @@ try {
     foreach ($attempt in 1..200) {
         if (Test-Path $stdout) {
             $serverText = Get-Content -Raw $stdout
-            if ($serverText -match 'Port:\s+(\d+)') { $port = [int] $Matches[1] }
-            if ($serverText -match 'Folder:\s+\\\\[^\\]+\\share\\([0-9a-f]{8})') { $folder = $Matches[1] }
+            if ($serverText -match '(?m)^Server:\s+listening on \S+:(\d+)\s') { $port = [int] $Matches[1] }
+            if ($serverText -match '(?m)^Folder:\s+([0-9a-f]{8})\b') { $folder = $Matches[1] }
         }
         if ($port -and $folder) { break }
         if ($server.HasExited) {
@@ -175,6 +178,18 @@ if ($adapter -or $routes) {
 
 if (Get-ChildItem -Force $runtimeTmp | Select-Object -First 1) {
     throw 'the TAR.GZ backing left temporary files after server shutdown'
+}
+
+foreach ($script in 'build-windows-msi.ps1', 'verify-windows-msi.ps1') {
+    Write-Host ''
+    Write-Host "== $script =="
+    # sshd gives an administrator's session its full token, so msiexec runs unprompted here.
+    & pwsh -NoProfile -File (Join-Path 'packaging' $script)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ''
+        Write-Host "FAILED: $script (exit $LASTEXITCODE)"
+        exit $LASTEXITCODE
+    }
 }
 
 Write-Host ''

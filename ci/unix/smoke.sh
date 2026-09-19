@@ -21,6 +21,10 @@ mount_dir=
 elevated_pid=false
 
 info() { echo "[smoke] $*"; }
+# The banner's `Server:   listening on <host>:<port>  (...)` line, and the
+# archive's 8-hex id from `Folder:   <id>`.
+listen_port() { sed -n 's/^Server: *listening on .*:\([0-9][0-9]*\)  .*/\1/p' "$1" | head -n1; }
+archive_folder() { awk '/^Folder:/ {print $2; exit}' "$1"; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
 cleanup() {
@@ -84,10 +88,8 @@ for archive in tmp/candle-0.11.0.zip tmp/candle-0.11.0.tar tmp/candle-0.11.0.tar
 
     port=
     for _ in $(seq 1 200); do
-        if grep -q '^Port:' "$server_log"; then
-            port=$(grep -m1 '^Port:' "$server_log" | awk '{print $2}')
-            break
-        fi
+        port=$(listen_port "$server_log")
+        [[ -n "$port" ]] && break
         if ! kill -0 "$pid" 2>/dev/null; then
             cat "$server_log" >&2
             exit 1
@@ -99,7 +101,7 @@ for archive in tmp/candle-0.11.0.zip tmp/candle-0.11.0.tar tmp/candle-0.11.0.tar
         cat "$server_log" >&2
         exit 1
     fi
-    folder=$(grep -m1 '^Folder:' "$server_log" | sed 's/.*\\//')
+    folder=$(archive_folder "$server_log")
 
     if [[ "$platform" == Darwin ]]; then
         mount_dir="$work/mount"
@@ -155,16 +157,16 @@ pid=$!
 elevated_pid=true
 
 for _ in $(seq 1 200); do
-    grep -q '^Port:' "$server_log" && break
+    grep -q '^Server:' "$server_log" && break
     sudo -n kill -0 "$pid" 2>/dev/null || { cat "$server_log" >&2; exit 1; }
     sleep 0.05
 done
-grep -q '^Port:[[:space:]]*445$' "$server_log" || {
+grep -q '^Server: *listening on 169\.254\.255\.1:445 ' "$server_log" || {
     echo 'packet tunnel did not start on port 445' >&2
     cat "$server_log" >&2
     exit 1
 }
-folder=$(grep -m1 '^Folder:' "$server_log" | sed 's/.*\\//')
+folder=$(archive_folder "$server_log")
 
 # A client whose handshake and FIN are processed in the same batch reaches the
 # tunnel already in CLOSE-WAIT and never appears as ESTABLISHED. Bridge slots

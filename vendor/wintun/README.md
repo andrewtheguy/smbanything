@@ -1,7 +1,7 @@
 # Vendored Wintun driver
 
-`wintun-amd64.dll` is shipped beside `smbanything.exe` in the Windows release
-archive. Linux and macOS do not use it; they create native TUN interfaces.
+`wintun-amd64.dll` is installed beside `smbanything.exe` by the Windows MSI
+(`packaging/windows/smbanything.wxs`). Linux and macOS do not use it; they create native TUN interfaces.
 
 | | |
 | --- | --- |

@@ -57,24 +57,21 @@ jobs:
   build:
     needs: setup
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            label: linux-amd64
-            ext: ""
-            artifact: target/release/smbanything-linux-amd64
+          # Pinned, not ubuntu-latest: the runner's glibc is the floor the .deb
+          # declares (libc6 >= 2.39 in packaging/build-native-packages.sh), so it
+          # must not drift under us into something newer.
+          - runner: ubuntu-24.04
+            label: linux-x86_64
           - runner: ubuntu-24.04-arm
             label: linux-arm64
-            ext: ""
-            artifact: target/release/smbanything-linux-arm64
           - runner: macos-latest
             label: macos-arm64
-            ext: ""
-            artifact: target/release/smbanything-macos-arm64
+          # An MSI carrying smbanything.exe with the Wintun driver beside it.
           - runner: windows-latest
-            label: windows-amd64
-            ext: ".exe"
-            artifact: target/release/smbanything-windows-amd64.zip
+            label: windows-x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -82,28 +79,38 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --release
+      - name: Install RPM packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
 
-      - name: Rename binary
-        shell: bash
-        run: mv target/release/smbanything${{ matrix.ext }} target/release/smbanything-${{ matrix.label }}${{ matrix.ext }}
+      - name: Build release packages (${{ matrix.label }})
+        if: runner.os != 'Windows'
+        run: |
+          bash packaging/build-tarball.sh
+          bash packaging/build-native-packages.sh
 
-      - name: Package Windows binary and Wintun driver
+      - name: Install WiX
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path target/release/smbanything-windows-amd64 | Out-Null
-          Copy-Item target/release/smbanything-windows-amd64.exe target/release/smbanything-windows-amd64/smbanything.exe
-          Copy-Item vendor/wintun/wintun-amd64.dll target/release/smbanything-windows-amd64/
-          Copy-Item vendor/wintun/LICENSE.txt target/release/smbanything-windows-amd64/WINTUN-LICENSE.txt
-          Compress-Archive -Path target/release/smbanything-windows-amd64/* -DestinationPath target/release/smbanything-windows-amd64.zip
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Build the release installer (${{ matrix.label }})
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File packaging/build-windows-msi.ps1
+
+      - name: Install, run and remove the installer (${{ matrix.label }})
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File packaging/verify-windows-msi.ps1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: smbanything-${{ matrix.label }}
-          path: ${{ matrix.artifact }}
+          path: dist/*
           if-no-files-found: error
 
   create-release:
@@ -124,7 +131,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-        run: gh release upload "${{ needs.setup.outputs.release_tag }}" artifacts/* --clobber
+        run: |
+          gh release upload "${{ needs.setup.outputs.release_tag }}" \
+            artifacts/*.deb artifacts/*.rpm artifacts/*.pkg \
+            artifacts/*.tar.gz artifacts/*.msi --clobber
 
       - name: Publish release (remove draft, creates the tag)
         env:
