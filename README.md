@@ -41,10 +41,11 @@ scripts, which have no terminal for the UI to draw on:
 ```
 
 The loaded archive is placed in a directory named with the first eight
-hexadecimal characters of the SHA-256 of its absolute path, so its SMB path is
-`//127.0.0.1/share/<8-hex-id>`. A random password is shown in the TUI for
-each run. To use a stable password, pass it through the environment rather than
-the process list:
+hexadecimal characters of the SHA-256 of its absolute path, inside the base
+share: `//127.0.0.1/share/<8-hex-id>`. Mount the base share itself, not that
+folder, so loading and unloading archives needs no remount. A random password
+is shown in the TUI for each run. To use a stable password, pass it through the
+environment rather than the process list:
 
 ```sh
 SMBANYTHING_PASSWORD='choose-a-strong-password' \
@@ -68,29 +69,30 @@ Run `smbanything --help` for the complete command-line help. Set
 ## Mounting
 
 The TUI's Connecting panel shows the ready-to-paste command for each client
-platform, filled in with the actual host, port, share, username, and loaded
-`<8-hex-id>` folder (`↑`/`↓` and `PgUp`/`PgDn` scroll it); serving one archive
-from the command line prints the same text. The commands prompt for the
-password instead of putting it in shell history.
+platform, filled in with the actual host, port, share, and username (`↑`/`↓`
+and `PgUp`/`PgDn` scroll it); serving one archive from the command line prints
+the same text. The commands mount the base share; a loaded archive appears
+inside it under its `<8-hex-id>` folder. They prompt for the password instead
+of putting it in shell history.
 
 Linux:
 
 ```sh
 sudo mount -t cifs \
   -o port=4456,vers=2.1,username=smbanything,ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 \
-  //127.0.0.1/share/<8-hex-id> /mnt/smbanything
+  //127.0.0.1/share /mnt/smbanything
 ```
 
 macOS, using Finder → Go → Connect to Server:
 
 ```text
-smb://smbanything@127.0.0.1:4456/share/<8-hex-id>
+smb://smbanything@127.0.0.1:4456/share
 ```
 
 Windows 11 24H2 or newer:
 
 ```bat
-net use Z: \\127.0.0.1\share\<8-hex-id> * /user:smbanything /TCPPORT:4456
+net use Z: \\127.0.0.1\share * /user:smbanything /TCPPORT:4456
 ```
 
 Older Windows clients require SMB's standard port 445. On Unix, binding that
@@ -115,6 +117,14 @@ sudo -E ./target/release/smbanything \
   --smb-tun --smb-tun-ip 169.254.255.3
 ```
 
+```bat
+:: Windows, from an elevated terminal in the unzipped release folder.
+.\smbanything.exe --smb-tun
+
+:: Mount on any Windows version: no /TCPPORT needed on the standard port.
+net use Z: \\169.254.255.1\share * /user:smbanything
+```
+
 Linux and macOS need no driver file. Windows has no native TUN API, so the
 Windows release is a ZIP containing `smbanything.exe`, the pinned
 `wintun-amd64.dll`, and Wintun's license; keep the DLL beside the executable
@@ -124,7 +134,7 @@ loaded.
 The default pair is in the RFC 3927 link-local block reserved from APIPA
 autoconfiguration. Neither address is routed off the machine. Because the
 tunnel uses the standard port, clients use plain paths such as
-`\\169.254.255.1\share\<8-hex-id>` and no `/TCPPORT` option is needed.
+`\\169.254.255.1\share` and no `/TCPPORT` option is needed.
 The full design — why a normal socket cannot serve 445 on Windows, the routing
 trick, crash cleanup, and the Wintun driver's provenance — is in
 [docs/smb-tun.md](docs/smb-tun.md).
