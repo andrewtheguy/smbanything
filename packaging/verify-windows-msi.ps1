@@ -1,7 +1,9 @@
 # Install the MSI packaging/build-windows-msi.ps1 wrote, prove the installed program runs from
 # where the package put it with the Wintun driver it needs beside it, remove the package, and
-# prove nothing of it is left. This is the smoke test the release workflow's Windows row and
-# ci/windows/ci.ps1 run; it needs an elevated PowerShell 7 (msiexec /qn installs per machine).
+# prove nothing of it is left, then prove a prerelease upgrades to its final release in place.
+# This is the smoke test the release workflow's Windows row and
+# ci/windows/ci.ps1 run; it needs an elevated PowerShell 7 (msiexec /qn installs per machine)
+# and, for the upgrade case's second package, WiX 5 with its UI extension on PATH.
 #Requires -Version 7
 param([string] $Msi = 'dist\smbanything-windows-x86_64.msi')
 $ErrorActionPreference = 'Stop'
@@ -54,6 +56,8 @@ foreach ($dialog in 'WelcomeDlg', 'InstallDirDlg', 'VerifyReadyDlg', 'ProgressDl
 $next = Read-MsiRows "SELECT ``Argument``, ``Ordering`` FROM ``ControlEvent`` WHERE ``Dialog_``='WelcomeDlg' AND ``Control_``='Next' AND ``Event``='NewDialog'" @('Argument', 'Ordering') |
     Sort-Object { [int]$_.Ordering } | Select-Object -Last 1
 if ($next.Argument -ne 'InstallDirDlg') { throw "the welcome page's Next leads to '$($next.Argument)', not the folder page" }
+$upgradeCode = (Read-MsiRows "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='UpgradeCode'" @('Value')).Value
+if (-not $upgradeCode) { throw 'the package has no UpgradeCode' }
 Write-Host "   the wizard has its $($dialogs.Count) pages, finish page included, and skips the licence page"
 
 Write-Host ">> installing $Msi"
@@ -79,3 +83,52 @@ Invoke-Msiexec @('/x', $Msi) 'uninstall'
 if (Test-Path $root) { throw "$root survived the uninstall" }
 if (Test-OnMachinePath $binDir) { throw "the machine PATH still names $binDir" }
 Write-Host '   removed cleanly'
+
+# ProductVersion is x.y.z without the pre-release suffix, so a prerelease and its final release
+# share one; smbanything.wxs allows same-version major upgrades so that installing the final
+# replaces the prerelease instead of adding a second product beside it. The counterpart to the
+# package under test is built from its own administrative image with only VERSION changed:
+# a final release gets an x.y.z-rc.1 before it, a prerelease gets its x.y.z after it.
+# Wrap every call in @(): a function's one-item output unrolls to the bare product code.
+function Get-Installed { $installer.RelatedProducts($upgradeCode) }
+$work = Join-Path $env:TEMP "smbanything-msi-upgrade-$PID"
+try {
+    if (Test-Path $work) { Remove-Item -Recurse -Force $work }
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+    Invoke-Msiexec @('/a', $Msi, "TARGETDIR=$work\admin") 'admin-image'
+    $stage = (Get-ChildItem -Recurse -File -Filter VERSION "$work\admin" | Select-Object -First 1).DirectoryName
+    if (-not $stage) { throw "the administrative image of $Msi has no VERSION" }
+    $label = (Get-Content (Join-Path $stage 'VERSION') -Raw).Trim()
+    $core = $label -replace '[-+].*$', ''
+    if ($label -eq $core) { $preLabel = "$core-rc.1"; $finalLabel = $label } else { $preLabel = $label; $finalLabel = $core }
+    [System.IO.File]::WriteAllText((Join-Path $stage 'VERSION'), "$(if ($label -eq $core) { $preLabel } else { $finalLabel })`n")
+    $other = Join-Path $work 'counterpart.msi'
+    & wix build -arch x64 -ext WixToolset.UI.wixext -d "Version=$core" -d "Stage=$stage" -o $other packaging\windows\smbanything.wxs
+    if ($LASTEXITCODE -ne 0) { throw "wix build of the counterpart package failed (exit $LASTEXITCODE)" }
+    if ($label -eq $core) { $preMsi = $other; $finalMsi = $Msi } else { $preMsi = $Msi; $finalMsi = $other }
+
+    Write-Host ">> upgrading $preLabel to $finalLabel (both ProductVersion $core)"
+    Invoke-Msiexec @('/i', $preMsi) 'install-prerelease'
+    $installed = (Get-Content (Join-Path $root 'VERSION') -Raw).Trim()
+    if ($installed -ne $preLabel) { throw "the prerelease install left VERSION $installed, not $preLabel" }
+    $preProduct = @(Get-Installed)
+    if ($preProduct.Count -ne 1) { throw "$($preProduct.Count) products installed after the prerelease, not 1" }
+    Invoke-Msiexec @('/i', $finalMsi) 'install-final'
+    $installed = (Get-Content (Join-Path $root 'VERSION') -Raw).Trim()
+    if ($installed -ne $finalLabel) { throw "the final install left VERSION $installed, not $finalLabel" }
+    $finalProduct = @(Get-Installed)
+    if ($finalProduct.Count -ne 1) { throw "$($finalProduct.Count) products installed after the final release — it went in beside the prerelease instead of replacing it" }
+    if ($finalProduct[0] -eq $preProduct[0]) { throw "the final release did not replace the prerelease's product $($preProduct[0])" }
+    if (-not (Test-OnMachinePath $binDir)) { throw "the machine PATH lost $binDir in the upgrade" }
+    Write-Host "   $finalLabel replaced ${preLabel}: one product installed, bin still on the PATH"
+
+    Invoke-Msiexec @('/x', $finalMsi) 'uninstall-final'
+    if (Test-Path $root) { throw "$root survived removing the upgraded install" }
+    if (@(Get-Installed).Count -ne 0) { throw 'a product is still registered after removing the upgraded install' }
+    if (Test-OnMachinePath $binDir) { throw "the machine PATH still names $binDir after the upgraded install's removal" }
+    Write-Host '   the upgraded install removed cleanly'
+} finally {
+    # Leave no product behind if a check above threw mid-way.
+    foreach ($product in @(Get-Installed)) { Start-Process msiexec -ArgumentList @('/x', $product, '/qn', '/norestart') -Wait | Out-Null }
+    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+}

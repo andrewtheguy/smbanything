@@ -36,8 +36,11 @@ if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
     throw "invalid version in Cargo.toml: '$version'"
 }
 # Windows Installer versions are three numbers (major and minor under 256, build under 65536)
-# and nothing else; a pre-release suffix is dropped from the MSI's ProductVersion and kept in
-# the VERSION file and `--version`.
+# and nothing else, so a pre-release suffix is dropped from the MSI's ProductVersion and kept in
+# the VERSION file and `--version`: 0.0.9-rc.1 and 0.0.9 are both ProductVersion 0.0.9. The
+# upgrade policy in smbanything.wxs is built around that — an MSI replaces an installed one of
+# the same x.y.z (so a prerelease upgrades to its final release in place), and within one x.y.z
+# the last one installed wins, since Windows Installer has nothing to order prereleases by.
 $msiVersion = $version -replace '[-+].*$', ''
 $parts = $msiVersion.Split('.') | ForEach-Object { [int]$_ }
 if ($parts[0] -gt 255 -or $parts[1] -gt 255 -or $parts[2] -gt 65535) {

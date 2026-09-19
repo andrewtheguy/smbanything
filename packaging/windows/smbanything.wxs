@@ -23,7 +23,12 @@
   <Package Name="smbanything" Manufacturer="andrewtheguy" Version="$(var.Version)"
            UpgradeCode="332ca06c-c5fa-4609-b9fa-8c1cdd9acdf3" Scope="perMachine">
     <SummaryInformation Description="Browse ZIP and TAR archives through a read-only SMB share" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of smbanything is already installed." />
+    <!-- ProductVersion is Cargo's x.y.z without any pre-release suffix, so a prerelease and its
+         final release share one. Same-version upgrades let either replace the other in place
+         (each build has its own ProductCode, so otherwise they would install side by side as
+         two products); a lower x.y.z is still refused as a downgrade. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of smbanything is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/andrewtheguy/smbanything" />

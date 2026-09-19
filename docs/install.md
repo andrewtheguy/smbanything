@@ -87,6 +87,11 @@ msiexec /i smbanything-windows-x86_64.msi
 
 Use only the command for the host platform. Files are replaced in place.
 
+Windows Installer versions have no prerelease part, so the MSI of `x.y.z-rc.1`
+and of `x.y.z` carry the same version: either replaces the other in place, and
+within one `x.y.z` the one installed last wins. A lower `x.y.z` is refused as a
+downgrade.
+
 ## Uninstall
 
 On Debian or Ubuntu:
