@@ -12,11 +12,24 @@ model, and troubleshooting. Write access, create/overwrite dispositions, deletio
 execution are rejected by the protocol layer. NTLMv2 authentication and SMB
 message signing are required.
 
-## Build and run
+## Install
+
+Releases ship native packages: `.deb` and `.rpm` for Linux (x86-64 and arm64),
+`.pkg` for macOS (arm64), and `.msi` for Windows (x86-64). For example:
 
 ```sh
-cargo build --release
-./target/release/smbanything
+curl -fsSLO https://github.com/andrewtheguy/smbanything/releases/latest/download/smbanything-linux-amd64.deb
+sudo apt install ./smbanything-linux-amd64.deb
+```
+
+Every platform, upgrades, and removal are in [docs/install.md](docs/install.md).
+To build from source instead, `cargo build --release` and run
+`./target/release/smbanything`.
+
+## Run
+
+```sh
+smbanything
 ```
 
 The default listener is IPv4 and IPv6 loopback on port 4456, with share name
@@ -37,7 +50,7 @@ until Ctrl-C, printing the mount details on stdout. That is the form for
 scripts, which have no terminal for the UI to draw on:
 
 ```sh
-./target/release/smbanything archive.tar.gz
+smbanything archive.tar.gz
 ```
 
 The loaded archive is placed in a directory named with the first eight
@@ -49,7 +62,7 @@ environment rather than the process list:
 
 ```sh
 SMBANYTHING_PASSWORD='choose-a-strong-password' \
-  ./target/release/smbanything
+  smbanything
 ```
 
 Useful options:
@@ -110,26 +123,25 @@ process stops.
 
 ```sh
 # Linux and macOS: /dev/net/tun and utun are native OS facilities.
-sudo -E ./target/release/smbanything --smb-tun
+sudo -E smbanything --smb-tun
 
 # Choose another pair when the default is already in use.
-sudo -E ./target/release/smbanything \
+sudo -E smbanything \
   --smb-tun --smb-tun-ip 169.254.255.3
 ```
 
 ```bat
-:: Windows, from an elevated terminal in the unzipped release folder.
-.\smbanything.exe --smb-tun
+:: Windows, from an elevated terminal.
+smbanything --smb-tun
 
 :: Mount on any Windows version: no /TCPPORT needed on the standard port.
 net use Z: \\169.254.255.1\share * /user:smbanything
 ```
 
 Linux and macOS need no driver file. Windows has no native TUN API, so the
-Windows release is a ZIP containing `smbanything.exe`, the pinned
-`wintun-amd64.dll`, and Wintun's license; keep the DLL beside the executable
-and run from an elevated terminal. The DLL is hash-verified before it is
-loaded.
+Windows installer puts the pinned `wintun-amd64.dll` beside `smbanything.exe`,
+with Wintun's license under `share\doc\smbanything`; run from an elevated
+terminal. The DLL is hash-verified before it is loaded.
 
 The default pair is in the RFC 3927 link-local block reserved from APIPA
 autoconfiguration. Neither address is routed off the machine. Because the

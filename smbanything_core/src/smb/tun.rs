@@ -232,7 +232,7 @@ mod windows {
             reject_addresses_in_use(addrs)?;
             let dll = locate_dll()?;
             // SAFETY: only the DLL with the pinned digest is passed to the
-            // loader. The release archive places that file beside the binary.
+            // loader. The Windows installer places that file beside the binary.
             let wintun = unsafe { wintun::load_from_path(&dll) }
                 .map_err(|e| anyhow!("loading {}: {e}", dll.display()))?;
             let adapter = wintun::Adapter::create(

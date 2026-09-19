@@ -122,7 +122,8 @@ with it; there is nothing to remove by hand.
 
 Linux and macOS need no driver file. On Windows, `wintun-amd64.dll` (427 KB,
 signed by WireGuard LLC) is vendored in `vendor/wintun/` and must sit next to
-the executable at runtime; `smbanything_core/src/smb/tun.rs` loads it from
+the executable at runtime, which is where the Windows MSI installs it;
+`smbanything_core/src/smb/tun.rs` loads it from
 there and re-verifies it against a pinned SHA-256 before each load — a stale or
 altered copy is refused rather than trusted. The Wintun *Prebuilt Binaries
 License* §3(d) permits redistribution alongside software that uses it only
