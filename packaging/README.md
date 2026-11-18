@@ -20,7 +20,9 @@ The MSI puts its `bin` on the machine `PATH`. Wintun has to sit beside the
 executable because that is the only place `--smb-tun` loads it from, after
 checking its pinned SHA-256; its licence travels with it as its
 redistribution terms require. There is no package wrapper, version directory,
-service, or config: smbanything keeps no state between runs.
+service, or config: smbanything keeps no state between runs. The MSI's one
+custom action runs on uninstall, `smbanything.exe --remove-wintun-driver`,
+taking out the Wintun driver the first tunnel put in the driver store.
 
 ## Scripts
 

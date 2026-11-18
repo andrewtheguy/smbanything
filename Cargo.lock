@@ -1643,6 +1643,7 @@ dependencies = [
  "bytes",
  "clap",
  "ctrlc",
+ "libc",
  "rapidgzip-core",
  "ratatui",
  "sha2",

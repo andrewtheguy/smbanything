@@ -1,6 +1,7 @@
 # Install the MSI packaging/build-windows-msi.ps1 wrote, prove the installed program runs from
-# where the package put it with the Wintun driver it needs beside it, remove the package, and
-# prove nothing of it is left, then prove a prerelease upgrades to its final release in place.
+# where the package put it with the Wintun driver it needs beside it, serving a packet tunnel,
+# remove the package, and prove nothing of it is left — the Wintun driver in the driver store
+# included — then prove a prerelease upgrades to its final release in place.
 # This is the smoke test the release workflow's Windows row and
 # ci/windows/ci.ps1 run; it needs an elevated PowerShell 7 (msiexec /qn installs per machine)
 # and, for the upgrade case's second package, WiX 5 with its UI extension on PATH.
@@ -78,11 +79,47 @@ Write-Host '   wintun-amd64.dll sits beside smbanything.exe and matches the vend
 if (-not (Test-OnMachinePath $binDir)) { throw "the machine PATH lacks $binDir" }
 Write-Host "   $binDir is on the machine PATH"
 
+# The installed copy has to serve a packet tunnel, not only start: that loads the DLL beside it,
+# and the first adapter puts the Wintun driver in the driver store, where it outlives every
+# adapter until the uninstall below takes it out again.
+$tunWork = Join-Path $env:TEMP "smbanything-msi-tun-$PID"
+New-Item -ItemType Directory -Force -Path $tunWork | Out-Null
+try {
+    Set-Content -Path (Join-Path $tunWork 'hello.txt') -Value 'hello'
+    $tunZip = Join-Path $tunWork 'hello.zip'
+    Compress-Archive -Path (Join-Path $tunWork 'hello.txt') -DestinationPath $tunZip
+    $tunLog = Join-Path $tunWork 'server.log'
+    $server = Start-Process -FilePath $exe -ArgumentList @($tunZip, '--smb-tun') -RedirectStandardOutput $tunLog `
+        -RedirectStandardError (Join-Path $tunWork 'server.err.log') -PassThru
+    try {
+        foreach ($attempt in 1..200) {
+            if ((Test-Path $tunLog) -and (Select-String -Quiet -Path $tunLog -Pattern '^Server:')) { break }
+            if ($server.HasExited) { throw "the installed smbanything.exe --smb-tun exited:`n$(Get-Content -Raw $tunLog)" }
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not (Select-String -Quiet -Path $tunLog -Pattern '^Server:\s+listening on 169\.254\.255\.1:445\s')) {
+            throw "the installed smbanything.exe never served the tunnel:`n$(Get-Content -Raw $tunLog)"
+        }
+    } finally {
+        if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force; Wait-Process -Id $server.Id -ErrorAction SilentlyContinue }
+    }
+    foreach ($attempt in 1..100) {
+        if (-not (Get-NetAdapter -Name 'smbanything' -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 50
+    }
+} finally {
+    Remove-Item -Recurse -Force $tunWork -ErrorAction SilentlyContinue
+}
+function Test-WintunDriver { [bool](pnputil /enum-drivers | Select-String -SimpleMatch 'wintun.inf') }
+if (-not (Test-WintunDriver)) { throw 'the installed program served a tunnel, but no Wintun driver is in the driver store' }
+Write-Host '   the installed program serves 169.254.255.1:445, and the Wintun driver is in the driver store'
+
 Write-Host '>> removing it'
 Invoke-Msiexec @('/x', $Msi) 'uninstall'
 if (Test-Path $root) { throw "$root survived the uninstall" }
 if (Test-OnMachinePath $binDir) { throw "the machine PATH still names $binDir" }
-Write-Host '   removed cleanly'
+if (Test-WintunDriver) { throw 'the uninstall left the Wintun driver in the driver store' }
+Write-Host '   removed cleanly, the Wintun driver included'
 
 # ProductVersion is x.y.z without the pre-release suffix, so a prerelease and its final release
 # share one; smbanything.wxs allows same-version major upgrades so that installing the final

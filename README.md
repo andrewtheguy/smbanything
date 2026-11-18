@@ -118,8 +118,10 @@ conflict with an SMB server already running on the host.
 socket to port 445. It creates a temporary L3 adapter, assigns
 `169.254.255.2/32` to it, and routes only `169.254.255.1/32` through it. A
 userspace TCP stack answers the first address and proxies authenticated SMB to
-the private loopback listener. The adapter and routes disappear when the
-process stops.
+the private loopback listener, and only for the adapter's own address. The
+adapter and routes disappear when the process stops. Root is needed only to
+create the adapter: on Linux and macOS the process switches back to the sudo
+user before it opens an archive or answers a client.
 
 ```sh
 # Linux and macOS: /dev/net/tun and utun are native OS facilities.

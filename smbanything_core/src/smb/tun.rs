@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Instant as StdInstant;
 
 use anyhow::{Result, anyhow};
 #[cfg(unix)]
@@ -20,13 +20,15 @@ use anyhow::Context as _;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 
 use super::TunAddrs;
 
 #[cfg(windows)]
 const ADAPTER_NAME: &str = "smbanything";
+/// The link MTU, set explicitly on the adapter on every platform so that the
+/// host and smoltcp agree on it. Wintun would otherwise default to 65535.
 const MTU: usize = 1500;
 const MAX_CONNS: usize = 8;
 const SOCKET_BUF: usize = 256 * 1024;
@@ -36,6 +38,7 @@ const PROXY_HIGH_WATER: usize = 512 * 1024;
 pub(super) struct TunShare {
     virtual_ip: Ipv4Addr,
     shutdown: Arc<AtomicBool>,
+    waker: Waker,
     join: Option<JoinHandle<()>>,
 }
 
@@ -52,20 +55,20 @@ impl TunShare {
             addrs.virtual_ip()
         );
 
+        let (poller, waker) = Poller::new()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let join = {
             let shutdown = shutdown.clone();
             std::thread::Builder::new()
                 .name(format!("smbanything-tun-{port}"))
-                .spawn(move || {
-                    poll_loop(device, addrs.virtual_ip(), port, forward_to, shutdown)
-                })
+                .spawn(move || poll_loop(device, poller, addrs, port, forward_to, shutdown))
                 .map_err(|e| anyhow!("spawning the packet-tunnel thread: {e}"))?
         };
 
         Ok(Self {
             virtual_ip: addrs.virtual_ip(),
             shutdown,
+            waker,
             join: Some(join),
         })
     }
@@ -78,6 +81,7 @@ impl TunShare {
 impl Drop for TunShare {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.waker.wake();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -92,6 +96,13 @@ fn adapter_hint(error: anyhow::Error) -> anyhow::Error {
     let privilege = "Run smbanything from an elevated terminal; creating a Wintun adapter requires administrator rights.";
 
     anyhow!("starting the SMB packet tunnel: {error}\n\n{privilege}")
+}
+
+/// Round a smoltcp timer up to whole milliseconds, the unit both platform
+/// waits take. Rounding down would wake just before the timer is due and spin
+/// until it is.
+fn wait_millis(timeout: Duration) -> u64 {
+    timeout.total_micros().div_ceil(1000)
 }
 
 // Linux and macOS both expose their native packet adapter as a file
@@ -157,6 +168,99 @@ impl PlatformTun {
     }
 }
 
+/// Wakes the packet thread out of its wait, so that stopping the share does
+/// not have to wait for the next packet or timer.
+#[cfg(unix)]
+struct Waker(std::os::unix::net::UnixStream);
+
+#[cfg(unix)]
+impl Waker {
+    fn wake(&self) {
+        let _ = (&self.0).write(&[0]);
+    }
+}
+
+/// What the packet thread sleeps on between rounds: the adapter, the loopback
+/// bridges, the shutdown waker, and smoltcp's next timer, all in one poll(2).
+#[cfg(unix)]
+struct Poller {
+    wake: std::os::unix::net::UnixStream,
+    fds: Vec<libc::pollfd>,
+}
+
+#[cfg(unix)]
+impl Poller {
+    fn new() -> Result<(Self, Waker)> {
+        let (wake, waker) = std::os::unix::net::UnixStream::pair()
+            .context("creating the packet-tunnel waker")?;
+        waker
+            .set_nonblocking(true)
+            .context("making the packet-tunnel waker nonblocking")?;
+        Ok((
+            Self {
+                wake,
+                fds: Vec::with_capacity(2 + MAX_CONNS),
+            },
+            Waker(waker),
+        ))
+    }
+
+    /// poll(2) is level-triggered and takes its interest list on every call,
+    /// so a new bridge needs no registration.
+    fn register(&self, _stream: &TcpStream) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn wait(&mut self, device: &PlatformTun, bridges: &[Bridge], timeout: Option<Duration>) {
+        use std::os::fd::AsRawFd;
+
+        let pollfd = |fd, events| libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        self.fds.clear();
+        self.fds.push(pollfd(self.wake.as_raw_fd(), libc::POLLIN));
+        self.fds.push(pollfd(device.device.as_raw_fd(), libc::POLLIN));
+        for bridge in bridges {
+            let Some(upstream) = &bridge.upstream else {
+                continue;
+            };
+            let mut events = 0;
+            if bridge.wants_upstream_read() {
+                events |= libc::POLLIN;
+            }
+            if bridge.wants_upstream_write() {
+                events |= libc::POLLOUT;
+            }
+            // A socket with no interest is left out entirely: poll(2) reports
+            // a hung-up one regardless of `events`, and that would spin.
+            if events != 0 {
+                self.fds.push(pollfd(upstream.as_raw_fd(), events));
+            }
+        }
+        let timeout = timeout.map_or(-1, |timeout| {
+            i32::try_from(wait_millis(timeout)).unwrap_or(i32::MAX)
+        });
+        // SAFETY: `fds` is a live, initialized array of `fds.len()` pollfds.
+        let ready = unsafe {
+            libc::poll(
+                self.fds.as_mut_ptr(),
+                self.fds.len() as libc::nfds_t,
+                timeout,
+            )
+        };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                smb_log!("tun: poll failed: {error}");
+                // Never spin on a wait that keeps failing.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 /// Refuse a pair when either address already belongs to a local interface.
 ///
 /// A second tunnel with the same pair can otherwise create another adapter on
@@ -202,15 +306,21 @@ fn reject_unix_addresses_in_use(addrs: TunAddrs) -> Result<()> {
     Ok(())
 }
 
-// Windows has no native TUN API. Keep the Wintun-specific setup and route
-// calls here; the packet stack and proxy below are identical on every OS.
+// Windows has no native TUN API. Keep the Wintun-specific setup, route and
+// wait calls here; the packet stack and proxy below are identical on every OS.
 #[cfg(windows)]
 mod windows {
+    use std::io::Read as _;
+    use std::net::TcpStream;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use anyhow::{Result, anyhow};
+    use windows_sys::Win32::Networking::WinSock::{
+        WSACloseEvent, WSACreateEvent, WSAEVENT, WSAResetEvent, WSASetEvent,
+    };
 
-    use super::{ADAPTER_NAME, Ipv4Addr, TunAddrs};
+    use super::{ADAPTER_NAME, Bridge, Duration, Ipv4Addr, MTU, TunAddrs, wait_millis};
 
     const TUNNEL_TYPE: &str = "smbanything archive share";
     const ADAPTER_GUID: u128 = 0xa7e1_6f81_6465_40c9_8e28_4a90_91db_43fc;
@@ -222,19 +332,18 @@ mod windows {
     ];
 
     pub(super) struct PlatformTun {
+        /// The session's read-wait event, owned by `session`. Wintun signals
+        /// it when packets arrive in a ring that a receive found empty.
+        read_event: isize,
         // Field order matters: the session must close before its adapter.
-        session: std::sync::Arc<wintun::Session>,
-        _adapter: std::sync::Arc<wintun::Adapter>,
+        session: Arc<wintun::Session>,
+        _adapter: Arc<wintun::Adapter>,
     }
 
     impl PlatformTun {
         pub(super) fn create(addrs: TunAddrs) -> Result<Self> {
             reject_addresses_in_use(addrs)?;
-            let dll = locate_dll()?;
-            // SAFETY: only the DLL with the pinned digest is passed to the
-            // loader. The Windows installer places that file beside the binary.
-            let wintun = unsafe { wintun::load_from_path(&dll) }
-                .map_err(|e| anyhow!("loading {}: {e}", dll.display()))?;
+            let wintun = load_pinned_dll()?;
             let adapter = wintun::Adapter::create(
                 &wintun,
                 ADAPTER_NAME,
@@ -243,13 +352,18 @@ mod windows {
             )
             .map_err(|e| anyhow!("creating the `{ADAPTER_NAME}` Wintun adapter: {e}"))?;
             let luid = unsafe { adapter.get_luid().Value };
+            set_mtu(luid, MTU as u32)?;
             assign_address(luid, addrs.adapter_ip())?;
             add_virtual_route(luid, addrs.virtual_ip())?;
             let session = adapter
                 .start_session(wintun::MAX_RING_CAPACITY)
                 .map_err(|e| anyhow!("starting the Wintun session: {e}"))?;
+            let read_event = session
+                .get_read_wait_event()
+                .map_err(|e| anyhow!("getting the Wintun read event: {e}"))?;
             Ok(Self {
-                session: std::sync::Arc::new(session),
+                read_event,
+                session: Arc::new(session),
                 _adapter: adapter,
             })
         }
@@ -276,31 +390,209 @@ mod windows {
         }
     }
 
-    fn locate_dll() -> Result<PathBuf> {
-        let exe = std::env::current_exe()
-            .map_err(|e| anyhow!("resolving the smbanything executable: {e}"))?;
-        let dir = exe
-            .parent()
-            .ok_or_else(|| anyhow!("{} has no parent directory", exe.display()))?;
-        let path = dir.join(WINTUN_DLL_NAME);
-        verify_dll(&path)?;
-        Ok(path)
+    /// A Winsock event object: manual-reset, and waitable alongside Wintun's
+    /// read event in one call.
+    struct Event(WSAEVENT);
+
+    // SAFETY: an event handle may be signalled, reset and waited on from any
+    // thread; the wrapper only closes it once, on drop.
+    unsafe impl Send for Event {}
+    unsafe impl Sync for Event {}
+
+    impl Event {
+        fn new() -> Result<Self> {
+            // SAFETY: no arguments; failure is reported as WSA_INVALID_EVENT.
+            let event = unsafe { WSACreateEvent() };
+            if event == 0 {
+                return Err(anyhow!(
+                    "creating a packet-tunnel event: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self(event))
+        }
+    }
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            // SAFETY: the handle is valid and closed exactly once.
+            unsafe { WSACloseEvent(self.0) };
+        }
+    }
+
+    /// Wakes the packet thread out of its wait, so that stopping the share
+    /// does not have to wait for the next packet or timer.
+    pub(super) struct Waker(Arc<Event>);
+
+    impl Waker {
+        pub(super) fn wake(&self) {
+            // SAFETY: the event outlives this call through the Arc.
+            unsafe { WSASetEvent(self.0.0) };
+        }
+    }
+
+    /// What the packet thread sleeps on between rounds: the shutdown event,
+    /// one event shared by every loopback bridge socket, Wintun's read event,
+    /// and smoltcp's next timer, all in one WaitForMultipleObjects.
+    pub(super) struct Poller {
+        wake: Arc<Event>,
+        upstream: Event,
+    }
+
+    impl Poller {
+        pub(super) fn new() -> Result<(Self, Waker)> {
+            let wake = Arc::new(Event::new()?);
+            let poller = Self {
+                wake: wake.clone(),
+                upstream: Event::new()?,
+            };
+            Ok((poller, Waker(wake)))
+        }
+
+        /// Signal the shared upstream event whenever `stream` becomes readable,
+        /// writable or closed. Winsock re-arms each of those only after the
+        /// matching call would block, which is exactly when the bridge stops
+        /// pumping, so nothing is missed between two waits.
+        pub(super) fn register(&self, stream: &TcpStream) -> std::io::Result<()> {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{
+                FD_CLOSE, FD_READ, FD_WRITE, SOCKET, WSAEventSelect, WSAGetLastError,
+            };
+
+            // SAFETY: the socket and the event are both live handles.
+            let status = unsafe {
+                WSAEventSelect(
+                    stream.as_raw_socket() as SOCKET,
+                    self.upstream.0,
+                    (FD_READ | FD_WRITE | FD_CLOSE) as i32,
+                )
+            };
+            if status != 0 {
+                // SAFETY: reads this thread's last Winsock error.
+                return Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+            }
+            Ok(())
+        }
+
+        /// Wintun's documented receive pattern: wait on the read event only
+        /// once a receive has found the ring empty. smoltcp's `poll` drains the
+        /// device before returning, and nothing reads it between that and
+        /// this wait.
+        pub(super) fn wait(
+            &mut self,
+            device: &PlatformTun,
+            _bridges: &[Bridge],
+            timeout: Option<Duration>,
+        ) {
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Networking::WinSock::{
+                WSA_INFINITE, WSA_WAIT_FAILED, WSAWaitForMultipleEvents,
+            };
+
+            let handles: [HANDLE; 3] = [
+                self.wake.0 as HANDLE,
+                self.upstream.0 as HANDLE,
+                device.read_event as HANDLE,
+            ];
+            let timeout = timeout.map_or(WSA_INFINITE, |timeout| {
+                u32::try_from(wait_millis(timeout)).map_or(WSA_INFINITE - 1, |ms| {
+                    ms.min(WSA_INFINITE - 1)
+                })
+            });
+            // SAFETY: three live event handles; wait for any, not alertable.
+            let woke = unsafe {
+                WSAWaitForMultipleEvents(handles.len() as u32, handles.as_ptr(), 0, timeout, 0)
+            };
+            if woke == WSA_WAIT_FAILED {
+                smb_log!(
+                    "tun: waiting for packets failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // Never spin on a wait that keeps failing.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Reset before the bridges are pumped, not after: a socket event
+            // that lands while they are being pumped must survive to the next
+            // wait.
+            // SAFETY: a live event handle.
+            unsafe { WSAResetEvent(self.upstream.0) };
+        }
+    }
+
+    /// The pinned Wintun DLL, held open so that it cannot change between the
+    /// hash check and the load.
+    ///
+    /// The handle shares read access only: while it lives, nobody can open
+    /// the file for writing, nor rename or delete it (both need delete
+    /// access). The loader's own open asks for read and execute, which that
+    /// sharing allows, so `LoadLibrary` maps exactly the bytes hashed here.
+    struct PinnedDll {
+        path: PathBuf,
+        _file: std::fs::File,
+    }
+
+    impl PinnedDll {
+        fn beside_exe() -> Result<Self> {
+            let exe = std::env::current_exe()
+                .map_err(|e| anyhow!("resolving the smbanything executable: {e}"))?;
+            let dir = exe
+                .parent()
+                .ok_or_else(|| anyhow!("{} has no parent directory", exe.display()))?;
+            Self::open(dir.join(WINTUN_DLL_NAME))
+        }
+
+        fn open(path: PathBuf) -> Result<Self> {
+            use sha2::{Digest, Sha256};
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&path)
+                .map_err(|error| {
+                    anyhow!(
+                        "{} could not be opened ({error}); Windows packet tunneling needs the release's {WINTUN_DLL_NAME} beside smbanything.exe",
+                        path.display()
+                    )
+                })?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|error| anyhow!("reading {}: {error}", path.display()))?;
+            if Sha256::digest(&bytes).as_slice() != WINTUN_DLL_SHA256 {
+                return Err(anyhow!(
+                    "{} does not match the Wintun driver shipped by smbanything; refusing to load it",
+                    path.display()
+                ));
+            }
+            Ok(Self { path, _file: file })
+        }
+    }
+
+    fn load_pinned_dll() -> Result<wintun::Wintun> {
+        let dll = PinnedDll::beside_exe()?;
+        // SAFETY: only the DLL with the pinned digest is passed to the loader,
+        // and `dll` keeps it from changing until the load has mapped it.
+        let wintun = unsafe { wintun::load_from_path(&dll.path) }
+            .map_err(|e| anyhow!("loading {}: {e}", dll.path.display()))?;
+        drop(dll);
+        Ok(wintun)
     }
 
     pub(super) fn verify_dll(path: &Path) -> Result<()> {
-        use sha2::{Digest, Sha256};
+        PinnedDll::open(path.to_path_buf()).map(drop)
+    }
 
-        let bytes = std::fs::read(path).map_err(|error| {
-            anyhow!(
-                "{} was not found ({error}); Windows packet tunneling needs the release's {WINTUN_DLL_NAME} beside smbanything.exe",
-                path.display()
-            )
-        })?;
-        let found = Sha256::digest(&bytes);
-        if found.as_slice() != WINTUN_DLL_SHA256 {
+    /// Remove the Wintun driver from the driver store, as the uninstaller
+    /// does. Wintun itself skips the removal while any Wintun adapter, ours
+    /// or another program's, still exists.
+    pub(super) fn remove_driver() -> Result<()> {
+        let wintun = load_pinned_dll()?;
+        // SAFETY: a documented export of the pinned driver, taking no arguments.
+        if unsafe { wintun.WintunDeleteDriver() } == 0 {
             return Err(anyhow!(
-                "{} does not match the Wintun driver shipped by smbanything; refusing to load it",
-                path.display()
+                "removing the Wintun driver failed: {}",
+                std::io::Error::last_os_error()
             ));
         }
         Ok(())
@@ -344,6 +636,43 @@ mod windows {
     }
 
     const ALREADY_EXISTS: u32 = 5010;
+
+    /// Wintun creates its adapter with an MTU of 65535. Set the IPv4 interface
+    /// to the MTU smoltcp is configured with, as Linux and macOS already are.
+    fn set_mtu(luid: u64, mtu: u32) -> Result<()> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetIpInterfaceEntry, InitializeIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+            SetIpInterfaceEntry,
+        };
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+        // SAFETY: the API initializer prepares the row, and the lookup fills
+        // it before the one changed field is written back.
+        let (lookup, status) = unsafe {
+            let mut row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+            InitializeIpInterfaceEntry(&mut row);
+            row.Family = AF_INET;
+            row.InterfaceLuid.Value = luid;
+            let lookup = GetIpInterfaceEntry(&mut row);
+            row.NlMtu = mtu;
+            // SetIpInterfaceEntry rejects an IPv4 row that carries the site
+            // prefix length GetIpInterfaceEntry reports.
+            row.SitePrefixLength = 0;
+            let status = if lookup == 0 {
+                SetIpInterfaceEntry(&mut row)
+            } else {
+                lookup
+            };
+            (lookup, status)
+        };
+        if status != 0 {
+            let call = if lookup == 0 { "setting" } else { "reading" };
+            return Err(anyhow!(
+                "{call} the Wintun interface MTU failed with Win32 error {status}"
+            ));
+        }
+        Ok(())
+    }
 
     fn assign_address(luid: u64, addr: Ipv4Addr) -> Result<()> {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -400,23 +729,55 @@ mod windows {
         Ok(())
     }
 
-    #[test]
-    fn vendored_driver_matches_the_runtime_digest() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    #[cfg(test)]
+    fn vendored_dll() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("workspace root")
             .join("vendor")
             .join("wintun")
-            .join(WINTUN_DLL_NAME);
+            .join(WINTUN_DLL_NAME)
+    }
+
+    #[test]
+    fn vendored_driver_matches_the_runtime_digest() {
+        let path = vendored_dll();
         verify_dll(&path).expect("the vendored Wintun DLL must match its pinned digest");
         let bytes = std::fs::read(path).expect("read Wintun DLL");
         assert_eq!(&bytes[..2], b"MZ");
         assert!(bytes.len() > 100_000);
     }
+
+    #[test]
+    fn the_pinned_driver_cannot_be_written_while_it_is_held() {
+        let dir = std::env::temp_dir().join(format!("smbanything-pinned-dll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(WINTUN_DLL_NAME);
+        std::fs::copy(vendored_dll(), &path).expect("copy the vendored DLL");
+
+        let held = PinnedDll::open(path.clone()).expect("the copy is the pinned driver");
+        let write = std::fs::OpenOptions::new().write(true).open(&path);
+        assert!(write.is_err(), "a writer opened the DLL while it was held");
+        let renamed = dir.join("moved.dll");
+        assert!(
+            std::fs::rename(&path, &renamed).is_err(),
+            "the DLL was renamed while it was held"
+        );
+        assert!(std::fs::remove_file(&path).is_err(), "the DLL was deleted while it was held");
+        // Readers are still let in: the loader is one.
+        std::fs::File::open(&path).expect("a reader opens the held DLL");
+
+        drop(held);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("a writer opens the DLL once it is released");
+        std::fs::remove_dir_all(&dir).expect("remove the temp dir");
+    }
 }
 
 #[cfg(windows)]
-use windows::PlatformTun;
+use windows::{PlatformTun, Poller, Waker};
 
 /// Check that the Wintun driver at `path` is byte-for-byte the one this crate
 /// pins and will load. For an embedder that vendors the DLL and ships it next
@@ -428,8 +789,31 @@ pub fn verify_driver(path: &std::path::Path) -> anyhow::Result<()> {
     windows::verify_dll(path)
 }
 
+/// Remove the Wintun driver from the Windows driver store, loading it through
+/// the same pinned DLL beside the executable that a tun share uses. Creating
+/// the first adapter installs the driver, and it stays installed after every
+/// adapter is gone; an uninstaller calls this to take it away. Wintun skips the
+/// removal while any Wintun adapter exists, including other programs'.
+#[cfg(windows)]
+pub fn remove_driver() -> anyhow::Result<()> {
+    windows::remove_driver()
+}
+
+/// Whether `packet` is IPv4 from `peer`, the adapter's own address.
+///
+/// The host sends to the virtual address from the adapter address, so nothing
+/// else is a client. On a host that forwards IP, a neighbour routing the
+/// virtual address through it would otherwise reach the share; dropping those
+/// packets before smoltcp sees them also means they get no reply at all, not
+/// even a reset.
+fn sent_by(packet: &[u8], peer: Ipv4Addr) -> bool {
+    packet.len() >= 20 && packet[0] >> 4 == 4 && packet[12..16] == peer.octets()
+}
+
 struct SmolDevice {
     io: PlatformTun,
+    peer: Ipv4Addr,
+    ignored_any: bool,
 }
 
 struct PacketRx {
@@ -472,14 +856,22 @@ impl Device for SmolDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.io.receive().map(|packet| {
-            (
-                PacketRx { packet },
-                PacketTx {
-                    io: &mut self.io,
-                },
-            )
-        })
+        loop {
+            let packet = self.io.receive()?;
+            if sent_by(&packet, self.peer) {
+                return Some((PacketRx { packet }, PacketTx { io: &mut self.io }));
+            }
+            // IPv6 the host sends on its own (router and multicast listener
+            // traffic) is routine and not worth a line; another IPv4 source is.
+            if !self.ignored_any && packet.len() >= 20 && packet[0] >> 4 == 4 {
+                self.ignored_any = true;
+                let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                smb_log!(
+                    "tun: ignoring IPv4 packets not sent from {}, the first from {source}",
+                    self.peer
+                );
+            }
+        }
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -511,6 +903,18 @@ impl Bridge {
         self.upstream_eof = false;
         self.upstream_write_closed = false;
     }
+
+    /// The loopback side has something to read that the bridge has room for.
+    #[cfg(unix)]
+    fn wants_upstream_read(&self) -> bool {
+        !self.upstream_eof && self.to_client.len() < PROXY_HIGH_WATER
+    }
+
+    /// Bytes from the client are waiting for the loopback side to take them.
+    #[cfg(unix)]
+    fn wants_upstream_write(&self) -> bool {
+        !self.to_upstream.is_empty() && !self.upstream_write_closed
+    }
 }
 
 fn recycle(bridge: &mut Bridge, socket: &mut tcp::Socket<'_>, port: u16) {
@@ -522,12 +926,17 @@ fn recycle(bridge: &mut Bridge, socket: &mut tcp::Socket<'_>, port: u16) {
 
 fn poll_loop(
     device: PlatformTun,
-    virtual_ip: Ipv4Addr,
+    mut poller: Poller,
+    addrs: TunAddrs,
     port: u16,
     forward_to: SocketAddr,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut device = SmolDevice { io: device };
+    let mut device = SmolDevice {
+        io: device,
+        peer: addrs.adapter_ip(),
+        ignored_any: false,
+    };
     let started = StdInstant::now();
     let now = || Instant::from_micros(started.elapsed().as_micros() as i64);
 
@@ -535,7 +944,7 @@ fn poll_loop(
     let mut interface = Interface::new(config, &mut device, now());
     interface.update_ip_addrs(|addresses| {
         addresses
-            .push(IpCidr::new(IpAddress::Ipv4(virtual_ip), 32))
+            .push(IpCidr::new(IpAddress::Ipv4(addrs.virtual_ip()), 32))
             .expect("one address fits");
     });
 
@@ -560,19 +969,22 @@ fn poll_loop(
         })
         .collect();
 
+    // Each round drains the adapter into smoltcp, moves what it can between
+    // smoltcp and the loopback bridges, and repeats while that moved anything.
+    // Only a round that changed nothing sleeps, until a packet, a bridge
+    // socket, the shutdown waker or smoltcp's next timer needs it.
     while !shutdown.load(Ordering::Relaxed) {
         interface.poll(now(), &mut device, &mut sockets);
 
         let mut did_work = false;
-        let mut any_active = false;
         for bridge in &mut bridges {
-            did_work |= pump(bridge, &mut sockets, forward_to, port);
-            any_active |= bridge.upstream.is_some();
+            did_work |= pump(bridge, &mut sockets, &poller, forward_to, port);
         }
         if did_work {
             continue;
         }
-        std::thread::sleep(Duration::from_millis(if any_active { 1 } else { 20 }));
+        let delay = interface.poll_delay(now(), &sockets);
+        poller.wait(&device.io, &bridges, delay);
     }
 
     for bridge in &mut bridges {
@@ -584,6 +996,7 @@ fn poll_loop(
 fn pump(
     bridge: &mut Bridge,
     sockets: &mut SocketSet<'_>,
+    poller: &Poller,
     forward_to: SocketAddr,
     port: u16,
 ) -> bool {
@@ -602,8 +1015,11 @@ fn pump(
         match TcpStream::connect(forward_to) {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
-                if let Err(error) = stream.set_nonblocking(true) {
-                    smb_log!("tun: cannot make loopback bridge nonblocking: {error}");
+                let ready = stream
+                    .set_nonblocking(true)
+                    .and_then(|()| poller.register(&stream));
+                if let Err(error) = ready {
+                    smb_log!("tun: cannot set up the loopback bridge: {error}");
                     socket.abort();
                     return true;
                 }
@@ -727,6 +1143,35 @@ mod tests {
             let addrs: TunAddrs = address.parse().unwrap();
             assert_ne!(addrs.virtual_ip(), addrs.adapter_ip());
         }
+    }
+
+    #[test]
+    fn only_the_adapter_address_is_a_client() {
+        let peer = Ipv4Addr::new(169, 254, 255, 2);
+        let mut packet = [0u8; 20];
+        packet[0] = 0x45;
+        packet[12..16].copy_from_slice(&peer.octets());
+        packet[16..20].copy_from_slice(&[169, 254, 255, 1]);
+        assert!(sent_by(&packet, peer));
+
+        // A forwarded packet from a neighbour, addressed to the same server.
+        let mut forwarded = packet;
+        forwarded[12..16].copy_from_slice(&[192, 168, 1, 50]);
+        assert!(!sent_by(&forwarded, peer));
+
+        // IPv6, and anything too short to carry an IPv4 header.
+        let mut ipv6 = packet;
+        ipv6[0] = 0x60;
+        assert!(!sent_by(&ipv6, peer));
+        assert!(!sent_by(&packet[..19], peer));
+    }
+
+    #[test]
+    fn timers_round_up_to_the_next_millisecond() {
+        assert_eq!(wait_millis(Duration::from_micros(0)), 0);
+        assert_eq!(wait_millis(Duration::from_micros(1)), 1);
+        assert_eq!(wait_millis(Duration::from_micros(1000)), 1);
+        assert_eq!(wait_millis(Duration::from_micros(1001)), 2);
     }
 
     #[cfg(unix)]

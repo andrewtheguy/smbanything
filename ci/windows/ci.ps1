@@ -135,6 +135,11 @@ try {
     }
     if (-not $ready) { throw 'the packet tunnel never accepted a connection on 169.254.255.1:445' }
 
+    # Wintun creates its adapter at 65535; the tunnel sets it to the MTU smoltcp uses.
+    $mtu = (Get-NetIPInterface -InterfaceAlias 'smbanything' -AddressFamily IPv4).NlMtu
+    if ($mtu -ne 1500) { throw "the tunnel adapter's IPv4 MTU is $mtu, not 1500" }
+    Write-Host "[smoke] the tunnel adapter's IPv4 MTU is $mtu"
+
     Write-Host '[smoke] probing the bridge pool with connect-then-close clients'
     foreach ($probe in 1..24) {
         $client = [Net.Sockets.TcpClient]::new()

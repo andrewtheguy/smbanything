@@ -19,6 +19,10 @@ platform=$(uname -s)
 pid=
 mount_dir=
 elevated_pid=false
+# A spare TEST-NET-2 address, aliased onto Linux loopback for the packet
+# tunnel's foreign-source check and removed again by cleanup.
+foreign_source=198.51.100.7
+foreign_alias=
 
 info() { echo "[smoke] $*"; }
 # The banner's `Server:   listening on <host>:<port>  (...)` line, and the
@@ -27,7 +31,14 @@ listen_port() { sed -n 's/^Server: *listening on .*:\([0-9][0-9]*\)  .*/\1/p' "$
 archive_folder() { awk '/^Folder:/ {print $2; exit}' "$1"; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
+remove_foreign_alias() {
+    [[ -n "$foreign_alias" ]] || return 0
+    sudo -n ip addr del "$foreign_source/32" dev "$foreign_alias" || true
+    foreign_alias=
+}
+
 cleanup() {
+    remove_foreign_alias
     if [[ -n "$mount_dir" ]]; then
         # macOS canonicalizes /tmp to /private/tmp in `mount` output, so a
         # textual mount-table check misses the exact mount we just created.
@@ -182,6 +193,70 @@ for _ in $(seq 1 24); do
     exec 3>&-
     sleep 0.02
 done
+
+# Root is needed only to create the adapter. The server sudo started must
+# have given it up, in every thread, before it served anything. $pid is sudo;
+# the server is a descendant, one or two levels down depending on whether sudo
+# interposes a monitor process.
+server_pid=$pid
+while [[ -n "$server_pid" && "$(ps -o comm= -p "$server_pid")" != *smbanything* ]]; do
+    server_pid=$(pgrep -P "$server_pid" | head -n1)
+done
+[[ -n "$server_pid" ]] || { echo 'cannot find the tunnel server under sudo' >&2; exit 1; }
+if [[ "$platform" == Darwin ]]; then
+    server_uids=$(ps -o uid= -p "$server_pid" | tr -d ' ')
+else
+    server_uids=$(sudo -n cat /proc/"$server_pid"/task/*/status | awk '/^Uid:/ {print $3}' | sort -u | xargs)
+fi
+[[ "$server_uids" == "$(id -u)" ]] || {
+    echo "the tunnel server still runs as uid(s) '$server_uids', not $(id -u)" >&2
+    exit 1
+}
+info "server runs as uid $server_uids after creating the adapter"
+
+# Nothing but the adapter address is a client. A packet the host forwards
+# from anywhere else has to get no answer at all. A spare local address
+# stands in for that neighbour: Linux routes its SYN into the tunnel just as
+# it would a forwarded one. macOS does not deliver that exchange whether or not
+# the tunnel answers, so there the check could not fail and is skipped.
+if [[ "$platform" != Darwin ]]; then
+    info 'checking that another source address gets no answer'
+    sudo -n ip addr add "$foreign_source/32" dev lo
+    foreign_alias=lo
+    if nc -z -w 2 -s "$foreign_source" 169.254.255.1 445 2>/dev/null; then
+        echo "a connection from $foreign_source reached the tunnel" >&2
+        exit 1
+    fi
+    remove_foreign_alias
+    nc -z -w 2 169.254.255.1 445 2>/dev/null || {
+        echo 'the adapter address itself can no longer connect' >&2
+        exit 1
+    }
+fi
+
+# The packet thread sleeps on the adapter, the bridges and smoltcp's timers
+# rather than on a clock, so an idle bridged connection costs it no wakeups.
+# Linux counts them per thread; macOS has no equivalent to read.
+if [[ "$platform" != Darwin ]]; then
+    exec 3<>/dev/tcp/169.254.255.1/445
+    sleep 0.5
+    tun_task=$(grep -lx 'smbanything-tun' /proc/"$server_pid"/task/*/comm 2>/dev/null | head -n1)
+    tun_task=${tun_task%/comm}
+    if [[ -z "$tun_task" ]]; then
+        echo 'no smbanything-tun thread in the server' >&2
+        exit 1
+    fi
+    switches() { sudo -n awk '/^voluntary_ctxt_switches/ {print $2}' "$tun_task/status"; }
+    before=$(switches)
+    sleep 2
+    wakeups=$(( $(switches) - before ))
+    exec 3>&-
+    (( wakeups < 20 )) || {
+        echo "the packet thread woke $wakeups times in 2 s with an idle connection" >&2
+        exit 1
+    }
+    info "packet thread woke $wakeups times in 2 s with an idle connection"
+fi
 
 if [[ "$platform" == Darwin ]]; then
     mount_dir="$work/mount"

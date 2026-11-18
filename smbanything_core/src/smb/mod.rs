@@ -146,7 +146,7 @@ use files::{Handles, OpenRegistry};
 use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, write_error_body};
 pub use path::SmbPath;
 #[cfg(all(windows, feature = "tun"))]
-pub use tun::verify_driver;
+pub use tun::{remove_driver, verify_driver};
 pub use proto::status;
 pub use session::Credentials;
 use session::{SessionState, TreeKind};
@@ -305,12 +305,19 @@ impl Ctx {
     /// the limit and start accepting logons again.
     fn record_failed_logon(&self) -> u32 {
         use std::sync::atomic::Ordering;
-        self.failed_logons
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(1))
-            })
-            .unwrap_or(0)
-            .saturating_add(1)
+        let mut current = self.failed_logons.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(1);
+            match self.failed_logons.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn clear_failed_logons(&self) {

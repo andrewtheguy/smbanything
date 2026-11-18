@@ -1,6 +1,8 @@
 mod archive;
 mod connection;
 mod picker;
+#[cfg(unix)]
+mod privilege;
 mod root;
 mod tui;
 
@@ -69,10 +71,20 @@ struct Args {
         requires = "smb_tun"
     )]
     smb_tun_ip: smb::TunAddrs,
+
+    /// Remove the Wintun driver from the driver store and exit. The MSI runs
+    /// this when it uninstalls; it is not meant to be typed.
+    #[cfg(windows)]
+    #[arg(long, hide = true, exclusive = true)]
+    remove_wintun_driver: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    #[cfg(windows)]
+    if args.remove_wintun_driver {
+        return smb::remove_driver();
+    }
     validate_simple_name("share", &args.share)?;
     validate_simple_name("user", &args.user)?;
 
@@ -97,6 +109,12 @@ fn main() -> Result<()> {
             password: password.clone(),
         },
     )?;
+    // Every privileged step is behind us: the adapter exists and the listener
+    // is bound. Nothing that parses client or archive input runs as root.
+    #[cfg(unix)]
+    let dropped_to = privilege::drop_root()?;
+    #[cfg(not(unix))]
+    let dropped_to = None;
     // The share is never empty: a README says what is loaded and how the
     // share behaves, so a client that mounts early sees a working server.
     let control = if args.archive.is_some() {
@@ -134,7 +152,7 @@ fn main() -> Result<()> {
     })?;
 
     let result = match args.archive {
-        Some(archive) => serve(&handle, &server, &archive, &stop_rx),
+        Some(archive) => serve(&handle, &server, dropped_to, &archive, &stop_rx),
         None => browse(&handle, &server, stop_rx),
     };
     handle.stop();
@@ -147,6 +165,7 @@ fn main() -> Result<()> {
 fn serve(
     handle: &smb::SmbHandle,
     server: &ServerView,
+    dropped_to: Option<u32>,
     archive: &Path,
     stop_rx: &mpsc::Receiver<()>,
 ) -> Result<()> {
@@ -183,6 +202,9 @@ fn serve(
             addrs.virtual_ip(),
             addrs.adapter_ip()
         );
+    }
+    if let Some(uid) = dropped_to {
+        println!("Runs as:  uid {uid}; root was needed only to start the server");
     }
     if server.bind_all {
         println!("Warning:  file data is signed but not encrypted and is visible in transit.");

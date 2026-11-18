@@ -123,7 +123,9 @@ sudo rm -f /usr/local/bin/smbanything
 sudo pkgutil --forget com.andrewtheguy.smbanything
 ```
 
-On Windows, remove smbanything from **Apps & features**.
+On Windows, remove smbanything from **Apps & features**. That also removes the
+Wintun driver that `--smb-tun` installed into the driver store, unless another
+program still has a Wintun adapter.
 
 ## Build release packages
 

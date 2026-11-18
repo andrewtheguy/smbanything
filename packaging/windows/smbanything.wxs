@@ -58,7 +58,7 @@
 
     <ComponentGroup Id="Program">
       <Component Directory="BinDir">
-        <File Source="$(var.Stage)\bin\smbanything.exe" />
+        <File Id="SmbanythingExe" Source="$(var.Stage)\bin\smbanything.exe" />
         <!-- On every account's PATH, as /usr/bin/smbanything is; removed with the package. -->
         <Environment Id="PathEntry" Name="PATH" Value="[BinDir]" Part="last" Action="set" System="yes" />
       </Component>
@@ -72,6 +72,19 @@
         <File Source="$(var.Stage)\VERSION" />
       </Component>
     </ComponentGroup>
+
+    <!-- Creating the first Wintun adapter installs the Wintun driver into the driver store, and
+         it stays there after every adapter is gone. Removing the package removes it too, through
+         the installed exe and its pinned DLL (WintunDeleteDriver), before either file is deleted.
+         Wintun leaves the driver in place while any Wintun adapter exists, another program's
+         included. An upgrade keeps it: the new version would only install it again. A failure
+         never blocks the uninstall. -->
+    <CustomAction Id="RemoveWintunDriver" FileRef="SmbanythingExe" ExeCommand="--remove-wintun-driver"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="RemoveWintunDriver" Before="RemoveFiles"
+              Condition='REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+    </InstallExecuteSequence>
 
     <Feature Id="Main">
       <ComponentGroupRef Id="Program" />

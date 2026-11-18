@@ -83,16 +83,58 @@ terminates the connection and proxies it to the ordinary loopback listener
 handling never learn a tun exists. The extra loopback hop costs a memcpy per
 buffer, which is nothing next to a backing read.
 
+The packet thread sleeps only until something needs it. Each round drains the
+adapter into smoltcp and moves what it can between smoltcp and the loopback
+bridges; a round that moved nothing waits on everything that could change that,
+with smoltcp's next timer (`poll_delay`) as the timeout:
+
+- on Linux and macOS, one `poll(2)` over the tun descriptor, each bridge socket
+  that has room to read or bytes to write, and a socketpair that wakes it for
+  shutdown;
+- on Windows, one `WSAWaitForMultipleEvents` over Wintun's read-wait event, a
+  single Winsock event every bridge socket is `WSAEventSelect`ed onto, and a
+  shutdown event. The read-wait event is waited on only once a receive has
+  found the ring empty — Wintun's documented pattern — which smoltcp's `poll`
+  guarantees, since it drains the device before returning.
+
+An idle share costs no wakeups, mounted or not. Against the 1 ms sleep loop
+this replaced, with a bridged connection left idle and a 64 MiB file read
+through the tunnel:
+
+| | Idle cost | 64 MiB read |
+| --- | --- | --- |
+| Linux (`smbclient`) | 0 wakeups in 2 s, was ~1,700 | 0.6 s, was 0.7 s |
+| macOS (`mount_smbfs`) | no CPU time in 10 s, was 0.19 s | 0.22 s, was 0.91 s |
+
+The Linux smoke test holds the idle wakeups under 20.
+
 ## Requirements and side effects
 
-- **Elevation**, because creating a network adapter always requires it. Nothing
-  else needs it, and no existing service, binding or adapter is modified.
+- **Elevation to start, not to run.** Creating a network adapter always needs
+  it, and nothing else does, so on Linux and macOS the process gives root back
+  as soon as the adapter exists and the private listener is bound: under sudo
+  it switches every thread to `SUDO_UID`/`SUDO_GID` (with that user's
+  supplementary groups) for good, before it opens an archive or answers a
+  client, and says so in the banner (`Runs as:  uid 1000`). The adapter's file
+  descriptor keeps working, because the kernel checked privilege when it was
+  opened. Run as root without sudo, there is nobody to switch to and it stays
+  root. Windows has no cheap equivalent — an elevated token cannot be narrowed
+  back to the user's for a running process — so there the whole share runs
+  elevated. No existing service, binding or adapter is modified.
 - **Two host routes.** While a share is open, `169.254.255.1/32` and
   `169.254.255.2/32` route to the tun adapter — nothing wider. The server
   refuses to start if either exact address is already owned by the machine.
-- **Nothing persists**, and not only on the tidy path. Dropping the share
-  removes the adapter, and with it the address and the routes. A crash or a
-  forced kill does the same: see below.
+- **Only the adapter's own client is served.** The host sends to `.1` from the
+  adapter's `.2`, so the stack drops every packet from any other source before
+  it is processed — no reply, not even a reset. Without that, a host with IP
+  forwarding on would serve the share to a neighbour that routes `.1` through
+  it.
+- **No network state persists**, and not only on the tidy path. Dropping the
+  share removes the adapter, and with it the address and the routes. A crash or
+  a forced kill does the same: see below. The one thing that outlives a share
+  is on Windows: the first adapter installs the Wintun driver into the driver
+  store, and it stays there, unused, until the MSI is uninstalled — see
+  [The Windows driver](#the-windows-driver).
 
 ### What happens if the process crashes
 
@@ -144,19 +186,32 @@ DLL hash is pinned as `WINTUN_DLL_SHA256` and checked twice:
 
 - `vendored_driver_matches_the_runtime_digest` fails the build if the vendored
   binary ever changes without the constant changing with it;
-- `locate_dll` hashes the file next to the executable and refuses it unless it
+- `PinnedDll` hashes the file next to the executable and refuses it unless it
   is byte-for-byte the pinned driver. Nothing is passed to `LoadLibrary` that
-  has not just been verified.
+  has not just been verified, through a handle that is still holding it.
 
 An embedder that vendors and ships the DLL itself pins its own copy with
 `smb::verify_driver` in a test of its own, so a driver update that forgets one
 side fails that build too.
 
-It narrows the window rather than closing it. Between the hash check and the
-load, a writer could still swap the file. Anything able to write the install
-directory can already replace the executable itself; this defends against a
-stale or corrupted copy, not against an attacker who is already inside that
-trust boundary.
+The check and the load see the same bytes. The DLL is opened with read-only
+sharing, hashed through that handle, and the handle is held until
+`LoadLibrary` has mapped it: while it is open nothing can open the file for
+writing, rename it or delete it, and the loader's own read-and-execute open is
+still let in. `the_pinned_driver_cannot_be_written_while_it_is_held` checks all
+four.
+
+### The driver store
+
+Wintun installs its driver into the Windows driver store (`wintun.inf`, as an
+`oemN.inf`) the first time an adapter is created, and the package stays there
+after every adapter is gone. Uninstalling the MSI removes it: a deferred custom
+action runs the installed `smbanything.exe --remove-wintun-driver` before the
+files go, which calls `WintunDeleteDriver` through the same pinned DLL. Wintun
+leaves the driver in place while any Wintun adapter exists, another program's
+included, and an upgrade skips the step, since the new version would only
+install it again. `verify-windows-msi.ps1` serves a tunnel from the installed
+copy, then checks the driver is gone after the uninstall.
 
 **Updating the driver:** verify the new archive against the SHA2-256 published
 on wintun.net *and* its Authenticode signature, then replace
@@ -167,14 +222,10 @@ point.
 
 ## Known limitations
 
-- The poll loop polls rather than waiting on an event, because no single wait
-  primitive spans both the tun device and the loopback sockets everywhere. It
-  sleeps 1 ms while a mount is live and 20 ms when idle. Measured cost is not
-  visible next to backing reads — a mount, a file read and a directory listing
-  are all well under 250 ms — but this is the first place to look if throughput
-  ever matters.
-- MTU is left at the platform default of 1500. Raising it would cut per-packet
-  overhead on bulk reads.
+- The MTU is 1500, set explicitly on every platform — on Windows too, where
+  Wintun would otherwise leave the adapter at 65535. Raising it would cut
+  per-packet overhead on bulk reads; it has to change on the adapter and in
+  smoltcp together.
 - IPv4 only.
 
 One trap worth knowing on Windows, because it cost 272 seconds a run before it
