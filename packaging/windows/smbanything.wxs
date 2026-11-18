@@ -3,8 +3,8 @@
   The Windows package: an MSI installing smbanything under %ProgramFiles%\smbanything with bin
   on the machine PATH, and nothing else — no service, no shortcut, no config, like the .deb,
   .rpm and .pkg. The one addition is the Wintun driver DLL beside the exe, which the packet tunnel
-  loads from there after checking its pinned SHA-256 (smbanything_core/src/smb/tun.rs), and
-  Wintun's licence, which its redistribution terms require to travel with it.
+  loads from there (smbanything_core/src/smb/tun.rs), and Wintun's licence, which its
+  redistribution terms require to travel with it.
 
   Built by packaging/build-windows-msi.ps1 with WiX 5 (`wix build`), which defines
     Version: Cargo's version with any pre-release suffix removed (an MSI version is x.y.z)
@@ -72,28 +72,6 @@
         <File Source="$(var.Stage)\VERSION" />
       </Component>
     </ComponentGroup>
-
-    <!-- Creating the first Wintun adapter installs the Wintun driver into the driver store, and
-         it stays there after every adapter is gone. A full uninstall tries to remove it by calling
-         WintunDeleteDriver, which leaves it in place while any Wintun adapter exists, another
-         program's included. An upgrade skips the step: the new version would only install it
-         again. The result is ignored, so a driver that stays never blocks the uninstall.
-
-         The action runs as SYSTEM, so it must not run anything from the install folder: the
-         wizard lets that be anywhere, a folder a standard user can write included. Windows
-         Installer instead extracts its own copy of the DLL, embedded here, into its admin-only
-         directory and calls the export directly. That export takes no arguments and returns a
-         BOOL rather than taking the MSIHANDLE and returning an error code; on x64 the handle is
-         simply ignored. The result is ignored too, but it reads backwards in the msiexec log:
-         Windows Installer turns the TRUE of a removal into "actual error code 1603", and a
-         FALSE would read as 0. -->
-    <Binary Id="WintunDll" SourceFile="$(var.Stage)\bin\wintun-amd64.dll" />
-    <CustomAction Id="RemoveWintunDriver" BinaryRef="WintunDll" DllEntry="WintunDeleteDriver"
-                  Execute="deferred" Impersonate="no" Return="ignore" />
-    <InstallExecuteSequence>
-      <Custom Action="RemoveWintunDriver" Before="RemoveFiles"
-              Condition='REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' />
-    </InstallExecuteSequence>
 
     <Feature Id="Main">
       <ComponentGroupRef Id="Program" />

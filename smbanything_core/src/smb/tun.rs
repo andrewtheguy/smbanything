@@ -333,9 +333,7 @@ fn reject_unix_addresses_in_use(addrs: TunAddrs) -> Result<()> {
 // wait calls here; the packet stack and proxy below are identical on every OS.
 #[cfg(windows)]
 mod windows {
-    use std::io::Read as _;
     use std::net::TcpStream;
-    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use anyhow::{Result, anyhow};
@@ -348,11 +346,6 @@ mod windows {
     const TUNNEL_TYPE: &str = "smbanything archive share";
     const ADAPTER_GUID: u128 = 0xa7e1_6f81_6465_40c9_8e28_4a90_91db_43fc;
     const WINTUN_DLL_NAME: &str = "wintun-amd64.dll";
-    const WINTUN_DLL_SHA256: [u8; 32] = [
-        0xe5, 0xda, 0x84, 0x47, 0xdc, 0x2c, 0x32, 0x0e, 0xdc, 0x0f, 0xc5, 0x2f, 0xa0, 0x18,
-        0x85, 0xc1, 0x03, 0xde, 0x8c, 0x11, 0x84, 0x81, 0xf6, 0x83, 0x64, 0x3c, 0xac, 0xc3,
-        0x22, 0x0d, 0xaf, 0xce,
-    ];
 
     pub(super) struct PlatformTun {
         /// The session's read-wait event, owned by `session`. Wintun signals
@@ -366,7 +359,7 @@ mod windows {
     impl PlatformTun {
         pub(super) fn create(addrs: TunAddrs) -> Result<Self> {
             reject_addresses_in_use(addrs)?;
-            let wintun = load_pinned_dll()?;
+            let wintun = load_dll()?;
             let adapter = wintun::Adapter::create(
                 &wintun,
                 ADAPTER_NAME,
@@ -542,122 +535,22 @@ mod windows {
         }
     }
 
-    /// The pinned Wintun DLL, held open so that it cannot change between the
-    /// hash check and the load.
-    ///
-    /// The handle shares read access only: while it lives, nobody can open
-    /// the file for writing, nor rename or delete it (both need delete
-    /// access). The loader's own open asks for read and execute, which that
-    /// sharing allows. `load_path` is the file's final path, read back from
-    /// the handle: no junction or symlink is left in it to retarget, and no
-    /// directory along it can be renamed while a file inside is open, so
-    /// `LoadLibrary` maps exactly the bytes hashed here.
-    struct PinnedDll {
-        path: PathBuf,
-        load_path: PathBuf,
-        _file: std::fs::File,
-    }
-
-    impl PinnedDll {
-        fn beside_exe() -> Result<Self> {
-            let exe = std::env::current_exe()
-                .map_err(|e| anyhow!("resolving the smbanything executable: {e}"))?;
-            let dir = exe
-                .parent()
-                .ok_or_else(|| anyhow!("{} has no parent directory", exe.display()))?;
-            Self::open(dir.join(WINTUN_DLL_NAME))
-        }
-
-        fn open(path: PathBuf) -> Result<Self> {
-            use sha2::{Digest, Sha256};
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
-
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ)
-                .open(&path)
-                .map_err(|error| {
-                    anyhow!(
-                        "{} could not be opened ({error}); Windows packet tunneling needs the release's {WINTUN_DLL_NAME} beside smbanything.exe",
-                        path.display()
-                    )
-                })?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|error| anyhow!("reading {}: {error}", path.display()))?;
-            if Sha256::digest(&bytes).as_slice() != WINTUN_DLL_SHA256 {
-                return Err(anyhow!(
-                    "{} does not match the Wintun driver shipped by smbanything; refusing to load it",
-                    path.display()
-                ));
-            }
-            let load_path = final_path(&file)
-                .map_err(|error| anyhow!("resolving {}: {error}", path.display()))?;
-            Ok(Self {
-                path,
-                load_path,
-                _file: file,
-            })
-        }
-    }
-
-    /// The path the handle actually reached, with every junction and
-    /// symlink resolved. The `\\?\` prefix is dropped from a drive path,
-    /// which means the same file without it.
-    fn final_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
-        use std::os::windows::ffi::OsStringExt;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
-        };
-
-        let mut buffer = vec![0u16; 512];
-        loop {
-            // SAFETY: a live file handle, and a buffer of the length passed.
-            let len = unsafe {
-                GetFinalPathNameByHandleW(
-                    file.as_raw_handle(),
-                    buffer.as_mut_ptr(),
-                    buffer.len() as u32,
-                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-                )
-            } as usize;
-            if len == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // Too small: `len` is the size needed, terminator included.
-            if len >= buffer.len() {
-                buffer.resize(len, 0);
-                continue;
-            }
-            let path = std::ffi::OsString::from_wide(&buffer[..len]);
-            let text = path.to_string_lossy();
-            let bytes = text.as_bytes();
-            let drive_path = bytes.len() > 6
-                && bytes.starts_with(br"\\?\")
-                && bytes[4].is_ascii_alphabetic()
-                && bytes[5] == b':';
-            return Ok(if drive_path {
-                PathBuf::from(&text[4..])
-            } else {
-                PathBuf::from(path)
-            });
-        }
-    }
-
-    fn load_pinned_dll() -> Result<wintun::Wintun> {
-        let dll = PinnedDll::beside_exe()?;
-        // SAFETY: only the DLL with the pinned digest is passed to the loader,
-        // and `dll` keeps it from changing until the load has mapped it.
-        let wintun = unsafe { wintun::load_from_path(&dll.load_path) }
-            .map_err(|e| anyhow!("loading {}: {e}", dll.path.display()))?;
-        drop(dll);
-        Ok(wintun)
-    }
-
-    pub(super) fn verify_dll(path: &Path) -> Result<()> {
-        PinnedDll::open(path.to_path_buf()).map(drop)
+    /// Load the Wintun DLL from beside the executable, by full path, so the
+    /// DLL search order never picks up another copy.
+    fn load_dll() -> Result<wintun::Wintun> {
+        let exe = std::env::current_exe()
+            .map_err(|e| anyhow!("resolving the smbanything executable: {e}"))?;
+        let dir = exe
+            .parent()
+            .ok_or_else(|| anyhow!("{} has no parent directory", exe.display()))?;
+        let path = dir.join(WINTUN_DLL_NAME);
+        // SAFETY: loading the Wintun DLL runs only its own initialization.
+        unsafe { wintun::load_from_path(&path) }.map_err(|e| {
+            anyhow!(
+                "loading {} ({e}); Windows packet tunneling needs the release's {WINTUN_DLL_NAME} beside smbanything.exe",
+                path.display()
+            )
+        })
     }
 
     fn reject_addresses_in_use(addrs: TunAddrs) -> Result<()> {
@@ -790,76 +683,10 @@ mod windows {
         }
         Ok(())
     }
-
-    #[cfg(test)]
-    fn vendored_dll() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root")
-            .join("vendor")
-            .join("wintun")
-            .join(WINTUN_DLL_NAME)
-    }
-
-    #[test]
-    fn vendored_driver_matches_the_runtime_digest() {
-        let path = vendored_dll();
-        verify_dll(&path).expect("the vendored Wintun DLL must match its pinned digest");
-        let bytes = std::fs::read(path).expect("read Wintun DLL");
-        assert_eq!(&bytes[..2], b"MZ");
-        assert!(bytes.len() > 100_000);
-    }
-
-    #[test]
-    fn the_pinned_driver_cannot_be_written_while_it_is_held() {
-        let dir = std::env::temp_dir().join(format!("smbanything-pinned-dll-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join(WINTUN_DLL_NAME);
-        std::fs::copy(vendored_dll(), &path).expect("copy the vendored DLL");
-
-        let held = PinnedDll::open(path.clone()).expect("the copy is the pinned driver");
-        let write = std::fs::OpenOptions::new().write(true).open(&path);
-        assert!(write.is_err(), "a writer opened the DLL while it was held");
-        let renamed = dir.join("moved.dll");
-        assert!(
-            std::fs::rename(&path, &renamed).is_err(),
-            "the DLL was renamed while it was held"
-        );
-        assert!(std::fs::remove_file(&path).is_err(), "the DLL was deleted while it was held");
-        // Nor can the path the loader is given be pointed elsewhere.
-        assert!(
-            std::fs::rename(&dir, dir.with_extension("moved")).is_err(),
-            "the DLL's directory was renamed while it was held"
-        );
-        assert!(!held.load_path.to_string_lossy().starts_with(r"\\?\"));
-        assert_eq!(
-            std::fs::canonicalize(&held.load_path).unwrap(),
-            std::fs::canonicalize(&path).unwrap()
-        );
-        // Readers are still let in: the loader is one.
-        std::fs::File::open(&path).expect("a reader opens the held DLL");
-
-        drop(held);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .expect("a writer opens the DLL once it is released");
-        std::fs::remove_dir_all(&dir).expect("remove the temp dir");
-    }
 }
 
 #[cfg(windows)]
 use windows::{PlatformTun, Poller, Waker};
-
-/// Check that the Wintun driver at `path` is byte-for-byte the one this crate
-/// pins and will load. For an embedder that vendors the DLL and ships it next
-/// to its own executable: run this over the vendored copy in a test, so a
-/// driver update that forgets one side fails the build rather than the first
-/// tun share started in the field.
-#[cfg(windows)]
-pub fn verify_driver(path: &std::path::Path) -> anyhow::Result<()> {
-    windows::verify_dll(path)
-}
 
 /// Whether `packet` is IPv4 from `peer`, the adapter's own address.
 ///

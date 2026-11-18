@@ -39,7 +39,6 @@ windows-sys = { version = "0.61", optional = true, features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
-    "Win32_Storage_FileSystem",
 ] }
 wintun = { version = "0.5", optional = true }
 

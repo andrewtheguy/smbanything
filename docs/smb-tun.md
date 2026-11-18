@@ -134,8 +134,8 @@ The Linux smoke test holds the idle wakeups under 20.
   share removes the adapter, and with it the address and the routes. A crash or
   a forced kill does the same: see below. The one thing that outlives a share
   is on Windows: the first adapter installs the Wintun driver into the driver
-  store, and it stays there, unused, until an uninstall of the MSI removes it —
-  see [The Windows driver](#the-windows-driver).
+  store, and it stays there, as it does for every program that uses Wintun —
+  see [The driver store](#the-driver-store).
 
 ### What happens if the process crashes
 
@@ -191,15 +191,14 @@ into the tunnel the same way; macOS refuses to, whether the alias is on `lo0` or
 
 Linux and macOS need no driver file. On Windows, `wintun-amd64.dll` (427 KB,
 signed by WireGuard LLC) is vendored in `vendor/wintun/` and must sit next to
-the executable at runtime, which is where the Windows MSI installs it;
-`smbanything_core/src/smb/tun.rs` loads it from
-there and re-verifies it against a pinned SHA-256 before each load — a stale or
-altered copy is refused rather than trusted. The Wintun *Prebuilt Binaries
+the executable at runtime, which is where the Windows MSI installs it.
+`smbanything_core/src/smb/tun.rs` loads it by full path from there, so the DLL
+search order never picks up another copy. The Wintun *Prebuilt Binaries
 License* §3(d) permits redistribution alongside software that uses it only
 through the documented API, which is all `tun.rs` does; `vendor/wintun/LICENSE.txt`
 is the copy that governs it.
 
-### Provenance and integrity
+### Provenance
 
 | | |
 | --- | --- |
@@ -208,57 +207,24 @@ is the copy that governs it.
 | `wintun-amd64.dll` SHA-256 | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` |
 | Authenticode | Valid, `CN=WireGuard LLC`, thumbprint `DF98E075A012ED8C86FBCF14854B8F9555CB3D45` |
 
-A checksum verified only at download time protects nothing afterwards, so the
-DLL hash is pinned as `WINTUN_DLL_SHA256` and checked twice:
-
-- `vendored_driver_matches_the_runtime_digest` fails the build if the vendored
-  binary ever changes without the constant changing with it;
-- `PinnedDll` hashes the file next to the executable and refuses it unless it
-  is byte-for-byte the pinned driver. Nothing is passed to `LoadLibrary` that
-  has not just been verified, through a handle that is still holding it.
-
-An embedder that vendors and ships the DLL itself pins its own copy with
-`smb::verify_driver` in a test of its own, so a driver update that forgets one
-side fails that build too.
-
-The check and the load see the same bytes. The DLL is opened with read-only
-sharing, hashed through that handle, and the handle is held until
-`LoadLibrary` has mapped it: while it is open nothing can open the file for
-writing, rename it or delete it, and the loader's own read-and-execute open is
-still let in. The loader is given the final path read back from that handle,
-with every junction and symlink resolved, and no directory along it can be
-renamed while the file inside is open, so the path cannot be pointed at another
-file either. `the_pinned_driver_cannot_be_written_while_it_is_held` checks all
-of it.
+**Updating the driver:** verify the new archive against the SHA2-256 published
+on wintun.net *and* its Authenticode signature, then replace
+`vendor/wintun/wintun-amd64.dll` with the archive's `bin/amd64/wintun.dll` —
+renamed, because `tun.rs` loads exactly the name `wintun-amd64.dll` — and
+update the table above and `vendor/wintun/README.md`.
 
 ### The driver store
 
 Wintun installs its driver into the Windows driver store (`wintun.inf`, as an
 `oemN.inf`) the first time an adapter is created, and the package stays there
-after every adapter is gone. A full uninstall of the MSI tries to remove it: a
-deferred custom action calls `WintunDeleteDriver`. Wintun leaves the driver in
-place while any Wintun adapter exists, another program's included; an upgrade
-skips the step, since the new version would only install it again; and a
-failure is ignored rather than blocking the uninstall.
-
-The action runs as SYSTEM, so it runs nothing from the install folder, which
-the wizard lets an administrator put somewhere a standard user can write.
-Windows Installer extracts its own copy of the DLL, embedded in the package,
-into its admin-only directory and calls the export there. `WintunDeleteDriver`
-takes no arguments and returns a `BOOL`, not the `UINT (MSIHANDLE)` a DLL
-custom action is declared with. On x64 the extra handle is harmless, and the
-result is ignored, but it reads backwards in the msiexec log: Windows Installer
-turns the `TRUE` of a removal into "actual error code 1603", and a `FALSE`
-would read as 0. `verify-windows-msi.ps1` serves a tunnel from the installed copy,
-checks the uninstall called the extracted copy, and checks the driver is gone.
-It refuses to run on a host that already has a Wintun adapter.
-
-**Updating the driver:** verify the new archive against the SHA2-256 published
-on wintun.net *and* its Authenticode signature, then replace
-`vendor/wintun/wintun-amd64.dll` with the archive's `bin/amd64/wintun.dll` —
-renamed, because `tun.rs` loads exactly the name `wintun-amd64.dll` — and
-update `WINTUN_DLL_SHA256`. The test will fail until they agree, which is the
-point.
+after every adapter is gone. smbanything leaves it there, as programs that ship
+Wintun generally do; uninstalling the MSI removes only the files it installed.
+The package is shared: every Wintun program on the machine uses the same one,
+and Wintun's own `WintunDeleteDriver` removes every Wintun package that no
+adapter is using, whichever program staged it. Unused, it costs nothing, and
+the next adapter any program creates reuses it or installs a newer one. To
+remove it by hand, find its `oemN.inf` in `pnputil /enum-drivers` and run
+`pnputil /delete-driver oemN.inf` from an elevated terminal.
 
 ## Known limitations
 

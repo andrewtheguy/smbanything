@@ -141,9 +141,8 @@ net use Z: \\169.254.255.1\share * /user:smbanything
 ```
 
 Linux and macOS need no driver file. Windows has no native TUN API, so the
-Windows installer puts the pinned `wintun-amd64.dll` beside `smbanything.exe`,
-with Wintun's license under `share\doc\smbanything`; run from an elevated
-terminal. The DLL is hash-verified before it is loaded.
+Windows installer puts `wintun-amd64.dll` beside `smbanything.exe`, with
+Wintun's license under `share\doc\smbanything`; run from an elevated terminal.
 
 The default pair is in the RFC 3927 link-local block reserved from APIPA
 autoconfiguration. Neither address is routed off the machine. Because the

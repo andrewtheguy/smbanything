@@ -64,7 +64,7 @@ C:\Program Files\smbanything\bin\wintun-amd64.dll
 C:\Program Files\smbanything\share\doc\smbanything\WINTUN-LICENSE.txt
 ```
 
-`wintun-amd64.dll` is the pinned Wintun driver `--smb-tun` loads from beside
+`wintun-amd64.dll` is the Wintun driver `--smb-tun` loads from beside
 the executable; see [smb-tun.md](smb-tun.md). Add `/qn` for an unattended
 install.
 
@@ -123,10 +123,7 @@ sudo rm -f /usr/local/bin/smbanything
 sudo pkgutil --forget com.andrewtheguy.smbanything
 ```
 
-On Windows, remove smbanything from **Apps & features**. The uninstall also
-tries to remove the Wintun driver that `--smb-tun` installed into the driver
-store. The driver stays if any Wintun adapter still exists, another program's
-included, or if the removal fails; neither stops the uninstall.
+On Windows, remove smbanything from **Apps & features**.
 
 ## Build release packages
 
