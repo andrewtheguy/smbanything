@@ -19,10 +19,14 @@ platform=$(uname -s)
 pid=
 mount_dir=
 elevated_pid=false
-# A spare TEST-NET-2 address, aliased onto Linux loopback for the packet
-# tunnel's foreign-source check and removed again by cleanup.
+# The packet tunnel's foreign-source check plays a neighbour at this spare
+# TEST-NET-2 address. Linux aliases it onto loopback; macOS puts it behind a
+# peered feth pair with IP forwarding on. Cleanup undoes either.
 foreign_source=198.51.100.7
 foreign_alias=
+neighbour_feth=false
+forwarding_was=
+tcpdump_sudo=
 
 info() { echo "[smoke] $*"; }
 # The banner's `Server:   listening on <host>:<port>  (...)` line, and the
@@ -37,8 +41,31 @@ remove_foreign_alias() {
     foreign_alias=
 }
 
+# $tcpdump_sudo is sudo, which does not relay signals on macOS: stop its child.
+stop_tcpdump() {
+    [[ -n "$tcpdump_sudo" ]] || return 0
+    sudo -n pkill -INT -P "$tcpdump_sudo" 2>/dev/null || true
+    wait "$tcpdump_sudo" 2>/dev/null || true
+    tcpdump_sudo=
+}
+
+remove_neighbour() {
+    stop_tcpdump
+    if $neighbour_feth; then
+        sudo -n route -q delete -host "$foreign_source" >/dev/null 2>&1 || true
+        sudo -n ifconfig feth4451 destroy 2>/dev/null || true
+        sudo -n ifconfig feth4450 destroy 2>/dev/null || true
+        neighbour_feth=false
+    fi
+    if [[ -n "$forwarding_was" ]]; then
+        sudo -n sysctl -q net.inet.ip.forwarding="$forwarding_was" >/dev/null || true
+        forwarding_was=
+    fi
+}
+
 cleanup() {
     remove_foreign_alias
+    remove_neighbour
     if [[ -n "$mount_dir" ]]; then
         # macOS canonicalizes /tmp to /private/tmp in `mount` output, so a
         # textual mount-table check misses the exact mount we just created.
@@ -215,11 +242,61 @@ fi
 info "server runs as uid $server_uids after creating the adapter"
 
 # Nothing but the adapter address is a client. A packet the host forwards
-# from anywhere else has to get no answer at all. A spare local address
-# stands in for that neighbour: Linux routes its SYN into the tunnel just as
-# it would a forwarded one. macOS does not deliver that exchange whether or not
-# the tunnel answers, so there the check could not fail and is skipped.
-if [[ "$platform" != Darwin ]]; then
+# from anywhere else has to get no answer at all.
+if [[ "$platform" == Darwin ]]; then
+    # macOS never sends a locally sourced packet from another address into
+    # the utun, so the neighbour has to be real enough to be forwarded: SYNs
+    # written by BPF onto one end of a peered feth pair arrive on the other,
+    # which this host owns, and with forwarding on it routes them into the
+    # tunnel — link-local destination and all. tcpdump on the utun proves
+    # they got there and that nothing answered.
+    info 'checking that a forwarded neighbour gets no answer'
+    uv_bin=$(command -v uv || echo "$HOME/.local/bin/uv")
+    python=$("$uv_bin" python find --managed-python 3.13) || {
+        echo 'the forwarded-neighbour check needs uv and its Python 3.13 (uv python install 3.13)' >&2
+        exit 1
+    }
+    utun=$(route -n get 169.254.255.1 | awk '/interface:/ {print $2}')
+    [[ "$utun" == utun* ]] || { echo "169.254.255.1 routes via '$utun', not a utun" >&2; exit 1; }
+    forwarding_was=$(sysctl -n net.inet.ip.forwarding)
+    neighbour_feth=true
+    sudo -n ifconfig feth4450 create
+    sudo -n ifconfig feth4451 create
+    sudo -n ifconfig feth4450 peer feth4451
+    sudo -n ifconfig feth4450 up
+    sudo -n ifconfig feth4451 inet 203.0.113.1/24 up
+    # Any reply goes back to the fake neighbour, never onto the real network.
+    sudo -n route -q add -host "$foreign_source" -interface feth4451 >/dev/null
+    sudo -n sysctl -q net.inet.ip.forwarding=1 >/dev/null
+    dump="$work/forwarded.txt"
+    sudo -n tcpdump -n -l -U -i "$utun" 'tcp port 445' >"$dump" 2>"$work/tcpdump.err" &
+    tcpdump_sudo=$!
+    for _ in $(seq 1 100); do
+        grep -q 'listening on' "$work/tcpdump.err" 2>/dev/null && break
+        sleep 0.05
+    done
+    sudo -n "$python" -I ci/unix/inject-syn.py feth4450 \
+        "$(ifconfig feth4450 | awk '/ether/ {print $2}')" \
+        "$(ifconfig feth4451 | awk '/ether/ {print $2}')" \
+        "$foreign_source" 169.254.255.1 445
+    sleep 1.5
+    remove_neighbour
+    arrived=$(grep -c "$foreign_source\.[0-9]* > 169\.254\.255\.1\.445: Flags \[S\]" "$dump" || true)
+    answered=$(grep -c "> $foreign_source\." "$dump" || true)
+    if (( arrived == 0 )); then
+        echo "no forwarded SYN reached $utun, so the check proved nothing" >&2
+        cat "$work/tcpdump.err" "$dump" >&2
+        exit 1
+    fi
+    if (( answered != 0 )); then
+        echo "the tunnel answered a forwarded SYN from $foreign_source" >&2
+        cat "$dump" >&2
+        exit 1
+    fi
+    info "$arrived forwarded SYNs reached $utun and got no answer"
+else
+    # Linux does route a locally sourced packet from a spare address into the
+    # tunnel, which stands in for a forwarded one without enabling forwarding.
     info 'checking that another source address gets no answer'
     sudo -n ip addr add "$foreign_source/32" dev lo
     foreign_alias=lo

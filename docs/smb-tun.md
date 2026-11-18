@@ -128,7 +128,7 @@ The Linux smoke test holds the idle wakeups under 20.
   adapter's `.2`, so the stack drops every packet from any other source before
   it is processed — no reply, not even a reset. Without that, a host with IP
   forwarding on would serve the share to a neighbour that routes `.1` through
-  it.
+  it — see [Forwarded neighbours](#forwarded-neighbours).
 - **No network state persists**, and not only on the tidy path. Dropping the
   share removes the adapter, and with it the address and the routes. A crash or
   a forced kill does the same: see below. The one thing that outlives a share
@@ -159,6 +159,31 @@ So there is no stale-adapter recovery procedure, because there is no stale
 adapter. An adapter that does show up belongs to a *live* process — a hung or
 suspended one still holds its handle. Stop that process and the adapter goes
 with it; there is nothing to remove by hand.
+
+### Forwarded neighbours
+
+Link-local addresses are not supposed to be forwarded (RFC 3927 §2.7), and it is
+tempting to rely on that. macOS does not: with IP forwarding on — which
+Internet Sharing turns on — it forwards a neighbour's SYN for `169.254.255.1`
+into the utun like any other packet. Measured on macOS by a neighbour played
+through a peered `feth` pair, three SYNs from `198.51.100.7` each time:
+
+| Build | Tunnel pair | SYNs into the tunnel | SYN-ACKs back |
+| --- | --- | --- | --- |
+| before the source check | default `169.254.255.1` | 3 | 2 |
+| before the source check | `--smb-tun-ip 192.0.2.1` | 3 | 2 |
+| with it | either | 3 | 0 |
+
+So before the check, a Mac sharing its connection offered the share's login to
+its LAN, default addresses included; a chosen pair outside link-local space
+widens that to anything able to route to it. The share still demanded the
+password, but nothing beyond the machine itself should have been able to ask.
+
+The smoke test repeats the measurement on every macOS run, and fails both when
+the tunnel answers and when no SYN reaches it, so it cannot pass vacuously. On
+Linux it uses a spare loopback address instead, because Linux routes a locally
+sourced packet from it into the tunnel the same way; macOS refuses to, whether
+the alias is on `lo0` or `en0`, which is why it needs the forwarded neighbour.
 
 ## The Windows driver
 
