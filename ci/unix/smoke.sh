@@ -449,7 +449,8 @@ fi
 if [[ "$platform" != Darwin ]]; then
     exec 3<>/dev/tcp/169.254.255.1/445
     sleep 0.5
-    tun_task=$(grep -lx 'smbanything-tun' /proc/"$server_pid"/task/*/comm 2>/dev/null | head -n1)
+    # No match is the case the check below reports, not a reason to exit here.
+    tun_task=$(grep -lx 'smbanything-tun' /proc/"$server_pid"/task/*/comm 2>/dev/null | head -n1 || true)
     tun_task=${tun_task%/comm}
     if [[ -z "$tun_task" ]]; then
         echo 'no smbanything-tun thread in the server' >&2

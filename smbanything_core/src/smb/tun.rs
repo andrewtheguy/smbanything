@@ -183,7 +183,15 @@ impl PlatformTun {
         use std::io::ErrorKind;
 
         match self.device.read(&mut self.buffer) {
-            Ok(0) => Ok(None),
+            // No packet is empty, so a zero-length read is end of file, and
+            // poll(2) would keep reporting the descriptor readable: fatal, as
+            // any other failed read is. (A utun cannot be removed from outside
+            // the process that owns it, nor a Linux tun's descriptor reach
+            // EOF, so this is a guard, not a path either is known to take.)
+            Ok(0) => Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "the adapter closed",
+            )),
             Ok(len) => Ok(Some(self.buffer[..len].to_vec())),
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
                 Ok(None)
