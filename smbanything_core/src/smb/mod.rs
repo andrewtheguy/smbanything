@@ -417,6 +417,17 @@ impl SmbHandle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// What the packet tunnel has to tell the owner, when one fronts this
+    /// server; the default report otherwise. The owner is expected to stop
+    /// the server once `stopped` is set: nothing reaches it any more.
+    pub fn tun_report(&self) -> TunReport {
+        #[cfg(feature = "tun")]
+        if let Some(tun) = &self.tun {
+            return tun.report();
+        }
+        TunReport::default()
+    }
+
     /// Replace the complete contents of the running share.
     ///
     /// Any file and directory handles opened against the previous contents are
@@ -510,6 +521,18 @@ pub const DEFAULT_TUN_ADDRS: TunAddrs = TunAddrs {
 };
 
 /// Client-visible endpoint for [`Bind::Tun`].
+/// What the packet thread reports while it runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TunReport {
+    /// Why the packet thread stopped serving, when the adapter failed under
+    /// it (deleted, or torn down by the system).
+    pub stopped: Option<String>,
+    /// The first IPv4 source other than the adapter's own address that sent
+    /// to the tunnel. Its packets get no answer, which a client on this host
+    /// that picked another source address sees as a connection that hangs.
+    pub ignored_source: Option<std::net::Ipv4Addr>,
+}
+
 #[cfg(feature = "tun")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TunConfig {

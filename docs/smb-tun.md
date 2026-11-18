@@ -114,11 +114,13 @@ The Linux smoke test holds the idle wakeups under 20.
   it, and nothing else does, so on Linux and macOS the process gives root back
   as soon as the adapter exists and the private listener is bound: under sudo
   it switches to `SUDO_UID`/`SUDO_GID` (with that user's supplementary
-  groups) for good before it starts a single server thread, so it never opens
-  an archive or reads a client's byte as root, and stops if it cannot. The
-  banner says so (`Runs as:  uid 1000`). The adapter's file descriptor keeps
-  working, because the kernel checked privilege when it was opened. Run as
-  root without sudo, there is nobody to switch to and it stays root. Windows
+  groups, and its `HOME`, `USER` and `LOGNAME`) for good before it starts a
+  single server thread, so it never opens an archive or reads a client's byte
+  as root, and stops if it cannot. The banner says so (`Runs as:  uid 1000`).
+  The adapter's file descriptor keeps working, because the kernel checked
+  privilege when it was opened. Started as root any other way — a root shell,
+  `doas`, `run0` — there is no user it can be sure to switch to, so it stays
+  root and the banner warns that it does. Windows
   has no cheap equivalent — an elevated token cannot be narrowed back to the
   user's for a running process — so there the whole share runs elevated. No
   existing service, binding or adapter is modified.
@@ -129,7 +131,11 @@ The Linux smoke test holds the idle wakeups under 20.
   adapter's `.2`, so the stack drops every packet from any other source before
   it is processed — no reply, not even a reset. Without that, a host with IP
   forwarding on would serve the share to a neighbour that routes `.1` through
-  it — see [Forwarded neighbours](#forwarded-neighbours).
+  it — see [Forwarded neighbours](#forwarded-neighbours). A client on this
+  machine that picks another source address is dropped the same way and hangs
+  until it times out, so the first ignored source is shown as a warning:
+  on stderr when serving an archive from the command line, in the server box
+  in the UI.
 - **No network state persists**, and not only on the tidy path. Dropping the
   share removes the adapter, and with it the address and the routes. A crash or
   a forced kill does the same: see below. The one thing that outlives a share
@@ -155,6 +161,12 @@ including the explicitly added `169.254.255.1/32`, because a route created
 against an interface LUID is owned by that interface. The same holds for a
 failure part-way through startup: if address assignment fails after the adapter
 exists, the error path drops the adapter and the address goes with it.
+
+An adapter removed under a running share — `ip link del`, or the system
+tearing down the utun or the Wintun session — fails every read from then on.
+The packet thread stops on the first such error rather than retrying, and the
+process exits saying why (`the packet tunnel stopped: ...`): nothing can reach
+the share without its adapter.
 
 So there is no stale-adapter recovery procedure, because there is no stale
 adapter. An adapter that does show up belongs to a *live* process — a hung or
@@ -197,6 +209,15 @@ search order never picks up another copy. The Wintun *Prebuilt Binaries
 License* §3(d) permits redistribution alongside software that uses it only
 through the documented API, which is all `tun.rs` does; `vendor/wintun/LICENSE.txt`
 is the copy that governs it.
+
+The DLL is not verified before it is loaded, so whoever can write the folder
+it sits in can run code in the elevated process. The MSI's folder under
+`Program Files` is writable only by administrators. smbanything is meant to be
+portable too — copy `smbanything.exe` and `wintun-amd64.dll` anywhere and run
+them — but for `--smb-tun` keep that copy in a folder only administrators can
+write, never Downloads, the desktop or another folder of your own: anything
+running as you could put its own `wintun-amd64.dll` there and have it run as
+administrator the next time you start a tunnel.
 
 ### Provenance
 

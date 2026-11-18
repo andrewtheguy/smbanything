@@ -12,27 +12,44 @@
 //! narrowed back to the user's for a running process, so an elevated share
 //! stays elevated there.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString, OsStr};
+use std::os::unix::ffi::OsStrExt;
 
 use anyhow::{Context, Result, bail};
 
-/// If this is root by way of sudo, become the invoking user for good and
-/// return their uid. Otherwise change nothing: a process that is not root has
-/// nothing to drop, and one that is root without sudo has nobody to drop to.
-pub(crate) fn drop_root() -> Result<Option<u32>> {
+use crate::connection::RunsAs;
+
+/// If this is root by way of sudo, become the invoking user for good, with
+/// their HOME, USER and LOGNAME, and say so. Otherwise change nothing: a
+/// process that is not root has nothing to drop, and one that is root without
+/// sudo has nobody to drop to.
+pub(crate) fn drop_root() -> Result<RunsAs> {
     // SAFETY: no preconditions.
     if unsafe { libc::geteuid() } != 0 {
-        return Ok(None);
+        return Ok(RunsAs::Starter);
     }
     let Some(uid) = id_from_env("SUDO_UID")? else {
-        return Ok(None);
+        return Ok(RunsAs::Root);
     };
     if uid == 0 {
-        return Ok(None);
+        return Ok(RunsAs::Root);
     }
     let gid = id_from_env("SUDO_GID")?.context("sudo set SUDO_UID but not SUDO_GID")?;
-    let user = std::env::var("SUDO_USER").context("sudo set SUDO_UID but not SUDO_USER")?;
-    let user = CString::new(user).context("SUDO_USER contains a NUL byte")?;
+    let name = std::env::var("SUDO_USER").context("sudo set SUDO_UID but not SUDO_USER")?;
+    let user = CString::new(name.clone()).context("SUDO_USER contains a NUL byte")?;
+    // sudo leaves HOME naming root's home (Debian and Ubuntu set HOME=/root),
+    // so `~` would still mean /root once the process is the user.
+    // SAFETY: `user` is a valid C string; the entry is copied out before any
+    // other passwd lookup can overwrite it.
+    let home = unsafe {
+        let entry = libc::getpwnam(user.as_ptr());
+        if entry.is_null() || (*entry).pw_dir.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr((*entry).pw_dir).to_owned())
+        }
+    }
+    .with_context(|| format!("{name} has no home directory in the user database"))?;
 
     // Supplementary groups, then the group, then the user: each step gives up
     // the right to take the ones before it. No server thread exists yet, and
@@ -58,7 +75,14 @@ pub(crate) fn drop_root() -> Result<Option<u32>> {
     if unsafe { libc::setuid(0) } == 0 {
         bail!("root could be regained after switching to user {uid}");
     }
-    Ok(Some(uid))
+    // SAFETY: no other thread exists yet (smb::bind starts none), so nothing
+    // reads the environment while it changes.
+    unsafe {
+        std::env::set_var("HOME", OsStr::from_bytes(home.to_bytes()));
+        std::env::set_var("USER", &name);
+        std::env::set_var("LOGNAME", &name);
+    }
+    Ok(RunsAs::DroppedTo(uid))
 }
 
 fn id_from_env(name: &str) -> Result<Option<u32>> {

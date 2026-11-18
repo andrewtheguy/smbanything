@@ -46,6 +46,8 @@ struct App {
     /// Lines the details panel could not show at the last draw, so scrolling
     /// stops at the end of the text instead of running past it.
     scroll_max: u16,
+    /// The first source the packet tunnel ignored, once one has sent to it.
+    ignored_source: Option<std::net::Ipv4Addr>,
 }
 
 struct Notice {
@@ -74,6 +76,7 @@ pub(crate) fn run(
         notice: None,
         scroll: 0,
         scroll_max: 0,
+        ignored_source: None,
     };
     // Opening an archive indexes the whole of it, which on a large one takes
     // long enough to freeze the UI. A worker does it and hands the result
@@ -94,6 +97,11 @@ pub(crate) fn run(
                 handle.failed_logons()
             );
         }
+        let report = handle.tun_report();
+        if let Some(reason) = report.stopped {
+            bail!("the packet tunnel stopped: {reason}");
+        }
+        app.ignored_source = report.ignored_source;
 
         if let Some(rx) = &opening {
             match rx.try_recv() {
@@ -319,7 +327,7 @@ fn render(frame: &mut Frame, app: &mut App, server: &ServerView) {
     // wrapping included, so the mount commands or the picker get every row
     // the terminal can spare.
     let width = frame.area().width.saturating_sub(2);
-    let server_lines = server_lines(server);
+    let server_lines = server_lines(server, app.ignored_source);
     let contents_lines = contents_lines(app);
     let notice_lines = app.notice.as_ref().map_or(0, |notice| {
         wrapped_rows(&notice.text, width + 2).min(3)
@@ -375,7 +383,10 @@ fn render_block(frame: &mut Frame, lines: Vec<Line>, title: &str, area: Rect) {
     );
 }
 
-fn server_lines(server: &ServerView) -> Vec<Line<'static>> {
+fn server_lines(
+    server: &ServerView,
+    ignored_source: Option<std::net::Ipv4Addr>,
+) -> Vec<Line<'static>> {
     // No path here: the listener is what this box reports, and every path a
     // client can actually use is in the mount commands below, spelled the way
     // its own platform wants it. A headline UNC would be wrong on any port but
@@ -405,6 +416,12 @@ fn server_lines(server: &ServerView) -> Vec<Line<'static>> {
             addrs.virtual_ip(),
             addrs.adapter_ip()
         )));
+        if let Some(source) = ignored_source {
+            lines.push(detail_line(connection::ignored_source_line(addrs, source)));
+        }
+    }
+    if let Some(runs_as) = server.runs_as.line() {
+        lines.push(detail_line(runs_as));
     }
     if server.bind_all {
         lines.push(Line::styled(
@@ -446,18 +463,20 @@ fn contents_lines(app: &App) -> Vec<Line<'static>> {
 
 /// The per-OS mount commands. They rarely fit, so the panel scrolls and says
 /// how much is left below.
+fn detail_line(detail: connection::DetailLine) -> Line<'static> {
+    let style = match detail.kind {
+        Kind::Heading => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Kind::Command => Style::default().fg(Color::White),
+        Kind::Note => Style::default().fg(Color::Gray),
+        Kind::Warning => Style::default().fg(Color::Yellow),
+    };
+    Line::styled(detail.text, style)
+}
+
 fn render_details(frame: &mut Frame, app: &mut App, server: &ServerView, area: Rect) {
     let lines: Vec<Line> = connection::details(server)
         .into_iter()
-        .map(|detail| {
-            let style = match detail.kind {
-                Kind::Heading => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                Kind::Command => Style::default().fg(Color::White),
-                Kind::Note => Style::default().fg(Color::Gray),
-                Kind::Warning => Style::default().fg(Color::Yellow),
-            };
-            Line::styled(detail.text, style)
-        })
+        .map(detail_line)
         .collect();
 
     let inner_height = area.height.saturating_sub(2);
@@ -677,11 +696,12 @@ mod tests {
             bind_all: false,
             standard_port,
             tun: None,
+            runs_as: connection::RunsAs::Starter,
         }
     }
 
     fn text(server: &ServerView) -> String {
-        server_lines(server)
+        server_lines(server, None)
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
@@ -697,6 +717,35 @@ mod tests {
         // per-platform paths belong in the mount commands regardless.
         assert!(!text.contains(r"\\127.0.0.1"), "no path belongs here:\n{text}");
         assert!(!text.contains("//127.0.0.1"), "no path belongs here:\n{text}");
+    }
+
+    #[test]
+    fn the_server_box_names_a_source_the_tunnel_ignored() {
+        let mut server = view(445, true);
+        let source = std::net::Ipv4Addr::new(192, 0, 2, 9);
+        // Only a tunnel ignores sources; without one there is nothing to say.
+        assert!(!text(&server).contains("Ignored:"));
+        server.tun = Some(smb::DEFAULT_TUN_ADDRS);
+        let lines = server_lines(&server, Some(source))
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            lines.contains("Ignored:  packets from 192.0.2.9 get no answer; only 169.254.255.2"),
+            "{lines}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_server_box_says_who_it_runs_as() {
+        let mut server = view(445, true);
+        assert!(!text(&server).contains("Runs as:"));
+        server.runs_as = connection::RunsAs::DroppedTo(1000);
+        assert!(text(&server).contains("Runs as:  uid 1000"));
+        server.runs_as = connection::RunsAs::Root;
+        assert!(text(&server).contains("Runs as:  root."));
     }
 
     #[test]

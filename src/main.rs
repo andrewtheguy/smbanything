@@ -104,9 +104,9 @@ fn main() -> Result<()> {
     // nothing that parses client or archive input ever runs as root, and a
     // failure to give it up exits before anyone is served.
     #[cfg(unix)]
-    let dropped_to = privilege::drop_root()?;
+    let runs_as = privilege::drop_root()?;
     #[cfg(not(unix))]
-    let dropped_to = None;
+    let runs_as = connection::RunsAs::Starter;
     let handle = bound.start()?;
     // The share is never empty: a README says what is loaded and how the
     // share behaves, so a client that mounts early sees a working server.
@@ -134,6 +134,7 @@ fn main() -> Result<()> {
         bind_all: args.bind_all,
         standard_port: handle.on_standard_port(),
         tun: args.smb_tun.then_some(args.smb_tun_ip),
+        runs_as,
     };
 
     // The termination handler only wakes the loop below. Cleanup remains on
@@ -145,7 +146,7 @@ fn main() -> Result<()> {
     })?;
 
     let result = match args.archive {
-        Some(archive) => serve(&handle, &server, dropped_to, &archive, &stop_rx),
+        Some(archive) => serve(&handle, &server, &archive, &stop_rx),
         None => browse(&handle, &server, stop_rx),
     };
     handle.stop();
@@ -158,7 +159,6 @@ fn main() -> Result<()> {
 fn serve(
     handle: &smb::SmbHandle,
     server: &ServerView,
-    dropped_to: Option<u32>,
     archive: &Path,
     stop_rx: &mpsc::Receiver<()>,
 ) -> Result<()> {
@@ -196,8 +196,8 @@ fn serve(
             addrs.adapter_ip()
         );
     }
-    if let Some(uid) = dropped_to {
-        println!("Runs as:  uid {uid}; root was needed only to start the server");
+    if let Some(runs_as) = server.runs_as.line() {
+        println!("{}", runs_as.text);
     }
     if server.bind_all {
         println!("Warning:  file data is signed but not encrypted and is visible in transit.");
@@ -223,6 +223,7 @@ fn serve(
     println!();
     println!("Press Ctrl-C to stop.");
 
+    let mut warned_ignored = false;
     loop {
         match stop_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
@@ -233,6 +234,16 @@ fn serve(
                 );
             }
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        let report = handle.tun_report();
+        if let Some(reason) = report.stopped {
+            bail!("the packet tunnel stopped: {reason}");
+        }
+        if let (Some(source), Some(addrs)) = (report.ignored_source, server.tun)
+            && !warned_ignored
+        {
+            eprintln!("{}", connection::ignored_source_line(addrs, source).text);
+            warned_ignored = true;
         }
     }
     Ok(())

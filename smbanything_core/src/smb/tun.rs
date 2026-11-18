@@ -9,8 +9,8 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant as StdInstant;
 
@@ -23,7 +23,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 
-use super::TunAddrs;
+use super::{TunAddrs, TunReport};
 
 #[cfg(windows)]
 const ADAPTER_NAME: &str = "smbanything";
@@ -78,17 +78,22 @@ impl TunAdapter {
         } = self;
         let (poller, waker) = Poller::new()?;
         let shutdown = Arc::new(AtomicBool::new(false));
+        let report = Arc::new(Mutex::new(TunReport::default()));
         let join = {
             let shutdown = shutdown.clone();
+            let report = report.clone();
             std::thread::Builder::new()
                 .name(format!("smbanything-tun-{port}"))
-                .spawn(move || poll_loop(device, poller, addrs, port, forward_to, shutdown))
+                .spawn(move || {
+                    poll_loop(device, poller, addrs, port, forward_to, shutdown, report)
+                })
                 .map_err(|e| anyhow!("spawning the packet-tunnel thread: {e}"))?
         };
 
         Ok(TunShare {
             shutdown,
             waker,
+            report,
             join: Some(join),
         })
     }
@@ -98,7 +103,14 @@ impl TunAdapter {
 pub(super) struct TunShare {
     shutdown: Arc<AtomicBool>,
     waker: Waker,
+    report: Arc<Mutex<TunReport>>,
     join: Option<JoinHandle<()>>,
+}
+
+impl TunShare {
+    pub(super) fn report(&self) -> TunReport {
+        self.report.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 impl Drop for TunShare {
@@ -134,6 +146,8 @@ fn wait_millis(timeout: Duration) -> u64 {
 #[cfg(unix)]
 struct PlatformTun {
     device: tun::Device,
+    /// Reused for every read; a packet is copied out only once one arrives.
+    buffer: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -157,22 +171,24 @@ impl PlatformTun {
         device
             .set_nonblock()
             .context("making the native TUN interface nonblocking")?;
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            buffer: vec![0; MTU],
+        })
     }
 
-    fn receive(&mut self) -> Option<Vec<u8>> {
-        let mut packet = vec![0; MTU];
-        match self.device.read(&mut packet) {
-            Ok(0) => None,
-            Ok(len) => {
-                packet.truncate(len);
-                Some(packet)
+    /// The next packet, `None` once the queue is empty, or the error that
+    /// means the adapter is gone.
+    fn receive(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::ErrorKind;
+
+        match self.device.read(&mut self.buffer) {
+            Ok(0) => Ok(None),
+            Ok(len) => Ok(Some(self.buffer[..len].to_vec())),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                Ok(None)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-            Err(error) => {
-                smb_log!("tun: packet receive failed: {error}");
-                None
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -384,14 +400,12 @@ mod windows {
             })
         }
 
-        pub(super) fn receive(&mut self) -> Option<Vec<u8>> {
+        /// The next packet, `None` once the ring is empty, or the error that
+        /// means the session is gone.
+        pub(super) fn receive(&mut self) -> std::io::Result<Option<Vec<u8>>> {
             match self.session.try_receive() {
-                Ok(Some(packet)) => Some(packet.bytes().to_vec()),
-                Ok(None) => None,
-                Err(error) => {
-                    smb_log!("tun: packet receive failed: {error}");
-                    None
-                }
+                Ok(packet) => Ok(packet.map(|packet| packet.bytes().to_vec())),
+                Err(error) => Err(std::io::Error::other(error.to_string())),
             }
         }
 
@@ -704,6 +718,9 @@ struct SmolDevice {
     peer: Ipv4Addr,
     ignored_any: bool,
     shutdown: Arc<AtomicBool>,
+    report: Arc<Mutex<TunReport>>,
+    /// Set by a receive that failed for good; the loop stops on it.
+    failed: Option<std::io::Error>,
 }
 
 struct PacketRx {
@@ -747,7 +764,13 @@ impl Device for SmolDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         loop {
-            let packet = self.io.receive()?;
+            let packet = match self.io.receive() {
+                Ok(packet) => packet?,
+                Err(error) => {
+                    self.failed = Some(error);
+                    return None;
+                }
+            };
             if sent_by(&packet, self.peer) {
                 return Some((PacketRx { packet }, PacketTx { io: &mut self.io }));
             }
@@ -760,6 +783,10 @@ impl Device for SmolDevice {
                     "tun: ignoring IPv4 packets not sent from {}, the first from {source}",
                     self.peer
                 );
+                self.report
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .ignored_source = Some(source);
             }
             // Ignored packets arriving as fast as they are read would keep
             // this loop, and so the packet thread, from ever seeing shutdown.
@@ -800,13 +827,13 @@ impl Bridge {
     }
 
     /// The loopback side has something to read that the bridge has room for.
-    #[cfg(unix)]
+    /// `pump` reads while this holds, and the Unix wait polls for it.
     fn wants_upstream_read(&self) -> bool {
         !self.upstream_eof && self.to_client.len() < PROXY_HIGH_WATER
     }
 
     /// Bytes from the client are waiting for the loopback side to take them.
-    #[cfg(unix)]
+    /// `pump` writes while this holds, and the Unix wait polls for it.
     fn wants_upstream_write(&self) -> bool {
         !self.to_upstream.is_empty() && !self.upstream_write_closed
     }
@@ -826,12 +853,15 @@ fn poll_loop(
     port: u16,
     forward_to: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    report: Arc<Mutex<TunReport>>,
 ) {
     let mut device = SmolDevice {
         io: device,
         peer: addrs.adapter_ip(),
         ignored_any: false,
         shutdown: shutdown.clone(),
+        report: report.clone(),
+        failed: None,
     };
     let started = StdInstant::now();
     let now = || Instant::from_micros(started.elapsed().as_micros() as i64);
@@ -871,6 +901,15 @@ fn poll_loop(
     // socket, the shutdown waker or smoltcp's next timer needs it.
     while !shutdown.load(Ordering::Relaxed) {
         interface.poll(now(), &mut device, &mut sockets);
+        // An adapter deleted or torn down under the process fails every read
+        // from then on, and its descriptor stays ready: carrying on would
+        // spin. Nothing will reach the share again, so stop and say why.
+        if let Some(error) = device.failed.take() {
+            smb_log!("tun: the adapter failed, stopping: {error}");
+            report.lock().unwrap_or_else(|e| e.into_inner()).stopped =
+                Some(format!("reading from the adapter failed: {error}"));
+            break;
+        }
 
         let mut did_work = false;
         for bridge in &mut bridges {
@@ -931,7 +970,9 @@ fn pump(
         }
     }
 
-    let Some(upstream) = bridge.upstream.as_mut() else {
+    // Shared, not mutable: `&TcpStream` reads and writes too, and the bridge
+    // stays borrowable for the `wants_upstream_*` conditions below.
+    let Some(mut upstream) = bridge.upstream.as_ref() else {
         return match socket.state() {
             // Waiting for a client, or mid-handshake: nothing to bridge yet.
             tcp::State::Listen | tcp::State::SynReceived => did_work,
@@ -961,7 +1002,7 @@ fn pump(
             Err(_) => break,
         }
     }
-    while !bridge.to_upstream.is_empty() {
+    while bridge.wants_upstream_write() {
         let (head, _) = bridge.to_upstream.as_slices();
         match upstream.write(head) {
             Ok(0) => break,
@@ -978,7 +1019,7 @@ fn pump(
         }
     }
 
-    while !bridge.upstream_eof && bridge.to_client.len() < PROXY_HIGH_WATER {
+    while bridge.wants_upstream_read() {
         let mut buffer = [0; 16 * 1024];
         match upstream.read(&mut buffer) {
             Ok(0) => {
