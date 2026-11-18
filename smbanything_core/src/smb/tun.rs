@@ -9,10 +9,10 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Instant as StdInstant;
 
 use anyhow::{Result, anyhow};
 #[cfg(unix)]
@@ -20,27 +20,32 @@ use anyhow::Context as _;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 
-use super::TunAddrs;
+use super::{TunAddrs, TunReport};
 
 #[cfg(windows)]
 const ADAPTER_NAME: &str = "smbanything";
+/// The link MTU, set explicitly on the adapter on every platform so that the
+/// host and smoltcp agree on it. Wintun would otherwise default to 65535.
 const MTU: usize = 1500;
 const MAX_CONNS: usize = 8;
 const SOCKET_BUF: usize = 256 * 1024;
 const PROXY_HIGH_WATER: usize = 512 * 1024;
 
-/// A running packet-tunnel front end for the private SMB listener.
-pub(super) struct TunShare {
-    virtual_ip: Ipv4Addr,
-    shutdown: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+/// A packet-tunnel adapter that is up and routed, but whose packets nothing
+/// reads yet: whatever arrives waits in the adapter's queue until
+/// [`TunAdapter::start`]. Dropping it removes the adapter.
+pub(super) struct TunAdapter {
+    device: PlatformTun,
+    addrs: TunAddrs,
+    port: u16,
+    forward_to: SocketAddr,
 }
 
-impl TunShare {
-    pub(super) fn start(port: u16, forward_to: SocketAddr, addrs: TunAddrs) -> Result<Self> {
+impl TunAdapter {
+    pub(super) fn create(port: u16, forward_to: SocketAddr, addrs: TunAddrs) -> Result<Self> {
         if port == 0 {
             return Err(anyhow!("the packet tunnel needs a fixed client-visible port"));
         }
@@ -51,33 +56,67 @@ impl TunShare {
             addrs.adapter_ip(),
             addrs.virtual_ip()
         );
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let join = {
-            let shutdown = shutdown.clone();
-            std::thread::Builder::new()
-                .name(format!("smbanything-tun-{port}"))
-                .spawn(move || {
-                    poll_loop(device, addrs.virtual_ip(), port, forward_to, shutdown)
-                })
-                .map_err(|e| anyhow!("spawning the packet-tunnel thread: {e}"))?
-        };
-
         Ok(Self {
-            virtual_ip: addrs.virtual_ip(),
-            shutdown,
-            join: Some(join),
+            device,
+            addrs,
+            port,
+            forward_to,
         })
     }
 
     pub(super) fn virtual_ip(&self) -> Ipv4Addr {
-        self.virtual_ip
+        self.addrs.virtual_ip()
+    }
+
+    /// Start answering clients on the adapter's packet thread.
+    pub(super) fn start(self) -> Result<TunShare> {
+        let Self {
+            device,
+            addrs,
+            port,
+            forward_to,
+        } = self;
+        let (poller, waker) = Poller::new()?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let report = Arc::new(Mutex::new(TunReport::default()));
+        let join = {
+            let shutdown = shutdown.clone();
+            let report = report.clone();
+            std::thread::Builder::new()
+                .name(format!("smbanything-tun-{port}"))
+                .spawn(move || {
+                    poll_loop(device, poller, addrs, port, forward_to, shutdown, report)
+                })
+                .map_err(|e| anyhow!("spawning the packet-tunnel thread: {e}"))?
+        };
+
+        Ok(TunShare {
+            shutdown,
+            waker,
+            report,
+            join: Some(join),
+        })
+    }
+}
+
+/// A running packet-tunnel front end for the private SMB listener.
+pub(super) struct TunShare {
+    shutdown: Arc<AtomicBool>,
+    waker: Waker,
+    report: Arc<Mutex<TunReport>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl TunShare {
+    pub(super) fn report(&self) -> TunReport {
+        self.report.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
 impl Drop for TunShare {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.waker.wake();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -94,12 +133,21 @@ fn adapter_hint(error: anyhow::Error) -> anyhow::Error {
     anyhow!("starting the SMB packet tunnel: {error}\n\n{privilege}")
 }
 
+/// Round a smoltcp timer up to whole milliseconds, the unit both platform
+/// waits take. Rounding down would wake just before the timer is due and spin
+/// until it is.
+fn wait_millis(timeout: Duration) -> u64 {
+    timeout.total_micros().div_ceil(1000)
+}
+
 // Linux and macOS both expose their native packet adapter as a file
 // descriptor. `tun` performs the platform ioctls and normalizes macOS's
 // four-byte utun packet header away, leaving raw IP packets here.
 #[cfg(unix)]
 struct PlatformTun {
     device: tun::Device,
+    /// Reused for every read; a packet is copied out only once one arrives.
+    buffer: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -123,22 +171,32 @@ impl PlatformTun {
         device
             .set_nonblock()
             .context("making the native TUN interface nonblocking")?;
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            buffer: vec![0; MTU],
+        })
     }
 
-    fn receive(&mut self) -> Option<Vec<u8>> {
-        let mut packet = vec![0; MTU];
-        match self.device.read(&mut packet) {
-            Ok(0) => None,
-            Ok(len) => {
-                packet.truncate(len);
-                Some(packet)
+    /// The next packet, `None` once the queue is empty, or the error that
+    /// means the adapter is gone.
+    fn receive(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::ErrorKind;
+
+        match self.device.read(&mut self.buffer) {
+            // No packet is empty, so a zero-length read is end of file, and
+            // poll(2) would keep reporting the descriptor readable: fatal, as
+            // any other failed read is. (A utun cannot be removed from outside
+            // the process that owns it, nor a Linux tun's descriptor reach
+            // EOF, so this is a guard, not a path either is known to take.)
+            Ok(0) => Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "the adapter closed",
+            )),
+            Ok(len) => Ok(Some(self.buffer[..len].to_vec())),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                Ok(None)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-            Err(error) => {
-                smb_log!("tun: packet receive failed: {error}");
-                None
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -153,6 +211,99 @@ impl PlatformTun {
                 smb_log!("tun: transmit queue full; dropping one packet")
             }
             Err(error) => smb_log!("tun: packet send failed: {error}"),
+        }
+    }
+}
+
+/// Wakes the packet thread out of its wait, so that stopping the share does
+/// not have to wait for the next packet or timer.
+#[cfg(unix)]
+struct Waker(std::os::unix::net::UnixStream);
+
+#[cfg(unix)]
+impl Waker {
+    fn wake(&self) {
+        let _ = (&self.0).write(&[0]);
+    }
+}
+
+/// What the packet thread sleeps on between rounds: the adapter, the loopback
+/// bridges, the shutdown waker, and smoltcp's next timer, all in one poll(2).
+#[cfg(unix)]
+struct Poller {
+    wake: std::os::unix::net::UnixStream,
+    fds: Vec<libc::pollfd>,
+}
+
+#[cfg(unix)]
+impl Poller {
+    fn new() -> Result<(Self, Waker)> {
+        let (wake, waker) = std::os::unix::net::UnixStream::pair()
+            .context("creating the packet-tunnel waker")?;
+        waker
+            .set_nonblocking(true)
+            .context("making the packet-tunnel waker nonblocking")?;
+        Ok((
+            Self {
+                wake,
+                fds: Vec::with_capacity(2 + MAX_CONNS),
+            },
+            Waker(waker),
+        ))
+    }
+
+    /// poll(2) is level-triggered and takes its interest list on every call,
+    /// so a new bridge needs no registration.
+    fn register(&self, _stream: &TcpStream) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn wait(&mut self, device: &PlatformTun, bridges: &[Bridge], timeout: Option<Duration>) {
+        use std::os::fd::AsRawFd;
+
+        let pollfd = |fd, events| libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        self.fds.clear();
+        self.fds.push(pollfd(self.wake.as_raw_fd(), libc::POLLIN));
+        self.fds.push(pollfd(device.device.as_raw_fd(), libc::POLLIN));
+        for bridge in bridges {
+            let Some(upstream) = &bridge.upstream else {
+                continue;
+            };
+            let mut events = 0;
+            if bridge.wants_upstream_read() {
+                events |= libc::POLLIN;
+            }
+            if bridge.wants_upstream_write() {
+                events |= libc::POLLOUT;
+            }
+            // A socket with no interest is left out entirely: poll(2) reports
+            // a hung-up one regardless of `events`, and that would spin.
+            if events != 0 {
+                self.fds.push(pollfd(upstream.as_raw_fd(), events));
+            }
+        }
+        let timeout = timeout.map_or(-1, |timeout| {
+            i32::try_from(wait_millis(timeout)).unwrap_or(i32::MAX)
+        });
+        // SAFETY: `fds` is a live, initialized array of `fds.len()` pollfds.
+        let ready = unsafe {
+            libc::poll(
+                self.fds.as_mut_ptr(),
+                self.fds.len() as libc::nfds_t,
+                timeout,
+            )
+        };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                smb_log!("tun: poll failed: {error}");
+                // Never spin on a wait that keeps failing.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
     }
 }
@@ -202,39 +353,37 @@ fn reject_unix_addresses_in_use(addrs: TunAddrs) -> Result<()> {
     Ok(())
 }
 
-// Windows has no native TUN API. Keep the Wintun-specific setup and route
-// calls here; the packet stack and proxy below are identical on every OS.
+// Windows has no native TUN API. Keep the Wintun-specific setup, route and
+// wait calls here; the packet stack and proxy below are identical on every OS.
 #[cfg(windows)]
 mod windows {
-    use std::path::{Path, PathBuf};
+    use std::net::TcpStream;
+    use std::sync::Arc;
 
     use anyhow::{Result, anyhow};
+    use windows_sys::Win32::Networking::WinSock::{
+        WSACloseEvent, WSACreateEvent, WSAEVENT, WSAResetEvent, WSASetEvent,
+    };
 
-    use super::{ADAPTER_NAME, Ipv4Addr, TunAddrs};
+    use super::{ADAPTER_NAME, Bridge, Duration, Ipv4Addr, MTU, TunAddrs, wait_millis};
 
     const TUNNEL_TYPE: &str = "smbanything archive share";
     const ADAPTER_GUID: u128 = 0xa7e1_6f81_6465_40c9_8e28_4a90_91db_43fc;
     const WINTUN_DLL_NAME: &str = "wintun-amd64.dll";
-    const WINTUN_DLL_SHA256: [u8; 32] = [
-        0xe5, 0xda, 0x84, 0x47, 0xdc, 0x2c, 0x32, 0x0e, 0xdc, 0x0f, 0xc5, 0x2f, 0xa0, 0x18,
-        0x85, 0xc1, 0x03, 0xde, 0x8c, 0x11, 0x84, 0x81, 0xf6, 0x83, 0x64, 0x3c, 0xac, 0xc3,
-        0x22, 0x0d, 0xaf, 0xce,
-    ];
 
     pub(super) struct PlatformTun {
+        /// The session's read-wait event, owned by `session`. Wintun signals
+        /// it when packets arrive in a ring that a receive found empty.
+        read_event: isize,
         // Field order matters: the session must close before its adapter.
-        session: std::sync::Arc<wintun::Session>,
-        _adapter: std::sync::Arc<wintun::Adapter>,
+        session: Arc<wintun::Session>,
+        _adapter: Arc<wintun::Adapter>,
     }
 
     impl PlatformTun {
         pub(super) fn create(addrs: TunAddrs) -> Result<Self> {
             reject_addresses_in_use(addrs)?;
-            let dll = locate_dll()?;
-            // SAFETY: only the DLL with the pinned digest is passed to the
-            // loader. The Windows installer places that file beside the binary.
-            let wintun = unsafe { wintun::load_from_path(&dll) }
-                .map_err(|e| anyhow!("loading {}: {e}", dll.display()))?;
+            let wintun = load_dll()?;
             let adapter = wintun::Adapter::create(
                 &wintun,
                 ADAPTER_NAME,
@@ -243,25 +392,28 @@ mod windows {
             )
             .map_err(|e| anyhow!("creating the `{ADAPTER_NAME}` Wintun adapter: {e}"))?;
             let luid = unsafe { adapter.get_luid().Value };
+            set_mtu(luid, MTU as u32)?;
             assign_address(luid, addrs.adapter_ip())?;
             add_virtual_route(luid, addrs.virtual_ip())?;
             let session = adapter
                 .start_session(wintun::MAX_RING_CAPACITY)
                 .map_err(|e| anyhow!("starting the Wintun session: {e}"))?;
+            let read_event = session
+                .get_read_wait_event()
+                .map_err(|e| anyhow!("getting the Wintun read event: {e}"))?;
             Ok(Self {
-                session: std::sync::Arc::new(session),
+                read_event,
+                session: Arc::new(session),
                 _adapter: adapter,
             })
         }
 
-        pub(super) fn receive(&mut self) -> Option<Vec<u8>> {
+        /// The next packet, `None` once the ring is empty, or the error that
+        /// means the session is gone.
+        pub(super) fn receive(&mut self) -> std::io::Result<Option<Vec<u8>>> {
             match self.session.try_receive() {
-                Ok(Some(packet)) => Some(packet.bytes().to_vec()),
-                Ok(None) => None,
-                Err(error) => {
-                    smb_log!("tun: packet receive failed: {error}");
-                    None
-                }
+                Ok(packet) => Ok(packet.map(|packet| packet.bytes().to_vec())),
+                Err(error) => Err(std::io::Error::other(error.to_string())),
             }
         }
 
@@ -276,34 +428,151 @@ mod windows {
         }
     }
 
-    fn locate_dll() -> Result<PathBuf> {
+    /// A Winsock event object: manual-reset, and waitable alongside Wintun's
+    /// read event in one call.
+    struct Event(WSAEVENT);
+
+    // SAFETY: an event handle may be signalled, reset and waited on from any
+    // thread; the wrapper only closes it once, on drop.
+    unsafe impl Send for Event {}
+    unsafe impl Sync for Event {}
+
+    impl Event {
+        fn new() -> Result<Self> {
+            // SAFETY: no arguments; failure is reported as WSA_INVALID_EVENT.
+            let event = unsafe { WSACreateEvent() };
+            if event == 0 {
+                return Err(anyhow!(
+                    "creating a packet-tunnel event: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self(event))
+        }
+    }
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            // SAFETY: the handle is valid and closed exactly once.
+            unsafe { WSACloseEvent(self.0) };
+        }
+    }
+
+    /// Wakes the packet thread out of its wait, so that stopping the share
+    /// does not have to wait for the next packet or timer.
+    pub(super) struct Waker(Arc<Event>);
+
+    impl Waker {
+        pub(super) fn wake(&self) {
+            // SAFETY: the event outlives this call through the Arc.
+            unsafe { WSASetEvent(self.0.0) };
+        }
+    }
+
+    /// What the packet thread sleeps on between rounds: the shutdown event,
+    /// one event shared by every loopback bridge socket, Wintun's read event,
+    /// and smoltcp's next timer, all in one WaitForMultipleObjects.
+    pub(super) struct Poller {
+        wake: Arc<Event>,
+        upstream: Event,
+    }
+
+    impl Poller {
+        pub(super) fn new() -> Result<(Self, Waker)> {
+            let wake = Arc::new(Event::new()?);
+            let poller = Self {
+                wake: wake.clone(),
+                upstream: Event::new()?,
+            };
+            Ok((poller, Waker(wake)))
+        }
+
+        /// Signal the shared upstream event whenever `stream` becomes readable,
+        /// writable or closed. Winsock re-arms each of those only after the
+        /// matching call would block, which is exactly when the bridge stops
+        /// pumping, so nothing is missed between two waits.
+        pub(super) fn register(&self, stream: &TcpStream) -> std::io::Result<()> {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{
+                FD_CLOSE, FD_READ, FD_WRITE, SOCKET, WSAEventSelect, WSAGetLastError,
+            };
+
+            // SAFETY: the socket and the event are both live handles.
+            let status = unsafe {
+                WSAEventSelect(
+                    stream.as_raw_socket() as SOCKET,
+                    self.upstream.0,
+                    (FD_READ | FD_WRITE | FD_CLOSE) as i32,
+                )
+            };
+            if status != 0 {
+                // SAFETY: reads this thread's last Winsock error.
+                return Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+            }
+            Ok(())
+        }
+
+        /// Wintun's documented receive pattern: wait on the read event only
+        /// once a receive has found the ring empty. smoltcp's `poll` drains the
+        /// device before returning, and nothing reads it between that and
+        /// this wait.
+        pub(super) fn wait(
+            &mut self,
+            device: &PlatformTun,
+            _bridges: &[Bridge],
+            timeout: Option<Duration>,
+        ) {
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Networking::WinSock::{
+                WSA_INFINITE, WSA_WAIT_FAILED, WSAWaitForMultipleEvents,
+            };
+
+            let handles: [HANDLE; 3] = [
+                self.wake.0 as HANDLE,
+                self.upstream.0 as HANDLE,
+                device.read_event as HANDLE,
+            ];
+            let timeout = timeout.map_or(WSA_INFINITE, |timeout| {
+                u32::try_from(wait_millis(timeout)).map_or(WSA_INFINITE - 1, |ms| {
+                    ms.min(WSA_INFINITE - 1)
+                })
+            });
+            // SAFETY: three live event handles; wait for any, not alertable.
+            let woke = unsafe {
+                WSAWaitForMultipleEvents(handles.len() as u32, handles.as_ptr(), 0, timeout, 0)
+            };
+            if woke == WSA_WAIT_FAILED {
+                smb_log!(
+                    "tun: waiting for packets failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // Never spin on a wait that keeps failing.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Reset before the bridges are pumped, not after: a socket event
+            // that lands while they are being pumped must survive to the next
+            // wait.
+            // SAFETY: a live event handle.
+            unsafe { WSAResetEvent(self.upstream.0) };
+        }
+    }
+
+    /// Load the Wintun DLL from beside the executable, by full path, so the
+    /// DLL search order never picks up another copy.
+    fn load_dll() -> Result<wintun::Wintun> {
         let exe = std::env::current_exe()
             .map_err(|e| anyhow!("resolving the smbanything executable: {e}"))?;
         let dir = exe
             .parent()
             .ok_or_else(|| anyhow!("{} has no parent directory", exe.display()))?;
         let path = dir.join(WINTUN_DLL_NAME);
-        verify_dll(&path)?;
-        Ok(path)
-    }
-
-    pub(super) fn verify_dll(path: &Path) -> Result<()> {
-        use sha2::{Digest, Sha256};
-
-        let bytes = std::fs::read(path).map_err(|error| {
+        // SAFETY: loading the Wintun DLL runs only its own initialization.
+        unsafe { wintun::load_from_path(&path) }.map_err(|e| {
             anyhow!(
-                "{} was not found ({error}); Windows packet tunneling needs the release's {WINTUN_DLL_NAME} beside smbanything.exe",
+                "loading {} ({e}); Windows packet tunneling needs the release's {WINTUN_DLL_NAME} beside smbanything.exe",
                 path.display()
             )
-        })?;
-        let found = Sha256::digest(&bytes);
-        if found.as_slice() != WINTUN_DLL_SHA256 {
-            return Err(anyhow!(
-                "{} does not match the Wintun driver shipped by smbanything; refusing to load it",
-                path.display()
-            ));
-        }
-        Ok(())
+        })
     }
 
     fn reject_addresses_in_use(addrs: TunAddrs) -> Result<()> {
@@ -344,6 +613,43 @@ mod windows {
     }
 
     const ALREADY_EXISTS: u32 = 5010;
+
+    /// Wintun creates its adapter with an MTU of 65535. Set the IPv4 interface
+    /// to the MTU smoltcp is configured with, as Linux and macOS already are.
+    fn set_mtu(luid: u64, mtu: u32) -> Result<()> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetIpInterfaceEntry, InitializeIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+            SetIpInterfaceEntry,
+        };
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+        // SAFETY: the API initializer prepares the row, and the lookup fills
+        // it before the one changed field is written back.
+        let (lookup, status) = unsafe {
+            let mut row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+            InitializeIpInterfaceEntry(&mut row);
+            row.Family = AF_INET;
+            row.InterfaceLuid.Value = luid;
+            let lookup = GetIpInterfaceEntry(&mut row);
+            row.NlMtu = mtu;
+            // SetIpInterfaceEntry rejects an IPv4 row that carries the site
+            // prefix length GetIpInterfaceEntry reports.
+            row.SitePrefixLength = 0;
+            let status = if lookup == 0 {
+                SetIpInterfaceEntry(&mut row)
+            } else {
+                lookup
+            };
+            (lookup, status)
+        };
+        if status != 0 {
+            let call = if lookup == 0 { "setting" } else { "reading" };
+            return Err(anyhow!(
+                "{call} the Wintun interface MTU failed with Win32 error {status}"
+            ));
+        }
+        Ok(())
+    }
 
     fn assign_address(luid: u64, addr: Ipv4Addr) -> Result<()> {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -399,37 +705,30 @@ mod windows {
         }
         Ok(())
     }
-
-    #[test]
-    fn vendored_driver_matches_the_runtime_digest() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root")
-            .join("vendor")
-            .join("wintun")
-            .join(WINTUN_DLL_NAME);
-        verify_dll(&path).expect("the vendored Wintun DLL must match its pinned digest");
-        let bytes = std::fs::read(path).expect("read Wintun DLL");
-        assert_eq!(&bytes[..2], b"MZ");
-        assert!(bytes.len() > 100_000);
-    }
 }
 
 #[cfg(windows)]
-use windows::PlatformTun;
+use windows::{PlatformTun, Poller, Waker};
 
-/// Check that the Wintun driver at `path` is byte-for-byte the one this crate
-/// pins and will load. For an embedder that vendors the DLL and ships it next
-/// to its own executable: run this over the vendored copy in a test, so a
-/// driver update that forgets one side fails the build rather than the first
-/// tun share started in the field.
-#[cfg(windows)]
-pub fn verify_driver(path: &std::path::Path) -> anyhow::Result<()> {
-    windows::verify_dll(path)
+/// Whether `packet` is IPv4 from `peer`, the adapter's own address.
+///
+/// The host sends to the virtual address from the adapter address, so nothing
+/// else is a client. On a host that forwards IP, a neighbour routing the
+/// virtual address through it would otherwise reach the share; dropping those
+/// packets before smoltcp sees them also means they get no reply at all, not
+/// even a reset.
+fn sent_by(packet: &[u8], peer: Ipv4Addr) -> bool {
+    packet.len() >= 20 && packet[0] >> 4 == 4 && packet[12..16] == peer.octets()
 }
 
 struct SmolDevice {
     io: PlatformTun,
+    peer: Ipv4Addr,
+    ignored_any: bool,
+    shutdown: Arc<AtomicBool>,
+    report: Arc<Mutex<TunReport>>,
+    /// Set by a receive that failed for good; the loop stops on it.
+    failed: Option<std::io::Error>,
 }
 
 struct PacketRx {
@@ -472,14 +771,37 @@ impl Device for SmolDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.io.receive().map(|packet| {
-            (
-                PacketRx { packet },
-                PacketTx {
-                    io: &mut self.io,
-                },
-            )
-        })
+        loop {
+            let packet = match self.io.receive() {
+                Ok(packet) => packet?,
+                Err(error) => {
+                    self.failed = Some(error);
+                    return None;
+                }
+            };
+            if sent_by(&packet, self.peer) {
+                return Some((PacketRx { packet }, PacketTx { io: &mut self.io }));
+            }
+            // IPv6 the host sends on its own (router and multicast listener
+            // traffic) is routine and not worth a line; another IPv4 source is.
+            if !self.ignored_any && packet.len() >= 20 && packet[0] >> 4 == 4 {
+                self.ignored_any = true;
+                let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                smb_log!(
+                    "tun: ignoring IPv4 packets not sent from {}, the first from {source}",
+                    self.peer
+                );
+                self.report
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .ignored_source = Some(source);
+            }
+            // Ignored packets arriving as fast as they are read would keep
+            // this loop, and so the packet thread, from ever seeing shutdown.
+            if self.shutdown.load(Ordering::Relaxed) {
+                return None;
+            }
+        }
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -511,6 +833,18 @@ impl Bridge {
         self.upstream_eof = false;
         self.upstream_write_closed = false;
     }
+
+    /// The loopback side has something to read that the bridge has room for.
+    /// `pump` reads while this holds, and the Unix wait polls for it.
+    fn wants_upstream_read(&self) -> bool {
+        !self.upstream_eof && self.to_client.len() < PROXY_HIGH_WATER
+    }
+
+    /// Bytes from the client are waiting for the loopback side to take them.
+    /// `pump` writes while this holds, and the Unix wait polls for it.
+    fn wants_upstream_write(&self) -> bool {
+        !self.to_upstream.is_empty() && !self.upstream_write_closed
+    }
 }
 
 fn recycle(bridge: &mut Bridge, socket: &mut tcp::Socket<'_>, port: u16) {
@@ -522,12 +856,21 @@ fn recycle(bridge: &mut Bridge, socket: &mut tcp::Socket<'_>, port: u16) {
 
 fn poll_loop(
     device: PlatformTun,
-    virtual_ip: Ipv4Addr,
+    mut poller: Poller,
+    addrs: TunAddrs,
     port: u16,
     forward_to: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    report: Arc<Mutex<TunReport>>,
 ) {
-    let mut device = SmolDevice { io: device };
+    let mut device = SmolDevice {
+        io: device,
+        peer: addrs.adapter_ip(),
+        ignored_any: false,
+        shutdown: shutdown.clone(),
+        report: report.clone(),
+        failed: None,
+    };
     let started = StdInstant::now();
     let now = || Instant::from_micros(started.elapsed().as_micros() as i64);
 
@@ -535,7 +878,7 @@ fn poll_loop(
     let mut interface = Interface::new(config, &mut device, now());
     interface.update_ip_addrs(|addresses| {
         addresses
-            .push(IpCidr::new(IpAddress::Ipv4(virtual_ip), 32))
+            .push(IpCidr::new(IpAddress::Ipv4(addrs.virtual_ip()), 32))
             .expect("one address fits");
     });
 
@@ -560,19 +903,31 @@ fn poll_loop(
         })
         .collect();
 
+    // Each round drains the adapter into smoltcp, moves what it can between
+    // smoltcp and the loopback bridges, and repeats while that moved anything.
+    // Only a round that changed nothing sleeps, until a packet, a bridge
+    // socket, the shutdown waker or smoltcp's next timer needs it.
     while !shutdown.load(Ordering::Relaxed) {
         interface.poll(now(), &mut device, &mut sockets);
+        // An adapter deleted or torn down under the process fails every read
+        // from then on, and its descriptor stays ready: carrying on would
+        // spin. Nothing will reach the share again, so stop and say why.
+        if let Some(error) = device.failed.take() {
+            smb_log!("tun: the adapter failed, stopping: {error}");
+            report.lock().unwrap_or_else(|e| e.into_inner()).stopped =
+                Some(format!("reading from the adapter failed: {error}"));
+            break;
+        }
 
         let mut did_work = false;
-        let mut any_active = false;
         for bridge in &mut bridges {
-            did_work |= pump(bridge, &mut sockets, forward_to, port);
-            any_active |= bridge.upstream.is_some();
+            did_work |= pump(bridge, &mut sockets, &poller, forward_to, port);
         }
         if did_work {
             continue;
         }
-        std::thread::sleep(Duration::from_millis(if any_active { 1 } else { 20 }));
+        let delay = interface.poll_delay(now(), &sockets);
+        poller.wait(&device.io, &bridges, delay);
     }
 
     for bridge in &mut bridges {
@@ -584,6 +939,7 @@ fn poll_loop(
 fn pump(
     bridge: &mut Bridge,
     sockets: &mut SocketSet<'_>,
+    poller: &Poller,
     forward_to: SocketAddr,
     port: u16,
 ) -> bool {
@@ -602,8 +958,11 @@ fn pump(
         match TcpStream::connect(forward_to) {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
-                if let Err(error) = stream.set_nonblocking(true) {
-                    smb_log!("tun: cannot make loopback bridge nonblocking: {error}");
+                let ready = stream
+                    .set_nonblocking(true)
+                    .and_then(|()| poller.register(&stream));
+                if let Err(error) = ready {
+                    smb_log!("tun: cannot set up the loopback bridge: {error}");
                     socket.abort();
                     return true;
                 }
@@ -619,7 +978,9 @@ fn pump(
         }
     }
 
-    let Some(upstream) = bridge.upstream.as_mut() else {
+    // Shared, not mutable: `&TcpStream` reads and writes too, and the bridge
+    // stays borrowable for the `wants_upstream_*` conditions below.
+    let Some(mut upstream) = bridge.upstream.as_ref() else {
         return match socket.state() {
             // Waiting for a client, or mid-handshake: nothing to bridge yet.
             tcp::State::Listen | tcp::State::SynReceived => did_work,
@@ -649,7 +1010,7 @@ fn pump(
             Err(_) => break,
         }
     }
-    while !bridge.to_upstream.is_empty() {
+    while bridge.wants_upstream_write() {
         let (head, _) = bridge.to_upstream.as_slices();
         match upstream.write(head) {
             Ok(0) => break,
@@ -658,15 +1019,21 @@ fn pump(
                 did_work = true;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            // The private listener is gone for this connection: nothing the
+            // client sends can be delivered, and keeping its bytes would only
+            // fill the queue and close its window. Abort, and leave recycling
+            // to a later round, as the other aborts here do: `listen` now
+            // would discard the reset the next `interface.poll` sends.
             Err(_) => {
                 bridge.to_upstream.clear();
                 bridge.upstream_write_closed = true;
-                break;
+                socket.abort();
+                return true;
             }
         }
     }
 
-    while !bridge.upstream_eof && bridge.to_client.len() < PROXY_HIGH_WATER {
+    while bridge.wants_upstream_read() {
         let mut buffer = [0; 16 * 1024];
         match upstream.read(&mut buffer) {
             Ok(0) => {
@@ -727,6 +1094,35 @@ mod tests {
             let addrs: TunAddrs = address.parse().unwrap();
             assert_ne!(addrs.virtual_ip(), addrs.adapter_ip());
         }
+    }
+
+    #[test]
+    fn only_the_adapter_address_is_a_client() {
+        let peer = Ipv4Addr::new(169, 254, 255, 2);
+        let mut packet = [0u8; 20];
+        packet[0] = 0x45;
+        packet[12..16].copy_from_slice(&peer.octets());
+        packet[16..20].copy_from_slice(&[169, 254, 255, 1]);
+        assert!(sent_by(&packet, peer));
+
+        // A forwarded packet from a neighbour, addressed to the same server.
+        let mut forwarded = packet;
+        forwarded[12..16].copy_from_slice(&[192, 168, 1, 50]);
+        assert!(!sent_by(&forwarded, peer));
+
+        // IPv6, and anything too short to carry an IPv4 header.
+        let mut ipv6 = packet;
+        ipv6[0] = 0x60;
+        assert!(!sent_by(&ipv6, peer));
+        assert!(!sent_by(&packet[..19], peer));
+    }
+
+    #[test]
+    fn timers_round_up_to_the_next_millisecond() {
+        assert_eq!(wait_millis(Duration::from_micros(0)), 0);
+        assert_eq!(wait_millis(Duration::from_micros(1)), 1);
+        assert_eq!(wait_millis(Duration::from_micros(1000)), 1);
+        assert_eq!(wait_millis(Duration::from_micros(1001)), 2);
     }
 
     #[cfg(unix)]

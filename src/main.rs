@@ -1,6 +1,8 @@
 mod archive;
 mod connection;
 mod picker;
+#[cfg(unix)]
+mod privilege;
 mod root;
 mod tui;
 
@@ -88,7 +90,7 @@ fn main() -> Result<()> {
     } else {
         smb::Bind::Loopback
     };
-    let handle = smb::start(
+    let bound = smb::bind(
         args.port,
         &args.share,
         bind,
@@ -97,6 +99,15 @@ fn main() -> Result<()> {
             password: password.clone(),
         },
     )?;
+    // Every privileged step is behind us: the adapter exists and the listener
+    // is bound, but no thread has read a client byte yet. Root goes first, so
+    // nothing that parses client or archive input ever runs as root, and a
+    // failure to give it up exits before anyone is served.
+    #[cfg(unix)]
+    let runs_as = privilege::drop_root()?;
+    #[cfg(not(unix))]
+    let runs_as = connection::RunsAs::Starter;
+    let handle = bound.start()?;
     // The share is never empty: a README says what is loaded and how the
     // share behaves, so a client that mounts early sees a working server.
     let control = if args.archive.is_some() {
@@ -123,6 +134,7 @@ fn main() -> Result<()> {
         bind_all: args.bind_all,
         standard_port: handle.on_standard_port(),
         tun: args.smb_tun.then_some(args.smb_tun_ip),
+        runs_as,
     };
 
     // The termination handler only wakes the loop below. Cleanup remains on
@@ -184,6 +196,9 @@ fn serve(
             addrs.adapter_ip()
         );
     }
+    if let Some(runs_as) = server.runs_as.line() {
+        println!("{}", runs_as.text);
+    }
     if server.bind_all {
         println!("Warning:  file data is signed but not encrypted and is visible in transit.");
     }
@@ -208,6 +223,7 @@ fn serve(
     println!();
     println!("Press Ctrl-C to stop.");
 
+    let mut warned_ignored = false;
     loop {
         match stop_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
@@ -218,6 +234,16 @@ fn serve(
                 );
             }
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        let report = handle.tun_report();
+        if let Some(reason) = report.stopped {
+            bail!("the packet tunnel stopped: {reason}");
+        }
+        if let (Some(source), Some(addrs)) = (report.ignored_source, server.tun)
+            && !warned_ignored
+        {
+            eprintln!("{}", connection::ignored_source_line(addrs, source).text);
+            warned_ignored = true;
         }
     }
     Ok(())

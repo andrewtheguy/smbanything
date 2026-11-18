@@ -4,7 +4,9 @@
 # invokes it: this Linux host through ci/unix/remote.sh (a Linux driver always
 # runs locally), or the macOS VM through `ci/unix/remote.sh -H macvm`. It
 # installs nothing permanently; the smoke creates one native TUN adapter and
-# two host routes, then removes them. `remote.sh doctor` checks its prerequisites.
+# two host routes, and briefly plays a neighbour at 198.51.100.7 (a loopback
+# alias on Linux; a feth pair with IP forwarding on macOS), then removes them
+# all and restores forwarding. `remote.sh doctor` checks its prerequisites.
 set -euo pipefail
 
 # Invoked over ssh the working directory is the login user's home, not the

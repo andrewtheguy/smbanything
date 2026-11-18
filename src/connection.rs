@@ -2,7 +2,58 @@
 //! share, rendered by the browser UI and printed by the non-interactive
 //! `serve` path so the two can never drift apart.
 
+use std::net::Ipv4Addr;
+
 use smbanything_core::smb::TunAddrs;
+
+/// Who the server runs as once it is listening.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunsAs {
+    /// Whoever started it, with nothing to give back: not root, or Windows,
+    /// where an elevated token stays elevated.
+    Starter,
+    /// The sudo user, root having been given up once the server was bound.
+    #[cfg(unix)]
+    DroppedTo(u32),
+    /// Root, started some other way than sudo (a root shell, doas, run0), so
+    /// there was no user to switch back to.
+    #[cfg(unix)]
+    Root,
+}
+
+impl RunsAs {
+    /// What the banner says about it, if anything.
+    pub(crate) fn line(self) -> Option<DetailLine> {
+        match self {
+            Self::Starter => None,
+            #[cfg(unix)]
+            Self::DroppedTo(uid) => Some(line(
+                Kind::Note,
+                format!("Runs as:  uid {uid}; root was needed only to start the server"),
+            )),
+            #[cfg(unix)]
+            Self::Root => Some(line(
+                Kind::Warning,
+                "Runs as:  root. Only sudo says which user to switch back to, so archives \
+                 and clients are handled as root; start it with sudo to avoid that.",
+            )),
+        }
+    }
+}
+
+/// The warning shown once a source other than the adapter's own address has
+/// sent to the tunnel: those packets get no answer, which a client on this
+/// machine that picked another source address sees as a hang.
+pub(crate) fn ignored_source_line(addrs: TunAddrs, source: Ipv4Addr) -> DetailLine {
+    line(
+        Kind::Warning,
+        format!(
+            "Ignored:  packets from {source} get no answer; only {}, the adapter's own \
+             address, is served.",
+            addrs.adapter_ip()
+        ),
+    )
+}
 
 pub(crate) struct ServerView {
     pub(crate) host: String,
@@ -18,6 +69,7 @@ pub(crate) struct ServerView {
     pub(crate) standard_port: bool,
     /// The packet tunnel's addresses, when one fronts this server.
     pub(crate) tun: Option<TunAddrs>,
+    pub(crate) runs_as: RunsAs,
 }
 
 /// How a line is meant to read, so the UI can colour it and stdout can ignore
@@ -183,6 +235,7 @@ mod tests {
             bind_all: false,
             standard_port,
             tun: None,
+            runs_as: RunsAs::Starter,
         }
     }
 

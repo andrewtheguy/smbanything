@@ -11,12 +11,9 @@
 | This file's SHA-256 | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` |
 | Authenticode | Valid — `CN=WireGuard LLC, O=WireGuard LLC, L=Boulder, S=Colorado, C=US`, thumbprint `DF98E075A012ED8C86FBCF14854B8F9555CB3D45` |
 
-The DLL hash is pinned in `WINTUN_DLL_SHA256` and asserted by a Windows test.
-It is also re-verified on disk before it is ever loaded as code.
-
 To update: download the new archive, confirm its SHA2-256 against wintun.net,
 confirm the Authenticode signature on the extracted DLL, replace this file, and
-update `WINTUN_DLL_SHA256` in `smbanything_core/src/smb/tun.rs` to match.
+update the table above.
 
 `LICENSE.txt` is the Wintun *Prebuilt Binaries License*. §3(d) permits
 redistribution alongside software that uses the driver only through the

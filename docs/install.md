@@ -64,7 +64,7 @@ C:\Program Files\smbanything\bin\wintun-amd64.dll
 C:\Program Files\smbanything\share\doc\smbanything\WINTUN-LICENSE.txt
 ```
 
-`wintun-amd64.dll` is the pinned Wintun driver `--smb-tun` loads from beside
+`wintun-amd64.dll` is the Wintun driver `--smb-tun` loads from beside
 the executable; see [smb-tun.md](smb-tun.md). Add `/qn` for an unattended
 install.
 

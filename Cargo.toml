@@ -1,6 +1,6 @@
 [package]
 name = "smbanything"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
 
 [workspace]
@@ -28,3 +28,7 @@ zip = { version = "8.6", default-features = false, features = [
     "xz",
     "zstd",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# Only to give root back after startup: see src/privilege.rs.
+libc = "0.2"

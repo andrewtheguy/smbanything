@@ -17,9 +17,8 @@ Windows: C:\Program Files\smbanything\bin\smbanything.exe
 ```
 
 The MSI puts its `bin` on the machine `PATH`. Wintun has to sit beside the
-executable because that is the only place `--smb-tun` loads it from, after
-checking its pinned SHA-256; its licence travels with it as its
-redistribution terms require. There is no package wrapper, version directory,
+executable because that is the only place `--smb-tun` loads it from; its
+licence travels with it as its redistribution terms require. There is no package wrapper, version directory,
 service, or config: smbanything keeps no state between runs.
 
 ## Scripts

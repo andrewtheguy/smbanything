@@ -79,20 +79,69 @@ next address up goes on the adapter) when the default is taken.
 
 The SMB protocol code is deliberately untouched by all of this. smoltcp
 terminates the connection and proxies it to the ordinary loopback listener
-`smb::start` already creates, so the async server, its tests and its wire
+`smb::bind` already creates, so the async server, its tests and its wire
 handling never learn a tun exists. The extra loopback hop costs a memcpy per
 buffer, which is nothing next to a backing read.
 
+The packet thread sleeps only until something needs it. Each round drains the
+adapter into smoltcp and moves what it can between smoltcp and the loopback
+bridges; a round that moved nothing waits on everything that could change that,
+with smoltcp's next timer (`poll_delay`) as the timeout:
+
+- on Linux and macOS, one `poll(2)` over the tun descriptor, each bridge socket
+  that has room to read or bytes to write, and a socketpair that wakes it for
+  shutdown;
+- on Windows, one `WSAWaitForMultipleEvents` over Wintun's read-wait event, a
+  single Winsock event every bridge socket is `WSAEventSelect`ed onto, and a
+  shutdown event. The read-wait event is waited on only once a receive has
+  found the ring empty — Wintun's documented pattern — which smoltcp's `poll`
+  guarantees, since it drains the device before returning.
+
+An idle share costs no wakeups, mounted or not. Against the 1 ms sleep loop
+this replaced, with a bridged connection left idle and a 64 MiB file read
+through the tunnel:
+
+| | Idle cost | 64 MiB read |
+| --- | --- | --- |
+| Linux (`smbclient`) | 0 wakeups in 2 s, was ~1,700 | 0.6 s, was 0.7 s |
+| macOS (`mount_smbfs`) | no CPU time in 10 s, was 0.19 s | 0.22 s, was 0.91 s |
+
+The Linux smoke test holds the idle wakeups under 20.
+
 ## Requirements and side effects
 
-- **Elevation**, because creating a network adapter always requires it. Nothing
-  else needs it, and no existing service, binding or adapter is modified.
+- **Elevation to start, not to run.** Creating a network adapter always needs
+  it, and nothing else does, so on Linux and macOS the process gives root back
+  as soon as the adapter exists and the private listener is bound: under sudo
+  it switches to `SUDO_UID`/`SUDO_GID` (with that user's supplementary
+  groups, and its `HOME`, `USER` and `LOGNAME`) for good before it starts a
+  single server thread, so it never opens an archive or reads a client's byte
+  as root, and stops if it cannot. The banner says so (`Runs as:  uid 1000`).
+  The adapter's file descriptor keeps working, because the kernel checked
+  privilege when it was opened. Started as root any other way — a root shell,
+  `doas`, `run0` — there is no user it can be sure to switch to, so it stays
+  root and the banner warns that it does. Windows
+  has no cheap equivalent — an elevated token cannot be narrowed back to the
+  user's for a running process — so there the whole share runs elevated. No
+  existing service, binding or adapter is modified.
 - **Two host routes.** While a share is open, `169.254.255.1/32` and
   `169.254.255.2/32` route to the tun adapter — nothing wider. The server
   refuses to start if either exact address is already owned by the machine.
-- **Nothing persists**, and not only on the tidy path. Dropping the share
-  removes the adapter, and with it the address and the routes. A crash or a
-  forced kill does the same: see below.
+- **Only the adapter's own client is served.** The host sends to `.1` from the
+  adapter's `.2`, so the stack drops every packet from any other source before
+  it is processed — no reply, not even a reset. Without that, a host with IP
+  forwarding on would serve the share to a neighbour that routes `.1` through
+  it — see [Forwarded neighbours](#forwarded-neighbours). A client on this
+  machine that picks another source address is dropped the same way and hangs
+  until it times out, so the first ignored source is shown as a warning:
+  on stderr when serving an archive from the command line, in the server box
+  in the UI.
+- **No network state persists**, and not only on the tidy path. Dropping the
+  share removes the adapter, and with it the address and the routes. A crash or
+  a forced kill does the same: see below. The one thing that outlives a share
+  is on Windows: the first adapter installs the Wintun driver into the driver
+  store, and it stays there, as it does for every program that uses Wintun —
+  see [The driver store](#the-driver-store).
 
 ### What happens if the process crashes
 
@@ -113,24 +162,64 @@ against an interface LUID is owned by that interface. The same holds for a
 failure part-way through startup: if address assignment fails after the adapter
 exists, the error path drops the adapter and the address goes with it.
 
+An adapter removed under a running share — `ip link del`, or the system
+tearing down the utun or the Wintun session — fails every read from then on.
+The packet thread stops on the first such error rather than retrying, and the
+process exits saying why (`the packet tunnel stopped: ...`): nothing can reach
+the share without its adapter.
+
 So there is no stale-adapter recovery procedure, because there is no stale
 adapter. An adapter that does show up belongs to a *live* process — a hung or
 suspended one still holds its handle. Stop that process and the adapter goes
 with it; there is nothing to remove by hand.
 
+### Forwarded neighbours
+
+Link-local addresses are not supposed to be forwarded (RFC 3927 §2.7), and it is
+tempting to rely on that. macOS does not: with IP forwarding on — which
+Internet Sharing turns on — it forwards a neighbour's SYN for `169.254.255.1`
+into the utun like any other packet. Measured on macOS by a neighbour played
+through a peered `feth` pair, three SYNs from `198.51.100.7` each time:
+
+| Build | Tunnel pair | SYNs into the tunnel | SYN-ACKs back |
+| --- | --- | --- | --- |
+| before the source check | default `169.254.255.1` | 3 | 2 |
+| before the source check | `--smb-tun-ip 192.0.2.1` | 3 | 2 |
+| with it | either | 3 | 0 |
+
+So before the check, a Mac sharing its connection offered the share's login to
+its LAN, default addresses included; a chosen pair outside link-local space
+widens that to anything able to route to it. The share still demanded the
+password, but nothing beyond the machine itself should have been able to ask.
+
+The smoke test repeats the measurement on every run, watching the tunnel
+interface with tcpdump, and fails both when the tunnel answers and when no SYN
+reaches it, so it cannot pass vacuously. On Linux the SYNs come from a spare
+loopback address instead, because Linux routes a locally sourced packet from it
+into the tunnel the same way; macOS refuses to, whether the alias is on `lo0` or
+`en0`, which is why it needs the forwarded neighbour.
+
 ## The Windows driver
 
 Linux and macOS need no driver file. On Windows, `wintun-amd64.dll` (427 KB,
 signed by WireGuard LLC) is vendored in `vendor/wintun/` and must sit next to
-the executable at runtime, which is where the Windows MSI installs it;
-`smbanything_core/src/smb/tun.rs` loads it from
-there and re-verifies it against a pinned SHA-256 before each load — a stale or
-altered copy is refused rather than trusted. The Wintun *Prebuilt Binaries
+the executable at runtime, which is where the Windows MSI installs it.
+`smbanything_core/src/smb/tun.rs` loads it by full path from there, so the DLL
+search order never picks up another copy. The Wintun *Prebuilt Binaries
 License* §3(d) permits redistribution alongside software that uses it only
 through the documented API, which is all `tun.rs` does; `vendor/wintun/LICENSE.txt`
 is the copy that governs it.
 
-### Provenance and integrity
+The DLL is not verified before it is loaded, so whoever can write the folder
+it sits in can run code in the elevated process. The MSI's folder under
+`Program Files` is writable only by administrators. smbanything is meant to be
+portable too — copy `smbanything.exe` and `wintun-amd64.dll` anywhere and run
+them — but for `--smb-tun` keep that copy in a folder only administrators can
+write, never Downloads, the desktop or another folder of your own: anything
+running as you could put its own `wintun-amd64.dll` there and have it run as
+administrator the next time you start a tunnel.
+
+### Provenance
 
 | | |
 | --- | --- |
@@ -139,42 +228,31 @@ is the copy that governs it.
 | `wintun-amd64.dll` SHA-256 | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` |
 | Authenticode | Valid, `CN=WireGuard LLC`, thumbprint `DF98E075A012ED8C86FBCF14854B8F9555CB3D45` |
 
-A checksum verified only at download time protects nothing afterwards, so the
-DLL hash is pinned as `WINTUN_DLL_SHA256` and checked twice:
-
-- `vendored_driver_matches_the_runtime_digest` fails the build if the vendored
-  binary ever changes without the constant changing with it;
-- `locate_dll` hashes the file next to the executable and refuses it unless it
-  is byte-for-byte the pinned driver. Nothing is passed to `LoadLibrary` that
-  has not just been verified.
-
-An embedder that vendors and ships the DLL itself pins its own copy with
-`smb::verify_driver` in a test of its own, so a driver update that forgets one
-side fails that build too.
-
-It narrows the window rather than closing it. Between the hash check and the
-load, a writer could still swap the file. Anything able to write the install
-directory can already replace the executable itself; this defends against a
-stale or corrupted copy, not against an attacker who is already inside that
-trust boundary.
-
 **Updating the driver:** verify the new archive against the SHA2-256 published
 on wintun.net *and* its Authenticode signature, then replace
 `vendor/wintun/wintun-amd64.dll` with the archive's `bin/amd64/wintun.dll` —
 renamed, because `tun.rs` loads exactly the name `wintun-amd64.dll` — and
-update `WINTUN_DLL_SHA256`. The test will fail until they agree, which is the
-point.
+update the table above and `vendor/wintun/README.md`.
+
+### The driver store
+
+Wintun installs its driver into the Windows driver store (`wintun.inf`, as an
+`oemN.inf`) the first time an adapter is created, and the package stays there
+after every adapter is gone. smbanything leaves it there, as programs that ship
+Wintun generally do; uninstalling the MSI removes only the files it installed.
+The package is shared: every Wintun program on the machine uses the same one,
+and Wintun's own `WintunDeleteDriver` removes every Wintun package that no
+adapter is using, whichever program staged it. Unused, it costs nothing, and
+the next adapter any program creates reuses it or installs a newer one. To
+remove it by hand, find its `oemN.inf` in `pnputil /enum-drivers` and run
+`pnputil /delete-driver oemN.inf` from an elevated terminal.
 
 ## Known limitations
 
-- The poll loop polls rather than waiting on an event, because no single wait
-  primitive spans both the tun device and the loopback sockets everywhere. It
-  sleeps 1 ms while a mount is live and 20 ms when idle. Measured cost is not
-  visible next to backing reads — a mount, a file read and a directory listing
-  are all well under 250 ms — but this is the first place to look if throughput
-  ever matters.
-- MTU is left at the platform default of 1500. Raising it would cut per-packet
-  overhead on bulk reads.
+- The MTU is 1500, set explicitly on every platform — on Windows too, where
+  Wintun would otherwise leave the adapter at 65535. Raising it would cut
+  per-packet overhead on bulk reads; it has to change on the adapter and in
+  smoltcp together.
 - IPv4 only.
 
 One trap worth knowing on Windows, because it cost 272 seconds a run before it

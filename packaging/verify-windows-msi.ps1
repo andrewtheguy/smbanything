@@ -60,26 +60,45 @@ $upgradeCode = (Read-MsiRows "SELECT ``Value`` FROM ``Property`` WHERE ``Propert
 if (-not $upgradeCode) { throw 'the package has no UpgradeCode' }
 Write-Host "   the wizard has its $($dialogs.Count) pages, finish page included, and skips the licence page"
 
-Write-Host ">> installing $Msi"
-Invoke-Msiexec @('/i', $Msi) 'install'
-foreach ($file in 'bin\smbanything.exe', 'bin\wintun-amd64.dll', 'VERSION', 'share\doc\smbanything\WINTUN-LICENSE.txt') {
-    if (-not (Test-Path (Join-Path $root $file))) { throw "the installed tree lacks $file" }
+# Wrap every call in @(): a function's one-item output unrolls to the bare product code.
+function Get-Installed { $installer.RelatedProducts($upgradeCode) }
+function Uninstall-Leftovers {
+    foreach ($product in @(Get-Installed)) { Start-Process msiexec -ArgumentList @('/x', $product, '/qn', '/norestart') -Wait | Out-Null }
 }
-$version = (Get-Content (Join-Path $root 'VERSION') -Raw).Trim()
-$reported = (& $exe --version) -join ' '
-if ($LASTEXITCODE -ne 0) { throw "smbanything.exe --version exited $LASTEXITCODE" }
-if ($reported -ne "smbanything $version") { throw "--version says '$reported', VERSION says $version" }
-Write-Host "   $reported"
-# --smb-tun refuses any DLL but the pinned one, so the installed copy must be the vendored file.
-$installedDll = (Get-FileHash -Algorithm SHA256 (Join-Path $binDir 'wintun-amd64.dll')).Hash
-$vendoredDll = (Get-FileHash -Algorithm SHA256 'vendor\wintun\wintun-amd64.dll').Hash
-if ($installedDll -ne $vendoredDll) { throw "the installed wintun-amd64.dll ($installedDll) is not the vendored one ($vendoredDll)" }
-Write-Host '   wintun-amd64.dll sits beside smbanything.exe and matches the vendored driver'
-if (-not (Test-OnMachinePath $binDir)) { throw "the machine PATH lacks $binDir" }
-Write-Host "   $binDir is on the machine PATH"
 
-Write-Host '>> removing it'
-Invoke-Msiexec @('/x', $Msi) 'uninstall'
+# A failed install below uninstalls what is registered under this UpgradeCode, so nothing may be
+# registered before it: an smbanything installed in a custom folder, which the check of $root
+# above misses, would otherwise be removed, or replaced by this package as a same-version upgrade.
+$preinstalled = @(Get-Installed)
+if ($preinstalled.Count -ne 0) { throw "smbanything is already installed ($($preinstalled -join ', ')) — remove it first" }
+
+Write-Host ">> installing $Msi"
+# A check that fails before the uninstall below still removes the package, so the next run does
+# not find it in place.
+try {
+    Invoke-Msiexec @('/i', $Msi) 'install'
+    foreach ($file in 'bin\smbanything.exe', 'bin\wintun-amd64.dll', 'VERSION', 'share\doc\smbanything\WINTUN-LICENSE.txt') {
+        if (-not (Test-Path (Join-Path $root $file))) { throw "the installed tree lacks $file" }
+    }
+    $version = (Get-Content (Join-Path $root 'VERSION') -Raw).Trim()
+    $reported = (& $exe --version) -join ' '
+    if ($LASTEXITCODE -ne 0) { throw "smbanything.exe --version exited $LASTEXITCODE" }
+    if ($reported -ne "smbanything $version") { throw "--version says '$reported', VERSION says $version" }
+    Write-Host "   $reported"
+    # The installed copy must be the vendored file, byte for byte.
+    $installedDll = (Get-FileHash -Algorithm SHA256 (Join-Path $binDir 'wintun-amd64.dll')).Hash
+    $vendoredDll = (Get-FileHash -Algorithm SHA256 'vendor\wintun\wintun-amd64.dll').Hash
+    if ($installedDll -ne $vendoredDll) { throw "the installed wintun-amd64.dll ($installedDll) is not the vendored one ($vendoredDll)" }
+    Write-Host '   wintun-amd64.dll sits beside smbanything.exe and matches the vendored driver'
+    if (-not (Test-OnMachinePath $binDir)) { throw "the machine PATH lacks $binDir" }
+    Write-Host "   $binDir is on the machine PATH"
+
+    Write-Host '>> removing it'
+    Invoke-Msiexec @('/x', $Msi) 'uninstall'
+} catch {
+    Uninstall-Leftovers
+    throw
+}
 if (Test-Path $root) { throw "$root survived the uninstall" }
 if (Test-OnMachinePath $binDir) { throw "the machine PATH still names $binDir" }
 Write-Host '   removed cleanly'
@@ -89,8 +108,6 @@ Write-Host '   removed cleanly'
 # replaces the prerelease instead of adding a second product beside it. The counterpart to the
 # package under test is built from its own administrative image with only VERSION changed:
 # a final release gets an x.y.z-rc.1 before it, a prerelease gets its x.y.z after it.
-# Wrap every call in @(): a function's one-item output unrolls to the bare product code.
-function Get-Installed { $installer.RelatedProducts($upgradeCode) }
 $work = Join-Path $env:TEMP "smbanything-msi-upgrade-$PID"
 try {
     if (Test-Path $work) { Remove-Item -Recurse -Force $work }
@@ -129,6 +146,6 @@ try {
     Write-Host '   the upgraded install removed cleanly'
 } finally {
     # Leave no product behind if a check above threw mid-way.
-    foreach ($product in @(Get-Installed)) { Start-Process msiexec -ArgumentList @('/x', $product, '/qn', '/norestart') -Wait | Out-Null }
+    Uninstall-Leftovers
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }

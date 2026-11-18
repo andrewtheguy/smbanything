@@ -19,6 +19,19 @@ platform=$(uname -s)
 pid=
 mount_dir=
 elevated_pid=false
+# The packet tunnel's foreign-source check plays a neighbour at this spare
+# TEST-NET-2 address. Linux aliases it onto loopback; macOS puts it behind a
+# peered feth pair with IP forwarding on. Cleanup undoes only what this run
+# created, so an interface or route that was already there is left alone.
+foreign_source=198.51.100.7
+foreign_alias=
+feth4450_created=false
+feth4451_created=false
+neighbour_route=false
+forwarding_was=
+tcpdump_sudo=
+capture=
+capture_complete=false
 
 info() { echo "[smoke] $*"; }
 # The banner's `Server:   listening on <host>:<port>  (...)` line, and the
@@ -27,7 +40,142 @@ listen_port() { sed -n 's/^Server: *listening on .*:\([0-9][0-9]*\)  .*/\1/p' "$
 archive_folder() { awk '/^Folder:/ {print $2; exit}' "$1"; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
+# Run one cleanup step, saying so if it fails. The caller clears its record
+# only on success, so a later cleanup (the EXIT trap) tries again.
+undo() {
+    local what=$1; shift
+    "$@" >/dev/null 2>&1 && return 0
+    echo "[smoke] cleanup could not $what" >&2
+    return 1
+}
+
+remove_foreign_alias() {
+    [[ -n "$foreign_alias" ]] || return 0
+    undo "remove $foreign_source from $foreign_alias" \
+        sudo -n ip addr del "$foreign_source/32" dev "$foreign_alias" \
+        && foreign_alias=
+    # undo has reported any failure. Returning it would end cleanup here
+    # under `set -e`, before the unmount and the server's shutdown.
+    return 0
+}
+
+# Whether pid $1 is running: a zombie this shell has not reaped has exited.
+running() {
+    local state
+    state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+    [[ "$state" != Z* ]]
+}
+
+# The process named like $2 at or below pid $1. sudo runs its command as a
+# child, or as a grandchild when it interposes a monitor process (use_pty).
+descendant_named() {
+    local pid=$1
+    while [[ -n "$pid" && "$(ps -o comm= -p "$pid" || true)" != *"$2"* ]]; do
+        pid=$(pgrep -P "$pid" | head -n1 || true)
+    done
+    echo "$pid"
+}
+
+# Record TCP port 445 traffic on the tunnel interface $1 into $capture.
+start_capture() {
+    capture="$work/capture.txt"
+    sudo -n tcpdump -n -l -U -i "$1" 'tcp port 445' >"$capture" 2>"$work/tcpdump.err" &
+    tcpdump_sudo=$!
+    for _ in $(seq 1 100); do
+        grep -q 'listening on' "$work/tcpdump.err" && return 0
+        sleep 0.05
+    done
+    echo "tcpdump never started capturing on $1" >&2
+    cat "$work/tcpdump.err" >&2
+    exit 1
+}
+
+# $tcpdump_sudo is sudo, which does not relay a signal from this shell on
+# macOS, so signal tcpdump itself, wherever under sudo it runs. The capture is
+# complete only if tcpdump was still running then and exited cleanly on that
+# SIGINT, having written everything it saw. Otherwise it is killed after 5 s;
+# sudo is reaped only once it has exited, so cleanup never blocks on it.
+stop_tcpdump() {
+    [[ -n "$tcpdump_sudo" ]] || return 0
+    local tcpdump_pid status=1 interrupted=false
+    capture_complete=false
+    tcpdump_pid=$(descendant_named "$tcpdump_sudo" tcpdump)
+    if [[ -n "$tcpdump_pid" ]] && sudo -n kill -INT "$tcpdump_pid" 2>/dev/null; then
+        interrupted=true
+    fi
+    for _ in $(seq 1 100); do
+        running "$tcpdump_sudo" || break
+        sleep 0.05
+    done
+    if running "$tcpdump_sudo"; then
+        interrupted=false
+        [[ -z "$tcpdump_pid" ]] || sudo -n kill -KILL "$tcpdump_pid" 2>/dev/null || true
+        sudo -n kill -KILL "$tcpdump_sudo" 2>/dev/null || true
+        for _ in $(seq 1 40); do
+            running "$tcpdump_sudo" || break
+            sleep 0.05
+        done
+    fi
+    if running "$tcpdump_sudo"; then
+        # Kept, so a later cleanup tries again and the run fails if it stays.
+        echo "[smoke] cleanup could not stop tcpdump (sudo pid $tcpdump_sudo)" >&2
+        return 0
+    fi
+    wait "$tcpdump_sudo" 2>/dev/null && status=0 || status=$?
+    $interrupted && (( status == 0 )) && capture_complete=true
+    tcpdump_sudo=
+}
+
+# With tcpdump stopped: SYNs from $foreign_source must have reached the tunnel
+# interface $1, or the check proved nothing, and nothing may have answered. A
+# capture tcpdump did not finish cleanly proves neither.
+check_capture() {
+    local arrived answered
+    if ! $capture_complete; then
+        echo "the capture on $1 is incomplete (tcpdump did not exit cleanly), so it proves nothing" >&2
+        cat "$work/tcpdump.err" >&2
+        exit 1
+    fi
+    arrived=$(grep -c "$foreign_source\.[0-9]* > 169\.254\.255\.1\.445: Flags \[S\]" "$capture" || true)
+    answered=$(grep -c "> $foreign_source\." "$capture" || true)
+    if (( arrived == 0 )); then
+        echo "no SYN from $foreign_source reached $1, so the check proved nothing" >&2
+        cat "$work/tcpdump.err" "$capture" >&2
+        exit 1
+    fi
+    if (( answered != 0 )); then
+        echo "the tunnel answered a SYN from $foreign_source" >&2
+        cat "$capture" >&2
+        exit 1
+    fi
+    info "$arrived SYNs from $foreign_source reached $1 and got no answer"
+}
+
+remove_neighbour() {
+    stop_tcpdump
+    if $neighbour_route; then
+        undo "delete the host route to $foreign_source" \
+            sudo -n route -q delete -host "$foreign_source" \
+            && neighbour_route=false
+    fi
+    if $feth4451_created; then
+        undo 'destroy feth4451' sudo -n ifconfig feth4451 destroy && feth4451_created=false
+    fi
+    if $feth4450_created; then
+        undo 'destroy feth4450' sudo -n ifconfig feth4450 destroy && feth4450_created=false
+    fi
+    if [[ -n "$forwarding_was" ]]; then
+        undo "restore net.inet.ip.forwarding to $forwarding_was" \
+            sudo -n sysctl -q net.inet.ip.forwarding="$forwarding_was" \
+            && forwarding_was=
+    fi
+    # As in remove_foreign_alias: every step is attempted, failures reported.
+    return 0
+}
+
 cleanup() {
+    remove_foreign_alias
+    remove_neighbour
     if [[ -n "$mount_dir" ]]; then
         # macOS canonicalizes /tmp to /private/tmp in `mount` output, so a
         # textual mount-table check misses the exact mount we just created.
@@ -55,7 +203,25 @@ cleanup() {
     mount_dir=
     elevated_pid=false
 }
-trap cleanup EXIT
+# Teardown attempts every step and reports what failed, so the run cannot end
+# early; but anything still recorded once it is done is a change to this host
+# left in place, and the run fails for it even if everything else passed.
+on_exit() {
+    local status=$?
+    cleanup
+    if [[ -n "$foreign_alias$forwarding_was$tcpdump_sudo" ]] \
+        || $neighbour_route || $feth4450_created || $feth4451_created; then
+        echo '[smoke] cleanup left changes to this host in place (see above)' >&2
+        (( status != 0 )) || status=1
+    fi
+    exit "$status"
+}
+trap on_exit EXIT
+# A fatal signal that arrives during a foreground command kills bash without
+# the EXIT trap. Turned into an exit, it runs cleanup like any other failure.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p tmp
 [[ -f tmp/candle-0.11.0.tar.gz ]] || {
@@ -182,6 +348,133 @@ for _ in $(seq 1 24); do
     exec 3>&-
     sleep 0.02
 done
+
+# Root is needed only to create the adapter. The server sudo started must
+# have given it up, in every thread, before it served anything. $pid is sudo;
+# the server is a descendant, one or two levels down depending on whether sudo
+# interposes a monitor process.
+server_pid=$(descendant_named "$pid" smbanything)
+[[ -n "$server_pid" ]] || { echo 'cannot find the tunnel server under sudo' >&2; exit 1; }
+# Every uid counts: real, effective and saved (and on Linux the filesystem uid),
+# of every thread. A saved uid of 0 would still let the process take root back.
+if [[ "$platform" == Darwin ]]; then
+    server_uids=$(ps -o uid=,ruid=,svuid= -p "$server_pid" | xargs -n1 | sort -u | xargs)
+else
+    server_uids=$(sudo -n cat /proc/"$server_pid"/task/*/status \
+        | awk '/^Uid:/ {print $2; print $3; print $4; print $5}' | sort -u | xargs)
+fi
+[[ "$server_uids" == "$(id -u)" ]] || {
+    echo "the tunnel server still runs as uid(s) '$server_uids', not $(id -u)" >&2
+    exit 1
+}
+info "server runs as uid $server_uids after creating the adapter"
+
+# Nothing but the adapter address is a client. A packet the host forwards
+# from anywhere else has to get no answer at all.
+if [[ "$platform" == Darwin ]]; then
+    # macOS never sends a locally sourced packet from another address into
+    # the utun, so the neighbour has to be real enough to be forwarded: SYNs
+    # written by BPF onto one end of a peered feth pair arrive on the other,
+    # which this host owns, and with forwarding on it routes them into the
+    # tunnel — link-local destination and all. tcpdump on the utun proves
+    # they got there and that nothing answered.
+    info 'checking that a forwarded neighbour gets no answer'
+    uv_bin=$(command -v uv || echo "$HOME/.local/bin/uv")
+    # A no-op once uv has it; the injector runs on uv's Python, never the system's.
+    "$uv_bin" python install --quiet 3.13 \
+        && python=$("$uv_bin" python find --managed-python 3.13) || {
+        echo 'the forwarded-neighbour check needs uv and its Python 3.13' >&2
+        exit 1
+    }
+    utun=$(route -n get 169.254.255.1 | awk '/interface:/ {print $2}')
+    [[ "$utun" == utun* ]] || { echo "169.254.255.1 routes via '$utun', not a utun" >&2; exit 1; }
+    # Each flag is set only once its resource exists: under `set -e` a
+    # failed create exits first, and cleanup leaves the existing one alone.
+    sudo -n ifconfig feth4450 create
+    feth4450_created=true
+    sudo -n ifconfig feth4451 create
+    feth4451_created=true
+    sudo -n ifconfig feth4450 peer feth4451
+    sudo -n ifconfig feth4450 up
+    sudo -n ifconfig feth4451 inet 203.0.113.1/24 up
+    # Any reply goes back to the fake neighbour, never onto the real network.
+    sudo -n route -q add -host "$foreign_source" -interface feth4451 >/dev/null
+    neighbour_route=true
+    # Read just before the write, and undone only if this run changed it. The
+    # undo is recorded first: a signal that lands once the write is done must
+    # still find it.
+    if [[ "$(sysctl -n net.inet.ip.forwarding)" != 1 ]]; then
+        forwarding_was=0
+        sudo -n sysctl -q net.inet.ip.forwarding=1 >/dev/null
+    fi
+    start_capture "$utun"
+    sudo -n "$python" -I ci/unix/inject-syn.py feth4450 \
+        "$(ifconfig feth4450 | awk '/ether/ {print $2}')" \
+        "$(ifconfig feth4451 | awk '/ether/ {print $2}')" \
+        "$foreign_source" 169.254.255.1 445
+    sleep 1.5
+    remove_neighbour
+    check_capture "$utun"
+else
+    # Linux does route a locally sourced packet from a spare address into the
+    # tunnel, which stands in for a forwarded one without enabling forwarding.
+    info 'checking that another source address gets no answer'
+    tun_if=$(ip -o route get 169.254.255.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+    [[ "$tun_if" == smbany* ]] || { echo "169.254.255.1 routes via '$tun_if', not the tunnel" >&2; exit 1; }
+    sudo -n ip addr add "$foreign_source/32" dev lo
+    foreign_alias=lo
+    start_capture "$tun_if"
+    # nc's failure alone would prove nothing; the capture shows its SYNs got
+    # to the tunnel and that nothing answered them.
+    if nc -z -w 2 -s "$foreign_source" 169.254.255.1 445 2>/dev/null; then
+        echo "a connection from $foreign_source reached the tunnel" >&2
+        exit 1
+    fi
+    stop_tcpdump
+    remove_foreign_alias
+    check_capture "$tun_if"
+    nc -z -w 2 169.254.255.1 445 2>/dev/null || {
+        echo 'the adapter address itself can no longer connect' >&2
+        exit 1
+    }
+fi
+
+# The packet thread sleeps on the adapter, the bridges and smoltcp's timers
+# rather than on a clock, so an idle bridged connection costs it no wakeups
+# and no CPU. Linux counts both per thread; macOS has no equivalent to read.
+# The wakeup count catches a loop that sleeps briefly, as the old 1 ms poll
+# did; a loop that spins without sleeping never switches voluntarily, so its
+# CPU time (utime + stime, in clock ticks of 10 ms) is what catches it. Each
+# limit is a small fraction of what either loop would show in 2 s.
+if [[ "$platform" != Darwin ]]; then
+    exec 3<>/dev/tcp/169.254.255.1/445
+    sleep 0.5
+    # No match is the case the check below reports, not a reason to exit here.
+    tun_task=$(grep -lx 'smbanything-tun' /proc/"$server_pid"/task/*/comm 2>/dev/null | head -n1 || true)
+    tun_task=${tun_task%/comm}
+    if [[ -z "$tun_task" ]]; then
+        echo 'no smbanything-tun thread in the server' >&2
+        exit 1
+    fi
+    switches() { sudo -n awk '/^voluntary_ctxt_switches/ {print $2}' "$tun_task/status"; }
+    # stat fields 14 and 15, counted after the `pid (comm) ` prefix.
+    cpu_ticks() { sudo -n cat "$tun_task/stat" | sed 's/^.*) //' | awk '{print $12 + $13}'; }
+    before=$(switches)
+    ticks_before=$(cpu_ticks)
+    sleep 2
+    wakeups=$(( $(switches) - before ))
+    ticks=$(( $(cpu_ticks) - ticks_before ))
+    exec 3>&-
+    (( wakeups < 20 )) || {
+        echo "the packet thread woke $wakeups times in 2 s with an idle connection" >&2
+        exit 1
+    }
+    (( ticks < 5 )) || {
+        echo "the packet thread used $ticks clock ticks of CPU in 2 s with an idle connection" >&2
+        exit 1
+    }
+    info "packet thread woke $wakeups times and used $ticks clock ticks in 2 s with an idle connection"
+fi
 
 if [[ "$platform" == Darwin ]]; then
     mount_dir="$work/mount"

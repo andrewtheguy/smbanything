@@ -118,8 +118,10 @@ conflict with an SMB server already running on the host.
 socket to port 445. It creates a temporary L3 adapter, assigns
 `169.254.255.2/32` to it, and routes only `169.254.255.1/32` through it. A
 userspace TCP stack answers the first address and proxies authenticated SMB to
-the private loopback listener. The adapter and routes disappear when the
-process stops.
+the private loopback listener, and only for the adapter's own address. The
+adapter and routes disappear when the process stops. Root is needed only to
+create the adapter: on Linux and macOS the process switches back to the sudo
+user before it opens an archive or answers a client.
 
 ```sh
 # Linux and macOS: /dev/net/tun and utun are native OS facilities.
@@ -139,9 +141,12 @@ net use Z: \\169.254.255.1\share * /user:smbanything
 ```
 
 Linux and macOS need no driver file. Windows has no native TUN API, so the
-Windows installer puts the pinned `wintun-amd64.dll` beside `smbanything.exe`,
-with Wintun's license under `share\doc\smbanything`; run from an elevated
-terminal. The DLL is hash-verified before it is loaded.
+Windows installer puts `wintun-amd64.dll` beside `smbanything.exe`, with
+Wintun's license under `share\doc\smbanything`; run from an elevated terminal.
+The two files also work copied anywhere, but for `--smb-tun` keep them in a
+folder only administrators can write: the DLL is loaded into the elevated
+process unverified, so a writable folder lets anything running as you run code
+as administrator. See [docs/smb-tun.md](docs/smb-tun.md#the-windows-driver).
 
 The default pair is in the RFC 3927 link-local block reserved from APIPA
 autoconfiguration. Neither address is routed off the machine. Because the
