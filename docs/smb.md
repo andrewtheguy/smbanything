@@ -5,7 +5,7 @@ because the read-only half of SMB 2.1 against immutable backing data is small:
 no write path, no file locking, no cache invalidation, no oplocks worth
 honouring. The `smbanything` binary serves archives over it; other projects
 (wrustic serves restic snapshots) embed the same crate with their own
-[`Backing`](../smbanything_core/src/smb/backing.rs) implementation.
+[`Backing`](../crates/smbanything_core/src/smb/backing.rs) implementation.
 
 ## Security
 
@@ -139,7 +139,7 @@ refused with a specific NTSTATUS.
 
 ## Module map
 
-All under `smbanything_core/src/smb/`:
+All under `crates/smbanything_core/src/smb/`:
 
 | file | what it holds |
 |------|---------------|
@@ -159,7 +159,7 @@ All under `smbanything_core/src/smb/`:
 `Backing` is a trait so the byte-exact encoders can be tested against an
 in-memory tree without standing up any real data source — and so the whole
 server is reusable over any immutable tree: the `smbanything` binary implements
-it over ZIP/TAR archives (`src/archive/`), wrustic over restic snapshots.
+it over ZIP/TAR archives (`crates/smbanything/src/archive/`), wrustic over restic snapshots.
 
 ## When a mount fails
 

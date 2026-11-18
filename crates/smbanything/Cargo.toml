@@ -1,0 +1,30 @@
+[package]
+name = "smbanything"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = { version = "3.5", features = ["termination"] }
+rapidgzip-core = "0.3.1"
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
+sha2.workspace = true
+smbanything_core.workspace = true
+tar = "0.4"
+tempfile = "3"
+zip = { version = "8.6", default-features = false, features = [
+    "bzip2",
+    "deflate64",
+    "deflate-flate2-zlib-rs",
+    "legacy-zip",
+    "lzma",
+    "ppmd",
+    "xz",
+    "zstd",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Only to give root back after startup: see src/privilege.rs.
+libc.workspace = true

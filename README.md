@@ -197,10 +197,17 @@ TAR-specific behavior:
 
 ## Crate layout
 
-`smbanything_core` contains the archive-independent SMB server, authentication,
-protocol handling, and read-only backing interfaces. ZIP and TAR parsing stays
-in the `smbanything` application crate, in `src/archive/zip.rs` and
-`src/archive/tar.rs` respectively.
+The repository is a Cargo workspace with both crates under `crates/`:
+
+- `crates/smbanything_core` contains the archive-independent SMB server,
+  authentication, protocol handling, and read-only backing interfaces.
+- `crates/smbanything` is the application. ZIP and TAR parsing lives there, in
+  `src/archive/zip.rs` and `src/archive/tar.rs`.
+
+Both crates take their version from `[workspace.package]` in the root
+`Cargo.toml`, so a release tag `v<version>` is also the `smbanything_core`
+version another project pins with
+`smbanything_core = { git = "https://github.com/andrewtheguy/smbanything.git", tag = "v<version>" }`.
 
 ## Security boundary
 

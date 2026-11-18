@@ -3,7 +3,7 @@
   The Windows package: an MSI installing smbanything under %ProgramFiles%\smbanything with bin
   on the machine PATH, and nothing else — no service, no shortcut, no config, like the .deb,
   .rpm and .pkg. The one addition is the Wintun driver DLL beside the exe, which the packet tunnel
-  loads from there (smbanything_core/src/smb/tun.rs), and Wintun's licence, which its
+  loads from there (crates/smbanything_core/src/smb/tun.rs), and Wintun's licence, which its
   redistribution terms require to travel with it.
 
   Built by packaging/build-windows-msi.ps1 with WiX 5 (`wix build`), which defines

@@ -1,34 +1,17 @@
-[package]
-name = "smbanything"
-version = "0.0.10"
-edition = "2024"
-
 [workspace]
-members = ["smbanything_core"]
+members = ["crates/*"]
 resolver = "3"
 
-[dependencies]
+# One version for every crate: a release tags the workspace, so the core
+# library an embedder pins by that tag carries the same number.
+[workspace.package]
+version = "0.0.11"
+edition = "2024"
+
+# Dependencies more than one crate uses, declared once.
+[workspace.dependencies]
 anyhow = "1"
 bytes = "1"
-clap = { version = "4.5", features = ["derive"] }
-ctrlc = { version = "3.5", features = ["termination"] }
-rapidgzip-core = "0.3.1"
-ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
-sha2 = "0.11"
-smbanything_core = { path = "smbanything_core" }
-tar = "0.4"
-tempfile = "3"
-zip = { version = "8.6", default-features = false, features = [
-    "bzip2",
-    "deflate64",
-    "deflate-flate2-zlib-rs",
-    "legacy-zip",
-    "lzma",
-    "ppmd",
-    "xz",
-    "zstd",
-] }
-
-[target.'cfg(unix)'.dependencies]
-# Only to give root back after startup: see src/privilege.rs.
 libc = "0.2"
+sha2 = "0.11"
+smbanything_core = { path = "crates/smbanything_core" }

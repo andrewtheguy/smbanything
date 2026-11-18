@@ -1,7 +1,7 @@
 [package]
 name = "smbanything_core"
-version = "0.0.2"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [features]
 default = ["tun"]
@@ -14,22 +14,22 @@ default = ["tun"]
 tun = ["dep:libc", "dep:smoltcp", "dep:tun", "dep:windows-sys", "dep:wintun"]
 
 [dependencies]
-anyhow = "1"
-bytes = "1"
+anyhow.workspace = true
+bytes.workspace = true
 hmac = "0.13"
 jiff = "0.2"
 md-5 = "0.11"
 md4 = "0.11"
 rand = "0.10.1"
 rc4 = "0.2"
-sha2 = "0.11"
+sha2.workspace = true
 subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 # Linux uses /dev/net/tun and macOS uses utun. The crate configures those
 # native interfaces; neither platform has or needs a sidecar driver.
-libc = { version = "0.2", optional = true }
+libc = { workspace = true, optional = true }
 tun = { version = "0.8.14", optional = true }
 
 [target.'cfg(windows)'.dependencies]
