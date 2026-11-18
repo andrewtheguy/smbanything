@@ -146,7 +146,7 @@ use files::{Handles, OpenRegistry};
 use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, write_error_body};
 pub use path::SmbPath;
 #[cfg(all(windows, feature = "tun"))]
-pub use tun::{remove_driver, verify_driver};
+pub use tun::verify_driver;
 pub use proto::status;
 pub use session::Credentials;
 use session::{SessionState, TreeKind};
@@ -554,16 +554,32 @@ pub enum Bind {
     Tun(TunConfig),
 }
 
-/// Start an empty server on `port` (0 picks an ephemeral one). Binding happens
+/// A server whose listener is bound — and, with [`Bind::Tun`], whose adapter
+/// is up and routed — but that has not read a byte from any client: it starts
+/// no thread until [`Bound::start`]. Clients that arrive meanwhile wait in the
+/// kernel's queues. Everything that may need privilege happens in [`bind`],
+/// so a caller can give that privilege up before serving anyone. Dropping it
+/// unstarted closes the listener and removes the adapter.
+pub struct Bound {
+    listeners_std: Vec<StdTcpListener>,
+    bound_port: u16,
+    mount: MountPoint,
+    share_name: String,
+    credentials: Credentials,
+    #[cfg(feature = "tun")]
+    tun: Option<tun::TunAdapter>,
+}
+
+/// Bind an empty server on `port` (0 picks an ephemeral one). Binding happens
 /// synchronously so that a port conflict is reported to the caller rather than
-/// swallowed by the server thread. Use [`SmbHandle::load`] to change the root
-/// without restarting it.
-pub fn start(
+/// swallowed by the server thread. [`Bound::start`] then serves it; use
+/// [`SmbHandle::load`] to change the root without restarting it.
+pub fn bind(
     port: u16,
     share_name: impl Into<String>,
     bind: Bind,
     credentials: Credentials,
-) -> Result<SmbHandle> {
+) -> Result<Bound> {
     let listeners_std = match &bind {
         Bind::Loopback => {
             local_server::bind_localhost(port).map_err(|e| privileged_hint(e, port))?
@@ -590,7 +606,7 @@ pub fn start(
         .map_err(|e| anyhow!("read bound listener address: {e}"))?;
     let bound_port = bound_addr.port();
 
-    // Create the client-facing transport before spawning the SMB thread. A
+    // Create the client-facing transport before any thread exists. A
     // privilege, route, or driver failure therefore leaves no hidden server
     // running behind a tunnel that never came up.
     #[cfg(feature = "tun")]
@@ -600,12 +616,12 @@ pub fn start(
                 std::net::Ipv4Addr::LOCALHOST,
                 bound_port,
             ));
-            let share = tun::TunShare::start(config.port, forward_to, config.addrs)?;
+            let adapter = tun::TunAdapter::create(config.port, forward_to, config.addrs)?;
             let mount = MountPoint {
-                host: share.virtual_ip().to_string(),
+                host: adapter.virtual_ip().to_string(),
                 port: config.port,
             };
-            (Some(share), mount)
+            (Some(adapter), mount)
         }
         _ => (
             None,
@@ -625,55 +641,81 @@ pub fn start(
         port: bound_port,
     };
 
-    let share_name = share_name.into();
-    let boot_time = SystemTime::now();
-    let contents = Arc::new(Contents::new(&share_name, boot_time));
-    let failed_logons = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let ctx = Arc::new(Ctx {
-        share_name: share_name.clone(),
-        contents: contents.clone(),
-        credentials,
-        volume_serial: rand::random::<u32>(),
-        server_guid: rand::random::<[u8; 16]>(),
-        boot_time,
-        failed_logons: failed_logons.clone(),
-    });
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-    let join = thread::Builder::new()
-        .name(format!("smbanything-{bound_port}"))
-        .spawn(move || {
-            // Multi-thread rather than current-thread: a backing read may be
-            // blocking, and `block_in_place` (below) requires a runtime that can
-            // hand the reactor to another worker while one is stalled on a
-            // backend fetch.
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_io()
-                .enable_time()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(_) => return,
-            };
-            rt.block_on(async move {
-                accept_loop(listeners_std, ctx, shutdown_rx).await;
-            });
-        })
-        .map_err(|e| anyhow!("spawning smb thread: {e}"))?;
-
-    Ok(SmbHandle {
-        port: bound_port,
-        share_name,
+    Ok(Bound {
+        listeners_std,
+        bound_port,
         mount,
-        failed_logons,
-        contents,
+        share_name: share_name.into(),
+        credentials,
         #[cfg(feature = "tun")]
         tun,
-        shutdown_tx: Some(shutdown_tx),
-        join_handle: Some(join),
     })
+}
+
+impl Bound {
+    /// Start serving: the packet thread, when there is a tunnel, and the SMB
+    /// server thread.
+    pub fn start(self) -> Result<SmbHandle> {
+        let Self {
+            listeners_std,
+            bound_port,
+            mount,
+            share_name,
+            credentials,
+            #[cfg(feature = "tun")]
+            tun,
+        } = self;
+        #[cfg(feature = "tun")]
+        let tun = tun.map(tun::TunAdapter::start).transpose()?;
+        let boot_time = SystemTime::now();
+        let contents = Arc::new(Contents::new(&share_name, boot_time));
+        let failed_logons = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ctx = Arc::new(Ctx {
+            share_name: share_name.clone(),
+            contents: contents.clone(),
+            credentials,
+            volume_serial: rand::random::<u32>(),
+            server_guid: rand::random::<[u8; 16]>(),
+            boot_time,
+            failed_logons: failed_logons.clone(),
+        });
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let join = thread::Builder::new()
+            .name(format!("smbanything-{bound_port}"))
+            .spawn(move || {
+                // Multi-thread rather than current-thread: a backing read may be
+                // blocking, and `block_in_place` (below) requires a runtime that can
+                // hand the reactor to another worker while one is stalled on a
+                // backend fetch.
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(_) => return,
+                };
+                rt.block_on(async move {
+                    accept_loop(listeners_std, ctx, shutdown_rx).await;
+                });
+            })
+            .map_err(|e| anyhow!("spawning smb thread: {e}"))?;
+
+        Ok(SmbHandle {
+            port: bound_port,
+            share_name,
+            mount,
+            failed_logons,
+            contents,
+            #[cfg(feature = "tun")]
+            tun,
+            shutdown_tx: Some(shutdown_tx),
+            join_handle: Some(join),
+        })
+    }
 }
 
 async fn accept_loop(
@@ -1543,12 +1585,13 @@ mod tests {
     }
 
     fn start_test_server(port: u16) -> SmbHandle {
-        let handle = start(
+        let handle = bind(
             port,
             DEFAULT_SHARE_NAME,
             Bind::Loopback,
             test_credentials(),
         )
+        .and_then(Bound::start)
         .expect("server starts");
         handle.load(test_backing());
         handle

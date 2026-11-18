@@ -34,16 +34,18 @@ const MAX_CONNS: usize = 8;
 const SOCKET_BUF: usize = 256 * 1024;
 const PROXY_HIGH_WATER: usize = 512 * 1024;
 
-/// A running packet-tunnel front end for the private SMB listener.
-pub(super) struct TunShare {
-    virtual_ip: Ipv4Addr,
-    shutdown: Arc<AtomicBool>,
-    waker: Waker,
-    join: Option<JoinHandle<()>>,
+/// A packet-tunnel adapter that is up and routed, but whose packets nothing
+/// reads yet: whatever arrives waits in the adapter's queue until
+/// [`TunAdapter::start`]. Dropping it removes the adapter.
+pub(super) struct TunAdapter {
+    device: PlatformTun,
+    addrs: TunAddrs,
+    port: u16,
+    forward_to: SocketAddr,
 }
 
-impl TunShare {
-    pub(super) fn start(port: u16, forward_to: SocketAddr, addrs: TunAddrs) -> Result<Self> {
+impl TunAdapter {
+    pub(super) fn create(port: u16, forward_to: SocketAddr, addrs: TunAddrs) -> Result<Self> {
         if port == 0 {
             return Err(anyhow!("the packet tunnel needs a fixed client-visible port"));
         }
@@ -54,7 +56,26 @@ impl TunShare {
             addrs.adapter_ip(),
             addrs.virtual_ip()
         );
+        Ok(Self {
+            device,
+            addrs,
+            port,
+            forward_to,
+        })
+    }
 
+    pub(super) fn virtual_ip(&self) -> Ipv4Addr {
+        self.addrs.virtual_ip()
+    }
+
+    /// Start answering clients on the adapter's packet thread.
+    pub(super) fn start(self) -> Result<TunShare> {
+        let Self {
+            device,
+            addrs,
+            port,
+            forward_to,
+        } = self;
         let (poller, waker) = Poller::new()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let join = {
@@ -65,17 +86,19 @@ impl TunShare {
                 .map_err(|e| anyhow!("spawning the packet-tunnel thread: {e}"))?
         };
 
-        Ok(Self {
-            virtual_ip: addrs.virtual_ip(),
+        Ok(TunShare {
             shutdown,
             waker,
             join: Some(join),
         })
     }
+}
 
-    pub(super) fn virtual_ip(&self) -> Ipv4Addr {
-        self.virtual_ip
-    }
+/// A running packet-tunnel front end for the private SMB listener.
+pub(super) struct TunShare {
+    shutdown: Arc<AtomicBool>,
+    waker: Waker,
+    join: Option<JoinHandle<()>>,
 }
 
 impl Drop for TunShare {
@@ -525,9 +548,13 @@ mod windows {
     /// The handle shares read access only: while it lives, nobody can open
     /// the file for writing, nor rename or delete it (both need delete
     /// access). The loader's own open asks for read and execute, which that
-    /// sharing allows, so `LoadLibrary` maps exactly the bytes hashed here.
+    /// sharing allows. `load_path` is the file's final path, read back from
+    /// the handle: no junction or symlink is left in it to retarget, and no
+    /// directory along it can be renamed while a file inside is open, so
+    /// `LoadLibrary` maps exactly the bytes hashed here.
     struct PinnedDll {
         path: PathBuf,
+        load_path: PathBuf,
         _file: std::fs::File,
     }
 
@@ -565,7 +592,57 @@ mod windows {
                     path.display()
                 ));
             }
-            Ok(Self { path, _file: file })
+            let load_path = final_path(&file)
+                .map_err(|error| anyhow!("resolving {}: {error}", path.display()))?;
+            Ok(Self {
+                path,
+                load_path,
+                _file: file,
+            })
+        }
+    }
+
+    /// The path the handle actually reached, with every junction and
+    /// symlink resolved. The `\\?\` prefix is dropped from a drive path,
+    /// which means the same file without it.
+    fn final_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+        };
+
+        let mut buffer = vec![0u16; 512];
+        loop {
+            // SAFETY: a live file handle, and a buffer of the length passed.
+            let len = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle(),
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                )
+            } as usize;
+            if len == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Too small: `len` is the size needed, terminator included.
+            if len >= buffer.len() {
+                buffer.resize(len, 0);
+                continue;
+            }
+            let path = std::ffi::OsString::from_wide(&buffer[..len]);
+            let text = path.to_string_lossy();
+            let bytes = text.as_bytes();
+            let drive_path = bytes.len() > 6
+                && bytes.starts_with(br"\\?\")
+                && bytes[4].is_ascii_alphabetic()
+                && bytes[5] == b':';
+            return Ok(if drive_path {
+                PathBuf::from(&text[4..])
+            } else {
+                PathBuf::from(path)
+            });
         }
     }
 
@@ -573,7 +650,7 @@ mod windows {
         let dll = PinnedDll::beside_exe()?;
         // SAFETY: only the DLL with the pinned digest is passed to the loader,
         // and `dll` keeps it from changing until the load has mapped it.
-        let wintun = unsafe { wintun::load_from_path(&dll.path) }
+        let wintun = unsafe { wintun::load_from_path(&dll.load_path) }
             .map_err(|e| anyhow!("loading {}: {e}", dll.path.display()))?;
         drop(dll);
         Ok(wintun)
@@ -581,21 +658,6 @@ mod windows {
 
     pub(super) fn verify_dll(path: &Path) -> Result<()> {
         PinnedDll::open(path.to_path_buf()).map(drop)
-    }
-
-    /// Remove the Wintun driver from the driver store, as the uninstaller
-    /// does. Wintun itself skips the removal while any Wintun adapter, ours
-    /// or another program's, still exists.
-    pub(super) fn remove_driver() -> Result<()> {
-        let wintun = load_pinned_dll()?;
-        // SAFETY: a documented export of the pinned driver, taking no arguments.
-        if unsafe { wintun.WintunDeleteDriver() } == 0 {
-            return Err(anyhow!(
-                "removing the Wintun driver failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
     }
 
     fn reject_addresses_in_use(addrs: TunAddrs) -> Result<()> {
@@ -764,6 +826,16 @@ mod windows {
             "the DLL was renamed while it was held"
         );
         assert!(std::fs::remove_file(&path).is_err(), "the DLL was deleted while it was held");
+        // Nor can the path the loader is given be pointed elsewhere.
+        assert!(
+            std::fs::rename(&dir, dir.with_extension("moved")).is_err(),
+            "the DLL's directory was renamed while it was held"
+        );
+        assert!(!held.load_path.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(
+            std::fs::canonicalize(&held.load_path).unwrap(),
+            std::fs::canonicalize(&path).unwrap()
+        );
         // Readers are still let in: the loader is one.
         std::fs::File::open(&path).expect("a reader opens the held DLL");
 
@@ -789,16 +861,6 @@ pub fn verify_driver(path: &std::path::Path) -> anyhow::Result<()> {
     windows::verify_dll(path)
 }
 
-/// Remove the Wintun driver from the Windows driver store, loading it through
-/// the same pinned DLL beside the executable that a tun share uses. Creating
-/// the first adapter installs the driver, and it stays installed after every
-/// adapter is gone; an uninstaller calls this to take it away. Wintun skips the
-/// removal while any Wintun adapter exists, including other programs'.
-#[cfg(windows)]
-pub fn remove_driver() -> anyhow::Result<()> {
-    windows::remove_driver()
-}
-
 /// Whether `packet` is IPv4 from `peer`, the adapter's own address.
 ///
 /// The host sends to the virtual address from the adapter address, so nothing
@@ -814,6 +876,7 @@ struct SmolDevice {
     io: PlatformTun,
     peer: Ipv4Addr,
     ignored_any: bool,
+    shutdown: Arc<AtomicBool>,
 }
 
 struct PacketRx {
@@ -870,6 +933,11 @@ impl Device for SmolDevice {
                     "tun: ignoring IPv4 packets not sent from {}, the first from {source}",
                     self.peer
                 );
+            }
+            // Ignored packets arriving as fast as they are read would keep
+            // this loop, and so the packet thread, from ever seeing shutdown.
+            if self.shutdown.load(Ordering::Relaxed) {
+                return None;
             }
         }
     }
@@ -936,6 +1004,7 @@ fn poll_loop(
         io: device,
         peer: addrs.adapter_ip(),
         ignored_any: false,
+        shutdown: shutdown.clone(),
     };
     let started = StdInstant::now();
     let now = || Instant::from_micros(started.elapsed().as_micros() as i64);

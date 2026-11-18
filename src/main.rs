@@ -71,20 +71,10 @@ struct Args {
         requires = "smb_tun"
     )]
     smb_tun_ip: smb::TunAddrs,
-
-    /// Remove the Wintun driver from the driver store and exit. The MSI runs
-    /// this when it uninstalls; it is not meant to be typed.
-    #[cfg(windows)]
-    #[arg(long, hide = true, exclusive = true)]
-    remove_wintun_driver: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    #[cfg(windows)]
-    if args.remove_wintun_driver {
-        return smb::remove_driver();
-    }
     validate_simple_name("share", &args.share)?;
     validate_simple_name("user", &args.user)?;
 
@@ -100,7 +90,7 @@ fn main() -> Result<()> {
     } else {
         smb::Bind::Loopback
     };
-    let handle = smb::start(
+    let bound = smb::bind(
         args.port,
         &args.share,
         bind,
@@ -110,11 +100,14 @@ fn main() -> Result<()> {
         },
     )?;
     // Every privileged step is behind us: the adapter exists and the listener
-    // is bound. Nothing that parses client or archive input runs as root.
+    // is bound, but no thread has read a client byte yet. Root goes first, so
+    // nothing that parses client or archive input ever runs as root, and a
+    // failure to give it up exits before anyone is served.
     #[cfg(unix)]
     let dropped_to = privilege::drop_root()?;
     #[cfg(not(unix))]
     let dropped_to = None;
+    let handle = bound.start()?;
     // The share is never empty: a README says what is loaded and how the
     // share behaves, so a client that mounts early sees a working server.
     let control = if args.archive.is_some() {

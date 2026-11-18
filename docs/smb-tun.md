@@ -79,7 +79,7 @@ next address up goes on the adapter) when the default is taken.
 
 The SMB protocol code is deliberately untouched by all of this. smoltcp
 terminates the connection and proxies it to the ordinary loopback listener
-`smb::start` already creates, so the async server, its tests and its wire
+`smb::bind` already creates, so the async server, its tests and its wire
 handling never learn a tun exists. The extra loopback hop costs a memcpy per
 buffer, which is nothing next to a backing read.
 
@@ -113,14 +113,15 @@ The Linux smoke test holds the idle wakeups under 20.
 - **Elevation to start, not to run.** Creating a network adapter always needs
   it, and nothing else does, so on Linux and macOS the process gives root back
   as soon as the adapter exists and the private listener is bound: under sudo
-  it switches every thread to `SUDO_UID`/`SUDO_GID` (with that user's
-  supplementary groups) for good, before it opens an archive or answers a
-  client, and says so in the banner (`Runs as:  uid 1000`). The adapter's file
-  descriptor keeps working, because the kernel checked privilege when it was
-  opened. Run as root without sudo, there is nobody to switch to and it stays
-  root. Windows has no cheap equivalent — an elevated token cannot be narrowed
-  back to the user's for a running process — so there the whole share runs
-  elevated. No existing service, binding or adapter is modified.
+  it switches to `SUDO_UID`/`SUDO_GID` (with that user's supplementary
+  groups) for good before it starts a single server thread, so it never opens
+  an archive or reads a client's byte as root, and stops if it cannot. The
+  banner says so (`Runs as:  uid 1000`). The adapter's file descriptor keeps
+  working, because the kernel checked privilege when it was opened. Run as
+  root without sudo, there is nobody to switch to and it stays root. Windows
+  has no cheap equivalent — an elevated token cannot be narrowed back to the
+  user's for a running process — so there the whole share runs elevated. No
+  existing service, binding or adapter is modified.
 - **Two host routes.** While a share is open, `169.254.255.1/32` and
   `169.254.255.2/32` route to the tun adapter — nothing wider. The server
   refuses to start if either exact address is already owned by the machine.
@@ -133,8 +134,8 @@ The Linux smoke test holds the idle wakeups under 20.
   share removes the adapter, and with it the address and the routes. A crash or
   a forced kill does the same: see below. The one thing that outlives a share
   is on Windows: the first adapter installs the Wintun driver into the driver
-  store, and it stays there, unused, until the MSI is uninstalled — see
-  [The Windows driver](#the-windows-driver).
+  store, and it stays there, unused, until an uninstall of the MSI removes it —
+  see [The Windows driver](#the-windows-driver).
 
 ### What happens if the process crashes
 
@@ -179,11 +180,12 @@ its LAN, default addresses included; a chosen pair outside link-local space
 widens that to anything able to route to it. The share still demanded the
 password, but nothing beyond the machine itself should have been able to ask.
 
-The smoke test repeats the measurement on every macOS run, and fails both when
-the tunnel answers and when no SYN reaches it, so it cannot pass vacuously. On
-Linux it uses a spare loopback address instead, because Linux routes a locally
-sourced packet from it into the tunnel the same way; macOS refuses to, whether
-the alias is on `lo0` or `en0`, which is why it needs the forwarded neighbour.
+The smoke test repeats the measurement on every run, watching the tunnel
+interface with tcpdump, and fails both when the tunnel answers and when no SYN
+reaches it, so it cannot pass vacuously. On Linux the SYNs come from a spare
+loopback address instead, because Linux routes a locally sourced packet from it
+into the tunnel the same way; macOS refuses to, whether the alias is on `lo0` or
+`en0`, which is why it needs the forwarded neighbour.
 
 ## The Windows driver
 
@@ -223,20 +225,33 @@ The check and the load see the same bytes. The DLL is opened with read-only
 sharing, hashed through that handle, and the handle is held until
 `LoadLibrary` has mapped it: while it is open nothing can open the file for
 writing, rename it or delete it, and the loader's own read-and-execute open is
-still let in. `the_pinned_driver_cannot_be_written_while_it_is_held` checks all
-four.
+still let in. The loader is given the final path read back from that handle,
+with every junction and symlink resolved, and no directory along it can be
+renamed while the file inside is open, so the path cannot be pointed at another
+file either. `the_pinned_driver_cannot_be_written_while_it_is_held` checks all
+of it.
 
 ### The driver store
 
 Wintun installs its driver into the Windows driver store (`wintun.inf`, as an
 `oemN.inf`) the first time an adapter is created, and the package stays there
-after every adapter is gone. Uninstalling the MSI removes it: a deferred custom
-action runs the installed `smbanything.exe --remove-wintun-driver` before the
-files go, which calls `WintunDeleteDriver` through the same pinned DLL. Wintun
-leaves the driver in place while any Wintun adapter exists, another program's
-included, and an upgrade skips the step, since the new version would only
-install it again. `verify-windows-msi.ps1` serves a tunnel from the installed
-copy, then checks the driver is gone after the uninstall.
+after every adapter is gone. A full uninstall of the MSI tries to remove it: a
+deferred custom action calls `WintunDeleteDriver`. Wintun leaves the driver in
+place while any Wintun adapter exists, another program's included; an upgrade
+skips the step, since the new version would only install it again; and a
+failure is ignored rather than blocking the uninstall.
+
+The action runs as SYSTEM, so it runs nothing from the install folder, which
+the wizard lets an administrator put somewhere a standard user can write.
+Windows Installer extracts its own copy of the DLL, embedded in the package,
+into its admin-only directory and calls the export there. `WintunDeleteDriver`
+takes no arguments and returns a `BOOL`, not the `UINT (MSIHANDLE)` a DLL
+custom action is declared with. On x64 the extra handle is harmless, and the
+result is ignored, but it reads backwards in the msiexec log: Windows Installer
+turns the `TRUE` of a removal into "actual error code 1603", and a `FALSE`
+would read as 0. `verify-windows-msi.ps1` serves a tunnel from the installed copy,
+checks the uninstall called the extracted copy, and checks the driver is gone.
+It refuses to run on a host that already has a Wintun adapter.
 
 **Updating the driver:** verify the new archive against the SHA2-256 published
 on wintun.net *and* its Authenticode signature, then replace

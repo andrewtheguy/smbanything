@@ -21,12 +21,16 @@ mount_dir=
 elevated_pid=false
 # The packet tunnel's foreign-source check plays a neighbour at this spare
 # TEST-NET-2 address. Linux aliases it onto loopback; macOS puts it behind a
-# peered feth pair with IP forwarding on. Cleanup undoes either.
+# peered feth pair with IP forwarding on. Cleanup undoes only what this run
+# created, so an interface or route that was already there is left alone.
 foreign_source=198.51.100.7
 foreign_alias=
-neighbour_feth=false
+feth4450_created=false
+feth4451_created=false
+neighbour_route=false
 forwarding_was=
 tcpdump_sudo=
+capture=
 
 info() { echo "[smoke] $*"; }
 # The banner's `Server:   listening on <host>:<port>  (...)` line, and the
@@ -41,21 +45,84 @@ remove_foreign_alias() {
     foreign_alias=
 }
 
-# $tcpdump_sudo is sudo, which does not relay signals on macOS: stop its child.
+# The process named like $2 at or below pid $1. sudo runs its command as a
+# child, or as a grandchild when it interposes a monitor process (use_pty).
+descendant_named() {
+    local pid=$1
+    while [[ -n "$pid" && "$(ps -o comm= -p "$pid" || true)" != *"$2"* ]]; do
+        pid=$(pgrep -P "$pid" | head -n1 || true)
+    done
+    echo "$pid"
+}
+
+# Record TCP port 445 traffic on the tunnel interface $1 into $capture.
+start_capture() {
+    capture="$work/capture.txt"
+    sudo -n tcpdump -n -l -U -i "$1" 'tcp port 445' >"$capture" 2>"$work/tcpdump.err" &
+    tcpdump_sudo=$!
+    for _ in $(seq 1 100); do
+        grep -q 'listening on' "$work/tcpdump.err" && return 0
+        sleep 0.05
+    done
+    echo "tcpdump never started capturing on $1" >&2
+    cat "$work/tcpdump.err" >&2
+    exit 1
+}
+
+# $tcpdump_sudo is sudo, which does not relay a signal from this shell on
+# macOS, so signal tcpdump itself, wherever under sudo it runs. It exits on
+# SIGINT once its buffer is written; if it has not after 5 s, kill it, so the
+# wait for sudo cannot hang.
 stop_tcpdump() {
     [[ -n "$tcpdump_sudo" ]] || return 0
-    sudo -n pkill -INT -P "$tcpdump_sudo" 2>/dev/null || true
+    local tcpdump_pid
+    tcpdump_pid=$(descendant_named "$tcpdump_sudo" tcpdump)
+    if [[ -n "$tcpdump_pid" ]]; then
+        sudo -n kill -INT "$tcpdump_pid" 2>/dev/null || true
+        for _ in $(seq 1 100); do
+            ps -p "$tcpdump_pid" >/dev/null || break
+            sleep 0.05
+        done
+        sudo -n kill -KILL "$tcpdump_pid" 2>/dev/null || true
+    else
+        sudo -n kill -KILL "$tcpdump_sudo" 2>/dev/null || true
+    fi
     wait "$tcpdump_sudo" 2>/dev/null || true
     tcpdump_sudo=
 }
 
+# With tcpdump stopped: SYNs from $foreign_source must have reached the tunnel
+# interface $1, or the check proved nothing, and nothing may have answered.
+check_capture() {
+    local arrived answered
+    arrived=$(grep -c "$foreign_source\.[0-9]* > 169\.254\.255\.1\.445: Flags \[S\]" "$capture" || true)
+    answered=$(grep -c "> $foreign_source\." "$capture" || true)
+    if (( arrived == 0 )); then
+        echo "no SYN from $foreign_source reached $1, so the check proved nothing" >&2
+        cat "$work/tcpdump.err" "$capture" >&2
+        exit 1
+    fi
+    if (( answered != 0 )); then
+        echo "the tunnel answered a SYN from $foreign_source" >&2
+        cat "$capture" >&2
+        exit 1
+    fi
+    info "$arrived SYNs from $foreign_source reached $1 and got no answer"
+}
+
 remove_neighbour() {
     stop_tcpdump
-    if $neighbour_feth; then
+    if $neighbour_route; then
         sudo -n route -q delete -host "$foreign_source" >/dev/null 2>&1 || true
+        neighbour_route=false
+    fi
+    if $feth4451_created; then
         sudo -n ifconfig feth4451 destroy 2>/dev/null || true
+        feth4451_created=false
+    fi
+    if $feth4450_created; then
         sudo -n ifconfig feth4450 destroy 2>/dev/null || true
-        neighbour_feth=false
+        feth4450_created=false
     fi
     if [[ -n "$forwarding_was" ]]; then
         sudo -n sysctl -q net.inet.ip.forwarding="$forwarding_was" >/dev/null || true
@@ -225,10 +292,7 @@ done
 # have given it up, in every thread, before it served anything. $pid is sudo;
 # the server is a descendant, one or two levels down depending on whether sudo
 # interposes a monitor process.
-server_pid=$pid
-while [[ -n "$server_pid" && "$(ps -o comm= -p "$server_pid")" != *smbanything* ]]; do
-    server_pid=$(pgrep -P "$server_pid" | head -n1)
-done
+server_pid=$(descendant_named "$pid" smbanything)
 [[ -n "$server_pid" ]] || { echo 'cannot find the tunnel server under sudo' >&2; exit 1; }
 if [[ "$platform" == Darwin ]]; then
     server_uids=$(ps -o uid= -p "$server_pid" | tr -d ' ')
@@ -252,59 +316,54 @@ if [[ "$platform" == Darwin ]]; then
     # they got there and that nothing answered.
     info 'checking that a forwarded neighbour gets no answer'
     uv_bin=$(command -v uv || echo "$HOME/.local/bin/uv")
-    python=$("$uv_bin" python find --managed-python 3.13) || {
-        echo 'the forwarded-neighbour check needs uv and its Python 3.13 (uv python install 3.13)' >&2
+    # A no-op once uv has it; the injector runs on uv's Python, never the system's.
+    "$uv_bin" python install --quiet 3.13 \
+        && python=$("$uv_bin" python find --managed-python 3.13) || {
+        echo 'the forwarded-neighbour check needs uv and its Python 3.13' >&2
         exit 1
     }
     utun=$(route -n get 169.254.255.1 | awk '/interface:/ {print $2}')
     [[ "$utun" == utun* ]] || { echo "169.254.255.1 routes via '$utun', not a utun" >&2; exit 1; }
     forwarding_was=$(sysctl -n net.inet.ip.forwarding)
-    neighbour_feth=true
+    # Each flag is set only once its resource exists: under `set -e` a
+    # failed create exits first, and cleanup leaves the existing one alone.
     sudo -n ifconfig feth4450 create
+    feth4450_created=true
     sudo -n ifconfig feth4451 create
+    feth4451_created=true
     sudo -n ifconfig feth4450 peer feth4451
     sudo -n ifconfig feth4450 up
     sudo -n ifconfig feth4451 inet 203.0.113.1/24 up
     # Any reply goes back to the fake neighbour, never onto the real network.
     sudo -n route -q add -host "$foreign_source" -interface feth4451 >/dev/null
+    neighbour_route=true
     sudo -n sysctl -q net.inet.ip.forwarding=1 >/dev/null
-    dump="$work/forwarded.txt"
-    sudo -n tcpdump -n -l -U -i "$utun" 'tcp port 445' >"$dump" 2>"$work/tcpdump.err" &
-    tcpdump_sudo=$!
-    for _ in $(seq 1 100); do
-        grep -q 'listening on' "$work/tcpdump.err" 2>/dev/null && break
-        sleep 0.05
-    done
+    start_capture "$utun"
     sudo -n "$python" -I ci/unix/inject-syn.py feth4450 \
         "$(ifconfig feth4450 | awk '/ether/ {print $2}')" \
         "$(ifconfig feth4451 | awk '/ether/ {print $2}')" \
         "$foreign_source" 169.254.255.1 445
     sleep 1.5
     remove_neighbour
-    arrived=$(grep -c "$foreign_source\.[0-9]* > 169\.254\.255\.1\.445: Flags \[S\]" "$dump" || true)
-    answered=$(grep -c "> $foreign_source\." "$dump" || true)
-    if (( arrived == 0 )); then
-        echo "no forwarded SYN reached $utun, so the check proved nothing" >&2
-        cat "$work/tcpdump.err" "$dump" >&2
-        exit 1
-    fi
-    if (( answered != 0 )); then
-        echo "the tunnel answered a forwarded SYN from $foreign_source" >&2
-        cat "$dump" >&2
-        exit 1
-    fi
-    info "$arrived forwarded SYNs reached $utun and got no answer"
+    check_capture "$utun"
 else
     # Linux does route a locally sourced packet from a spare address into the
     # tunnel, which stands in for a forwarded one without enabling forwarding.
     info 'checking that another source address gets no answer'
+    tun_if=$(ip -o route get 169.254.255.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+    [[ "$tun_if" == smbany* ]] || { echo "169.254.255.1 routes via '$tun_if', not the tunnel" >&2; exit 1; }
     sudo -n ip addr add "$foreign_source/32" dev lo
     foreign_alias=lo
+    start_capture "$tun_if"
+    # nc's failure alone would prove nothing; the capture shows its SYNs got
+    # to the tunnel and that nothing answered them.
     if nc -z -w 2 -s "$foreign_source" 169.254.255.1 445 2>/dev/null; then
         echo "a connection from $foreign_source reached the tunnel" >&2
         exit 1
     fi
+    stop_tcpdump
     remove_foreign_alias
+    check_capture "$tun_if"
     nc -z -w 2 169.254.255.1 445 2>/dev/null || {
         echo 'the adapter address itself can no longer connect' >&2
         exit 1

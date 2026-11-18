@@ -1,11 +1,12 @@
-//! Hand root back once the server is listening.
+//! Hand root back once the server is bound, before it serves anyone.
 //!
 //! Root is needed only to create the `--smb-tun` adapter, or to bind a
-//! privileged `--port`, and both happen inside `smb::start`. Everything after
-//! that — archive parsing, NTLM, the SMB server — needs no more than the
-//! invoking user could do themselves, so under sudo the whole process becomes
-//! that user again. The adapter's file descriptor stays open and keeps
-//! working: the kernel checked privilege when it was opened, not on each read.
+//! privileged `--port`, and both happen inside `smb::bind`, before any thread
+//! reads from a client. Everything after that — archive parsing, NTLM, the SMB
+//! server — needs no more than the invoking user could do themselves, so under
+//! sudo the whole process becomes that user again. The adapter's file
+//! descriptor stays open and keeps working: the kernel checked privilege when
+//! it was opened, not on each read.
 //!
 //! Windows has no equivalent that is cheap: an elevated token cannot be
 //! narrowed back to the user's for a running process, so an elevated share
@@ -34,8 +35,8 @@ pub(crate) fn drop_root() -> Result<Option<u32>> {
     let user = CString::new(user).context("SUDO_USER contains a NUL byte")?;
 
     // Supplementary groups, then the group, then the user: each step gives up
-    // the right to take the ones before it. The C library applies each change
-    // to every thread, including the server's, which are already running.
+    // the right to take the ones before it. No server thread exists yet, and
+    // the C library would apply each change to every thread if one did.
     // SAFETY: `user` is a valid C string for the duration of the call.
     if unsafe { libc::initgroups(user.as_ptr(), gid as _) } != 0 {
         return Err(std::io::Error::last_os_error())
