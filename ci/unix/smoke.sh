@@ -31,6 +31,7 @@ neighbour_route=false
 forwarding_was=
 tcpdump_sudo=
 capture=
+capture_complete=false
 
 info() { echo "[smoke] $*"; }
 # The banner's `Server:   listening on <host>:<port>  (...)` line, and the
@@ -39,10 +40,27 @@ listen_port() { sed -n 's/^Server: *listening on .*:\([0-9][0-9]*\)  .*/\1/p' "$
 archive_folder() { awk '/^Folder:/ {print $2; exit}' "$1"; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
+# Run one cleanup step, saying so if it fails. The caller clears its record
+# only on success, so a later cleanup (the EXIT trap) tries again.
+undo() {
+    local what=$1; shift
+    "$@" >/dev/null 2>&1 && return 0
+    echo "[smoke] cleanup could not $what" >&2
+    return 1
+}
+
 remove_foreign_alias() {
     [[ -n "$foreign_alias" ]] || return 0
-    sudo -n ip addr del "$foreign_source/32" dev "$foreign_alias" || true
-    foreign_alias=
+    undo "remove $foreign_source from $foreign_alias" \
+        sudo -n ip addr del "$foreign_source/32" dev "$foreign_alias" \
+        && foreign_alias=
+}
+
+# Whether pid $1 is running: a zombie this shell has not reaped has exited.
+running() {
+    local state
+    state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+    [[ "$state" != Z* ]]
 }
 
 # The process named like $2 at or below pid $1. sudo runs its command as a
@@ -70,31 +88,50 @@ start_capture() {
 }
 
 # $tcpdump_sudo is sudo, which does not relay a signal from this shell on
-# macOS, so signal tcpdump itself, wherever under sudo it runs. It exits on
-# SIGINT once its buffer is written; if it has not after 5 s, kill it, so the
-# wait for sudo cannot hang.
+# macOS, so signal tcpdump itself, wherever under sudo it runs. The capture is
+# complete only if tcpdump was still running then and exited cleanly on that
+# SIGINT, having written everything it saw. Otherwise it is killed after 5 s;
+# sudo is reaped only once it has exited, so cleanup never blocks on it.
 stop_tcpdump() {
     [[ -n "$tcpdump_sudo" ]] || return 0
-    local tcpdump_pid
+    local tcpdump_pid status=1 interrupted=false
+    capture_complete=false
     tcpdump_pid=$(descendant_named "$tcpdump_sudo" tcpdump)
-    if [[ -n "$tcpdump_pid" ]]; then
-        sudo -n kill -INT "$tcpdump_pid" 2>/dev/null || true
-        for _ in $(seq 1 100); do
-            ps -p "$tcpdump_pid" >/dev/null || break
+    if [[ -n "$tcpdump_pid" ]] && sudo -n kill -INT "$tcpdump_pid" 2>/dev/null; then
+        interrupted=true
+    fi
+    for _ in $(seq 1 100); do
+        running "$tcpdump_sudo" || break
+        sleep 0.05
+    done
+    if running "$tcpdump_sudo"; then
+        interrupted=false
+        [[ -z "$tcpdump_pid" ]] || sudo -n kill -KILL "$tcpdump_pid" 2>/dev/null || true
+        sudo -n kill -KILL "$tcpdump_sudo" 2>/dev/null || true
+        for _ in $(seq 1 40); do
+            running "$tcpdump_sudo" || break
             sleep 0.05
         done
-        sudo -n kill -KILL "$tcpdump_pid" 2>/dev/null || true
-    else
-        sudo -n kill -KILL "$tcpdump_sudo" 2>/dev/null || true
     fi
-    wait "$tcpdump_sudo" 2>/dev/null || true
+    if running "$tcpdump_sudo"; then
+        echo "[smoke] cleanup could not stop tcpdump (sudo pid $tcpdump_sudo)" >&2
+    else
+        wait "$tcpdump_sudo" 2>/dev/null && status=0 || status=$?
+        $interrupted && (( status == 0 )) && capture_complete=true
+    fi
     tcpdump_sudo=
 }
 
 # With tcpdump stopped: SYNs from $foreign_source must have reached the tunnel
-# interface $1, or the check proved nothing, and nothing may have answered.
+# interface $1, or the check proved nothing, and nothing may have answered. A
+# capture tcpdump did not finish cleanly proves neither.
 check_capture() {
     local arrived answered
+    if ! $capture_complete; then
+        echo "the capture on $1 is incomplete (tcpdump did not exit cleanly), so it proves nothing" >&2
+        cat "$work/tcpdump.err" >&2
+        exit 1
+    fi
     arrived=$(grep -c "$foreign_source\.[0-9]* > 169\.254\.255\.1\.445: Flags \[S\]" "$capture" || true)
     answered=$(grep -c "> $foreign_source\." "$capture" || true)
     if (( arrived == 0 )); then
@@ -113,20 +150,20 @@ check_capture() {
 remove_neighbour() {
     stop_tcpdump
     if $neighbour_route; then
-        sudo -n route -q delete -host "$foreign_source" >/dev/null 2>&1 || true
-        neighbour_route=false
+        undo "delete the host route to $foreign_source" \
+            sudo -n route -q delete -host "$foreign_source" \
+            && neighbour_route=false
     fi
     if $feth4451_created; then
-        sudo -n ifconfig feth4451 destroy 2>/dev/null || true
-        feth4451_created=false
+        undo 'destroy feth4451' sudo -n ifconfig feth4451 destroy && feth4451_created=false
     fi
     if $feth4450_created; then
-        sudo -n ifconfig feth4450 destroy 2>/dev/null || true
-        feth4450_created=false
+        undo 'destroy feth4450' sudo -n ifconfig feth4450 destroy && feth4450_created=false
     fi
     if [[ -n "$forwarding_was" ]]; then
-        sudo -n sysctl -q net.inet.ip.forwarding="$forwarding_was" >/dev/null || true
-        forwarding_was=
+        undo "restore net.inet.ip.forwarding to $forwarding_was" \
+            sudo -n sysctl -q net.inet.ip.forwarding="$forwarding_was" \
+            && forwarding_was=
     fi
 }
 
@@ -161,6 +198,11 @@ cleanup() {
     elevated_pid=false
 }
 trap cleanup EXIT
+# A fatal signal that arrives during a foreground command kills bash without
+# the EXIT trap. Turned into an exit, it runs cleanup like any other failure.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p tmp
 [[ -f tmp/candle-0.11.0.tar.gz ]] || {
@@ -294,10 +336,13 @@ done
 # interposes a monitor process.
 server_pid=$(descendant_named "$pid" smbanything)
 [[ -n "$server_pid" ]] || { echo 'cannot find the tunnel server under sudo' >&2; exit 1; }
+# Every uid counts: real, effective and saved (and on Linux the filesystem uid),
+# of every thread. A saved uid of 0 would still let the process take root back.
 if [[ "$platform" == Darwin ]]; then
-    server_uids=$(ps -o uid= -p "$server_pid" | tr -d ' ')
+    server_uids=$(ps -o uid=,ruid=,svuid= -p "$server_pid" | xargs -n1 | sort -u | xargs)
 else
-    server_uids=$(sudo -n cat /proc/"$server_pid"/task/*/status | awk '/^Uid:/ {print $3}' | sort -u | xargs)
+    server_uids=$(sudo -n cat /proc/"$server_pid"/task/*/status \
+        | awk '/^Uid:/ {print $2; print $3; print $4; print $5}' | sort -u | xargs)
 fi
 [[ "$server_uids" == "$(id -u)" ]] || {
     echo "the tunnel server still runs as uid(s) '$server_uids', not $(id -u)" >&2
@@ -324,7 +369,6 @@ if [[ "$platform" == Darwin ]]; then
     }
     utun=$(route -n get 169.254.255.1 | awk '/interface:/ {print $2}')
     [[ "$utun" == utun* ]] || { echo "169.254.255.1 routes via '$utun', not a utun" >&2; exit 1; }
-    forwarding_was=$(sysctl -n net.inet.ip.forwarding)
     # Each flag is set only once its resource exists: under `set -e` a
     # failed create exits first, and cleanup leaves the existing one alone.
     sudo -n ifconfig feth4450 create
@@ -337,7 +381,11 @@ if [[ "$platform" == Darwin ]]; then
     # Any reply goes back to the fake neighbour, never onto the real network.
     sudo -n route -q add -host "$foreign_source" -interface feth4451 >/dev/null
     neighbour_route=true
-    sudo -n sysctl -q net.inet.ip.forwarding=1 >/dev/null
+    # Read just before the write, and undone only if this run changed it.
+    if [[ "$(sysctl -n net.inet.ip.forwarding)" != 1 ]]; then
+        sudo -n sysctl -q net.inet.ip.forwarding=1 >/dev/null
+        forwarding_was=0
+    fi
     start_capture "$utun"
     sudo -n "$python" -I ci/unix/inject-syn.py feth4450 \
         "$(ifconfig feth4450 | awk '/ether/ {print $2}')" \
@@ -371,8 +419,12 @@ else
 fi
 
 # The packet thread sleeps on the adapter, the bridges and smoltcp's timers
-# rather than on a clock, so an idle bridged connection costs it no wakeups.
-# Linux counts them per thread; macOS has no equivalent to read.
+# rather than on a clock, so an idle bridged connection costs it no wakeups
+# and no CPU. Linux counts both per thread; macOS has no equivalent to read.
+# The wakeup count catches a loop that sleeps briefly, as the old 1 ms poll
+# did; a loop that spins without sleeping never switches voluntarily, so its
+# CPU time (utime + stime, in clock ticks of 10 ms) is what catches it. Each
+# limit is a small fraction of what either loop would show in 2 s.
 if [[ "$platform" != Darwin ]]; then
     exec 3<>/dev/tcp/169.254.255.1/445
     sleep 0.5
@@ -383,15 +435,23 @@ if [[ "$platform" != Darwin ]]; then
         exit 1
     fi
     switches() { sudo -n awk '/^voluntary_ctxt_switches/ {print $2}' "$tun_task/status"; }
+    # stat fields 14 and 15, counted after the `pid (comm) ` prefix.
+    cpu_ticks() { sudo -n cat "$tun_task/stat" | sed 's/^.*) //' | awk '{print $12 + $13}'; }
     before=$(switches)
+    ticks_before=$(cpu_ticks)
     sleep 2
     wakeups=$(( $(switches) - before ))
+    ticks=$(( $(cpu_ticks) - ticks_before ))
     exec 3>&-
     (( wakeups < 20 )) || {
         echo "the packet thread woke $wakeups times in 2 s with an idle connection" >&2
         exit 1
     }
-    info "packet thread woke $wakeups times in 2 s with an idle connection"
+    (( ticks < 5 )) || {
+        echo "the packet thread used $ticks clock ticks of CPU in 2 s with an idle connection" >&2
+        exit 1
+    }
+    info "packet thread woke $wakeups times and used $ticks clock ticks in 2 s with an idle connection"
 fi
 
 if [[ "$platform" == Darwin ]]; then
