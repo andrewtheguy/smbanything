@@ -21,9 +21,7 @@ use ratatui::{
         cursor::Show,
         event::{DisableBracketedPaste, EnableBracketedPaste},
         execute,
-        terminal::{
-            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        },
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
     prelude::CrosstermBackend,
 };
@@ -251,11 +249,7 @@ fn serve(
 
 /// Run the interactive browser, which starts on an empty share and loads and
 /// unloads archives while the server keeps running.
-fn browse(
-    handle: &smb::SmbHandle,
-    server: &ServerView,
-    stop_rx: mpsc::Receiver<()>,
-) -> Result<()> {
+fn browse(handle: &smb::SmbHandle, server: &ServerView, stop_rx: mpsc::Receiver<()>) -> Result<()> {
     enable_raw_mode().context("entering raw mode")?;
     let entered = execute!(io::stdout(), EnterAlternateScreen).context("entering the UI screen");
     if let Err(e) = entered {
@@ -464,7 +458,8 @@ mod tests {
             Args::try_parse_from(["smbanything", "a.zip", "--smb-tun", "--port", "445"]).is_err()
         );
         assert!(
-            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun-ip", "169.254.255.3"]).is_err()
+            Args::try_parse_from(["smbanything", "a.zip", "--smb-tun-ip", "169.254.255.3"])
+                .is_err()
         );
     }
 }

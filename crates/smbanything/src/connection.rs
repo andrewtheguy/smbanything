@@ -263,13 +263,19 @@ mod tests {
         let text = text(&view(4456, false));
         assert!(text.contains("port=4456,vers=2.1"));
         assert!(text.contains("/TCPPORT:4456"));
-        assert!(text.contains("24H2"), "the Windows version floor is worth saying");
+        assert!(
+            text.contains("24H2"),
+            "the Windows version floor is worth saying"
+        );
     }
 
     #[test]
     fn the_standard_port_drops_the_port_options_and_offers_a_unc_path() {
         let text = text(&view(445, true));
-        assert!(!text.contains("port="), "no port option belongs on 445:\n{text}");
+        assert!(
+            !text.contains("port="),
+            "no port option belongs on 445:\n{text}"
+        );
         assert!(!text.contains("/TCPPORT"));
         assert!(text.contains("smb://smbanything@127.0.0.1/share"));
         assert!(text.contains("Explorer's address bar"));

@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant as StdInstant;
 
-use anyhow::{Result, anyhow};
 #[cfg(unix)]
 use anyhow::Context as _;
+use anyhow::{Result, anyhow};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
@@ -47,7 +47,9 @@ pub(super) struct TunAdapter {
 impl TunAdapter {
     pub(super) fn create(port: u16, forward_to: SocketAddr, addrs: TunAddrs) -> Result<Self> {
         if port == 0 {
-            return Err(anyhow!("the packet tunnel needs a fixed client-visible port"));
+            return Err(anyhow!(
+                "the packet tunnel needs a fixed client-visible port"
+            ));
         }
 
         let device = PlatformTun::create(addrs).map_err(adapter_hint)?;
@@ -84,9 +86,7 @@ impl TunAdapter {
             let report = report.clone();
             std::thread::Builder::new()
                 .name(format!("smbanything-tun-{port}"))
-                .spawn(move || {
-                    poll_loop(device, poller, addrs, port, forward_to, shutdown, report)
-                })
+                .spawn(move || poll_loop(device, poller, addrs, port, forward_to, shutdown, report))
                 .map_err(|e| anyhow!("spawning the packet-tunnel thread: {e}"))?
         };
 
@@ -109,7 +109,10 @@ pub(super) struct TunShare {
 
 impl TunShare {
     pub(super) fn report(&self) -> TunReport {
-        self.report.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -126,7 +129,8 @@ impl Drop for TunShare {
 
 fn adapter_hint(error: anyhow::Error) -> anyhow::Error {
     #[cfg(unix)]
-    let privilege = "Run smbanything through sudo; creating and routing a native TUN interface requires root.";
+    let privilege =
+        "Run smbanything through sudo; creating and routing a native TUN interface requires root.";
     #[cfg(windows)]
     let privilege = "Run smbanything from an elevated terminal; creating a Wintun adapter requires administrator rights.";
 
@@ -193,7 +197,9 @@ impl PlatformTun {
                 "the adapter closed",
             )),
             Ok(len) => Ok(Some(self.buffer[..len].to_vec())),
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -238,8 +244,8 @@ struct Poller {
 #[cfg(unix)]
 impl Poller {
     fn new() -> Result<(Self, Waker)> {
-        let (wake, waker) = std::os::unix::net::UnixStream::pair()
-            .context("creating the packet-tunnel waker")?;
+        let (wake, waker) =
+            std::os::unix::net::UnixStream::pair().context("creating the packet-tunnel waker")?;
         waker
             .set_nonblocking(true)
             .context("making the packet-tunnel waker nonblocking")?;
@@ -268,7 +274,8 @@ impl Poller {
         };
         self.fds.clear();
         self.fds.push(pollfd(self.wake.as_raw_fd(), libc::POLLIN));
-        self.fds.push(pollfd(device.device.as_raw_fd(), libc::POLLIN));
+        self.fds
+            .push(pollfd(device.device.as_raw_fd(), libc::POLLIN));
         for bridge in bridges {
             let Some(upstream) = &bridge.upstream else {
                 continue;
@@ -384,13 +391,9 @@ mod windows {
         pub(super) fn create(addrs: TunAddrs) -> Result<Self> {
             reject_addresses_in_use(addrs)?;
             let wintun = load_dll()?;
-            let adapter = wintun::Adapter::create(
-                &wintun,
-                ADAPTER_NAME,
-                TUNNEL_TYPE,
-                Some(ADAPTER_GUID),
-            )
-            .map_err(|e| anyhow!("creating the `{ADAPTER_NAME}` Wintun adapter: {e}"))?;
+            let adapter =
+                wintun::Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, Some(ADAPTER_GUID))
+                    .map_err(|e| anyhow!("creating the `{ADAPTER_NAME}` Wintun adapter: {e}"))?;
             let luid = unsafe { adapter.get_luid().Value };
             set_mtu(luid, MTU as u32)?;
             assign_address(luid, addrs.adapter_ip())?;
@@ -507,7 +510,9 @@ mod windows {
             };
             if status != 0 {
                 // SAFETY: reads this thread's last Winsock error.
-                return Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+                return Err(std::io::Error::from_raw_os_error(unsafe {
+                    WSAGetLastError()
+                }));
             }
             Ok(())
         }
@@ -533,9 +538,8 @@ mod windows {
                 device.read_event as HANDLE,
             ];
             let timeout = timeout.map_or(WSA_INFINITE, |timeout| {
-                u32::try_from(wait_millis(timeout)).map_or(WSA_INFINITE - 1, |ms| {
-                    ms.min(WSA_INFINITE - 1)
-                })
+                u32::try_from(wait_millis(timeout))
+                    .map_or(WSA_INFINITE - 1, |ms| ms.min(WSA_INFINITE - 1))
             });
             // SAFETY: three live event handles; wait for any, not alertable.
             let woke = unsafe {
@@ -576,9 +580,7 @@ mod windows {
     }
 
     fn reject_addresses_in_use(addrs: TunAddrs) -> Result<()> {
-        use windows_sys::Win32::NetworkManagement::IpHelper::{
-            GetBestRoute2, MIB_IPFORWARD_ROW2,
-        };
+        use windows_sys::Win32::NetworkManagement::IpHelper::{GetBestRoute2, MIB_IPFORWARD_ROW2};
         use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_INET};
 
         for addr in [addrs.virtual_ip(), addrs.adapter_ip()] {
@@ -653,8 +655,7 @@ mod windows {
 
     fn assign_address(luid: u64, addr: Ipv4Addr) -> Result<()> {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
-            CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry,
-            MIB_UNICASTIPADDRESS_ROW,
+            CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
         };
         use windows_sys::Win32::Networking::WinSock::{AF_INET, IpDadStatePreferred};
 
@@ -966,7 +967,10 @@ fn pump(
                     socket.abort();
                     return true;
                 }
-                smb_log!("tun: connection from {:?} bridged", socket.remote_endpoint());
+                smb_log!(
+                    "tun: connection from {:?} bridged",
+                    socket.remote_endpoint()
+                );
                 bridge.upstream = Some(stream);
                 did_work = true;
             }
@@ -1069,10 +1073,7 @@ fn pump(
         socket.close();
         did_work = true;
     }
-    if !socket.may_recv()
-        && bridge.to_upstream.is_empty()
-        && !bridge.upstream_write_closed
-    {
+    if !socket.may_recv() && bridge.to_upstream.is_empty() && !bridge.upstream_write_closed {
         let _ = upstream.shutdown(std::net::Shutdown::Write);
         bridge.upstream_write_closed = true;
         did_work = true;

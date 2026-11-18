@@ -95,4 +95,3 @@ fn id_from_env(name: &str) -> Result<Option<u32>> {
         Err(std::env::VarError::NotUnicode(_)) => bail!("{name} is not valid UTF-8"),
     }
 }
-

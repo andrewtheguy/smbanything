@@ -41,13 +41,9 @@ impl TarBacking {
             .metadata()
             .context("reading TAR archive metadata")?
             .len();
-        let scanner = file
-            .try_clone()
-            .context("cloning TAR archive handle")?;
+        let scanner = file.try_clone().context("cloning TAR archive handle")?;
         let mut archive = tar::Archive::new(scanner);
-        let entries = archive
-            .entries_with_seek()
-            .context("reading TAR entries")?;
+        let entries = archive.entries_with_seek().context("reading TAR entries")?;
         let (index, _) = Self::index_entries(entries, archive_timestamp, Some(archive_size))?;
         Ok(Self {
             source: TarSource::Plain(Arc::new(Mutex::new(file))),
@@ -175,10 +171,7 @@ impl Backing for TarBacking {
             .index
             .entry(path)
             .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
-        let offset = entry
-            .content
-            .as_ref()
-            .ok_or(status::FILE_IS_A_DIRECTORY)?;
+        let offset = entry.content.as_ref().ok_or(status::FILE_IS_A_DIRECTORY)?;
         Ok(Arc::new(TarFile {
             source: self.source.clone(),
             offset: *offset,
@@ -215,9 +208,7 @@ impl FileReader for TarFile {
         match &self.source {
             TarSource::Plain(source) => {
                 let mut buffer = vec![0u8; wanted];
-                let mut source = source
-                    .lock()
-                    .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
+                let mut source = source.lock().map_err(|_| status::UNEXPECTED_IO_ERROR)?;
                 let filled = read_at(&mut *source, absolute_offset, &mut buffer)
                     .map_err(|_| status::UNEXPECTED_IO_ERROR)?;
                 buffer.truncate(filled);
@@ -443,8 +434,8 @@ mod tests {
     use rapidgzip_core::DecodeError;
     use tempfile::NamedTempFile;
 
-    use super::*;
     use super::super::test_support::gzip_member;
+    use super::*;
 
     /// Extracts the decoder's typed failure, which reaches callers either
     /// directly through `finish` or boxed inside the `io::Error` that the
@@ -539,9 +530,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["docs", "root.txt"]
         );
-        let file = backing
-            .open(&smb_path(r"DOCS\DEEP\NUMBERS.TXT"))
-            .unwrap();
+        let file = backing.open(&smb_path(r"DOCS\DEEP\NUMBERS.TXT")).unwrap();
         assert_eq!(&file.read_at(3, 4).unwrap()[..], b"3456");
         assert_eq!(&file.read_at(0, 3).unwrap()[..], b"012");
         assert_eq!(&file.read_at(8, 20).unwrap()[..], b"89");
@@ -586,7 +575,8 @@ mod tests {
             .suffix(".tar.gz")
             .tempfile()
             .expect("temporary TAR.GZ");
-        temp.write_all(&gzip_bytes).expect("write multi-member gzip");
+        temp.write_all(&gzip_bytes)
+            .expect("write multi-member gzip");
         temp.flush().expect("flush multi-member gzip");
 
         let backing =
@@ -701,9 +691,7 @@ mod tests {
             header.set_size(1);
             header.set_mode(0o644);
             header.set_cksum();
-            writer
-                .append_data(&mut header, name, &b"x"[..])
-                .unwrap();
+            writer.append_data(&mut header, name, &b"x"[..]).unwrap();
         }
         writer.finish().unwrap();
 

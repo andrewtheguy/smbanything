@@ -186,9 +186,9 @@ fn readme_text(archive: Option<&OpenedArchive>, control: Control) -> String {
                 archive.total_size,
             ));
         }
-        None => text.push_str(
-            "No archive is loaded. This README is the only thing in the share.\n\n",
-        ),
+        None => {
+            text.push_str("No archive is loaded. This README is the only thing in the share.\n\n")
+        }
     }
     text.push_str(
         "About this share\n\
@@ -215,8 +215,10 @@ fn readme_text(archive: Option<&OpenedArchive>, control: Control) -> String {
 }
 
 fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 #[cfg(test)]
@@ -230,7 +232,11 @@ mod tests {
         let file = backing.open(&smb_path("readme.TXT")).unwrap();
         let size = backing.stat(&smb_path(README_NAME)).unwrap().size;
         let bytes = file.read_at(0, size as u32).unwrap();
-        assert_eq!(bytes.len() as u64, size, "the reported size is the whole file");
+        assert_eq!(
+            bytes.len() as u64,
+            size,
+            "the reported size is the whole file"
+        );
         assert!(file.read_at(size, 16).unwrap().is_empty());
         String::from_utf8(bytes.to_vec()).unwrap()
     }
@@ -325,7 +331,10 @@ mod tests {
         assert!(!ui.contains("No archive is loaded"), "{ui}");
 
         let one_shot = readme(&RootBacking::with_archive(&opened(), Control::CommandLine));
-        assert!(one_shot.contains("served\nuntil that process stops"), "{one_shot}");
+        assert!(
+            one_shot.contains("served\nuntil that process stops"),
+            "{one_shot}"
+        );
         assert!(!one_shot.contains("press l"), "{one_shot}");
     }
 }
