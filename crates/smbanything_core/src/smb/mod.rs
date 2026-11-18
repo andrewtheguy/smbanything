@@ -140,12 +140,12 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use crate::local_server;
-pub use backing::{Backing, FileReader, NodeInfo, NodeKind};
 use backing::EmptyBacking;
+pub use backing::{Backing, FileReader, NodeInfo, NodeKind};
 use files::{Handles, OpenRegistry};
-use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, write_error_body};
 pub use path::SmbPath;
 pub use proto::status;
+use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, write_error_body};
 pub use session::Credentials;
 use session::{SessionState, TreeKind};
 use wire::{MAX_INBOUND_MESSAGE, NBSS_HEADER_LEN, Reader, Writer, nbss_header, nbss_len};
@@ -494,15 +494,13 @@ impl std::str::FromStr for TunAddrs {
         let adapter_ip = u32::from(virtual_ip)
             .checked_add(1)
             .map(std::net::Ipv4Addr::from)
-            .ok_or_else(|| anyhow!("the adapter takes the address after {virtual_ip}, and there is none"))?;
+            .ok_or_else(|| {
+                anyhow!("the adapter takes the address after {virtual_ip}, and there is none")
+            })?;
 
         for addr in [virtual_ip, adapter_ip] {
             let first_octet = addr.octets()[0];
-            if addr.is_loopback()
-                || addr.is_multicast()
-                || first_octet == 0
-                || first_octet >= 240
-            {
+            if addr.is_loopback() || addr.is_multicast() || first_octet == 0 || first_octet >= 240 {
                 return Err(anyhow!(
                     "the tunnel needs {virtual_ip} and the next address, but {addr} is reserved by the local IP stack"
                 ));
@@ -633,10 +631,8 @@ pub fn bind(
     #[cfg(feature = "tun")]
     let (tun, mount) = match &bind {
         Bind::Tun(config) => {
-            let forward_to = std::net::SocketAddr::from((
-                std::net::Ipv4Addr::LOCALHOST,
-                bound_port,
-            ));
+            let forward_to =
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, bound_port));
             let adapter = tun::TunAdapter::create(config.port, forward_to, config.addrs)?;
             let mount = MountPoint {
                 host: adapter.virtual_ip().to_string(),
@@ -1589,10 +1585,7 @@ mod tests {
     }
 
     fn ctx() -> Arc<Ctx> {
-        let contents = Arc::new(Contents::new(
-            DEFAULT_SHARE_NAME,
-            SystemTime::UNIX_EPOCH,
-        ));
+        let contents = Arc::new(Contents::new(DEFAULT_SHARE_NAME, SystemTime::UNIX_EPOCH));
         contents.replace(test_backing());
         Arc::new(Ctx {
             share_name: DEFAULT_SHARE_NAME.to_string(),
@@ -1606,14 +1599,9 @@ mod tests {
     }
 
     fn start_test_server(port: u16) -> SmbHandle {
-        let handle = bind(
-            port,
-            DEFAULT_SHARE_NAME,
-            Bind::Loopback,
-            test_credentials(),
-        )
-        .and_then(Bound::start)
-        .expect("server starts");
+        let handle = bind(port, DEFAULT_SHARE_NAME, Bind::Loopback, test_credentials())
+            .and_then(Bound::start)
+            .expect("server starts");
         handle.load(test_backing());
         handle
     }
@@ -2678,10 +2666,7 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4455);
         let handle = start_test_server(port);
-        eprintln!(
-            "serving \\\\127.0.0.1\\anything on port {}",
-            handle.port
-        );
+        eprintln!("serving \\\\127.0.0.1\\anything on port {}", handle.port);
         std::thread::sleep(std::time::Duration::from_secs(120));
         handle.stop();
     }

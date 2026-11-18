@@ -239,10 +239,7 @@ impl Backing for ZipBacking {
             .index
             .entry(path)
             .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
-        let content = entry
-            .content
-            .as_ref()
-            .ok_or(status::FILE_IS_A_DIRECTORY)?;
+        let content = entry.content.as_ref().ok_or(status::FILE_IS_A_DIRECTORY)?;
         let file: Arc<dyn FileReader> = self.expand(entry, path, content)?;
         Ok(file)
     }

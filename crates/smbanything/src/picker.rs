@@ -62,7 +62,9 @@ impl Picker {
         let mut dir = if start.is_dir() {
             start.clone()
         } else {
-            start.parent().map_or_else(|| start.clone(), Path::to_path_buf)
+            start
+                .parent()
+                .map_or_else(|| start.clone(), Path::to_path_buf)
         };
         while fs::read_dir(&dir).is_err() {
             match dir.parent() {
@@ -236,7 +238,9 @@ impl Picker {
             self.selected = 0;
             return;
         }
-        let target = i64::try_from(self.selected).unwrap_or(0).saturating_add(delta);
+        let target = i64::try_from(self.selected)
+            .unwrap_or(0)
+            .saturating_add(delta);
         self.selected = target.clamp(0, i64::try_from(count - 1).unwrap_or(0)) as usize;
     }
 
@@ -302,7 +306,8 @@ impl Picker {
     }
 
     pub(crate) fn push_filter_str(&mut self, text: &str) {
-        self.filter.extend(text.chars().filter(|ch| !ch.is_control()));
+        self.filter
+            .extend(text.chars().filter(|ch| !ch.is_control()));
         self.filter_changed();
     }
 
@@ -409,8 +414,7 @@ fn typed_path(text: &str, dir: &Path) -> Option<PathBuf> {
         return Some(home.join(rest.trim_start_matches(['/', '\\'])));
     }
     let path = Path::new(&text);
-    let looks_like_path =
-        path.is_absolute() || text.contains(['/', '\\']) || text == "..";
+    let looks_like_path = path.is_absolute() || text.contains(['/', '\\']) || text == "..";
     looks_like_path.then(|| dir.join(path))
 }
 
@@ -442,11 +446,21 @@ mod tests {
     fn lists_directories_then_archives_and_hides_dotfiles() {
         let root = fixture();
         let mut picker = Picker::open(root.path());
-        assert_eq!(names(&picker), ["..", "photos", "Album.zip", "backup.tar.gz"]);
+        assert_eq!(
+            names(&picker),
+            ["..", "photos", "Album.zip", "backup.tar.gz"]
+        );
         picker.toggle_hidden();
         assert_eq!(
             names(&picker),
-            ["..", ".cache", "photos", ".secret.zip", "Album.zip", "backup.tar.gz"]
+            [
+                "..",
+                ".cache",
+                "photos",
+                ".secret.zip",
+                "Album.zip",
+                "backup.tar.gz"
+            ]
         );
     }
 
@@ -550,7 +564,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn normalize_folds_dot_components_lexically() {
-        assert_eq!(normalize(Path::new("/a/b/../c/./d")), PathBuf::from("/a/c/d"));
+        assert_eq!(
+            normalize(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
         assert_eq!(normalize(Path::new("/../a")), PathBuf::from("/a"));
     }
 
@@ -575,7 +592,10 @@ mod tests {
         picker.scroll_to_fit(5);
         let rows = picker.window(5);
         assert_eq!(rows.len(), 5);
-        assert!(rows.iter().any(|(entry, selected)| *selected && entry.name == "14.zip"));
+        assert!(
+            rows.iter()
+                .any(|(entry, selected)| *selected && entry.name == "14.zip")
+        );
         picker.move_by(-100);
         picker.scroll_to_fit(5);
         let rows = picker.window(5);

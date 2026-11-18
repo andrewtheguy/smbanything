@@ -46,10 +46,7 @@ impl Backing for TestBacking {
             .index
             .entry(path)
             .ok_or(status::OBJECT_NAME_NOT_FOUND)?;
-        let content = entry
-            .content
-            .as_ref()
-            .ok_or(status::FILE_IS_A_DIRECTORY)?;
+        let content = entry.content.as_ref().ok_or(status::FILE_IS_A_DIRECTORY)?;
         Ok(Arc::new(TestFile(Mutex::new(content.clone()))))
     }
 
@@ -78,12 +75,11 @@ impl FileReader for TestFile {
 
 const DEFLATE_BLOCK_SIZE: usize = 64 * 1024;
 const LENGTH_BASES: [usize; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99,
-    115, 131, 163, 195, 227, 258,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
 ];
 const LENGTH_EXTRA_BITS: [u8; 29] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5,
-    0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 
 /// Wraps bytes in a gzip member using fixed-Huffman DEFLATE blocks.
@@ -162,7 +158,10 @@ impl BitWriter {
             280..=287 => (0b1100_0000 + symbol - 280, 8),
             _ => panic!("invalid fixed-Huffman symbol {symbol}"),
         };
-        self.write_bits(code.reverse_bits() >> (u16::BITS - bit_count), bit_count as u8);
+        self.write_bits(
+            code.reverse_bits() >> (u16::BITS - bit_count),
+            bit_count as u8,
+        );
     }
 
     fn write_length(&mut self, length: usize) {

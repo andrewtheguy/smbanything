@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Result, bail};
-use smbanything_core::smb::{
-    Backing, FileReader, NodeInfo, NodeKind, SmbPath, status,
-};
+use smbanything_core::smb::{Backing, FileReader, NodeInfo, NodeKind, SmbPath, status};
 
 use self::tar::TarBacking;
 use self::zip::ZipBacking;
@@ -63,9 +61,7 @@ impl ArchiveBacking {
         match Format::of(path) {
             Some(Format::Zip) => Ok(Self(ArchiveKind::Zip(ZipBacking::open(path, label)?))),
             Some(Format::Tar) => Ok(Self(ArchiveKind::Tar(TarBacking::open(path, label)?))),
-            Some(Format::TarGz) => {
-                Ok(Self(ArchiveKind::Tar(TarBacking::open_gzip(path, label)?)))
-            }
+            Some(Format::TarGz) => Ok(Self(ArchiveKind::Tar(TarBacking::open_gzip(path, label)?))),
             None => match path.extension().and_then(|extension| extension.to_str()) {
                 Some(extension) => bail!(
                     "unsupported archive extension .{extension}; expected .zip, .tar, .tar.gz, or .tgz"
@@ -320,8 +316,8 @@ fn display_components(components: &[String]) -> String {
 mod tests {
     use std::io::Write as _;
 
-    use super::*;
     use super::test_support::{gzip_member, smb_path};
+    use super::*;
 
     #[test]
     fn unknown_extensions_are_rejected() {
@@ -348,7 +344,9 @@ mod tests {
             header.set_size(5);
             header.set_mode(0o644);
             header.set_cksum();
-            writer.append_data(&mut header, "hello.txt", &b"hello"[..]).unwrap();
+            writer
+                .append_data(&mut header, "hello.txt", &b"hello"[..])
+                .unwrap();
             writer.finish().unwrap();
             drop(writer);
 

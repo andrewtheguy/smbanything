@@ -329,21 +329,28 @@ fn render(frame: &mut Frame, app: &mut App, server: &ServerView) {
     let width = frame.area().width.saturating_sub(2);
     let server_lines = server_lines(server, app.ignored_source);
     let contents_lines = contents_lines(app);
-    let notice_lines = app.notice.as_ref().map_or(0, |notice| {
-        wrapped_rows(&notice.text, width + 2).min(3)
-    });
+    let notice_lines = app
+        .notice
+        .as_ref()
+        .map_or(0, |notice| wrapped_rows(&notice.text, width + 2).min(3));
     let picking = matches!(app.mode, Mode::Picking(_));
 
-    let [server_area, contents_area, middle_area, filter_area, notice_area, footer_area] =
-        Layout::vertical([
-            Constraint::Length(boxed_height(&server_lines, width)),
-            Constraint::Length(boxed_height(&contents_lines, width)),
-            Constraint::Fill(1),
-            Constraint::Length(if picking { 3 } else { 0 }),
-            Constraint::Length(notice_lines),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
+    let [
+        server_area,
+        contents_area,
+        middle_area,
+        filter_area,
+        notice_area,
+        footer_area,
+    ] = Layout::vertical([
+        Constraint::Length(boxed_height(&server_lines, width)),
+        Constraint::Length(boxed_height(&contents_lines, width)),
+        Constraint::Fill(1),
+        Constraint::Length(if picking { 3 } else { 0 }),
+        Constraint::Length(notice_lines),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
 
     render_block(frame, server_lines, " SMB server ", server_area);
     render_block(frame, contents_lines, " Contents ", contents_area);
@@ -396,16 +403,16 @@ fn server_lines(
     } else {
         "read-only, this machine only"
     };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::raw("Server:   "),
-            Span::styled(
-                format!("listening on {}:{}", server.host, server.port),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("  ({reach})")),
-        ]),
-    ];
+    let mut lines = vec![Line::from(vec![
+        Span::raw("Server:   "),
+        Span::styled(
+            format!("listening on {}:{}", server.host, server.port),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  ({reach})")),
+    ])];
     // Keyed on the transport actually in use, not on the port number: --port
     // 445 reaches the standard port with no tunnel anywhere, and claiming a
     // private adapter exists when none does would simply be wrong.
@@ -465,7 +472,9 @@ fn contents_lines(app: &App) -> Vec<Line<'static>> {
 /// how much is left below.
 fn detail_line(detail: connection::DetailLine) -> Line<'static> {
     let style = match detail.kind {
-        Kind::Heading => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Kind::Heading => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
         Kind::Command => Style::default().fg(Color::White),
         Kind::Note => Style::default().fg(Color::Gray),
         Kind::Warning => Style::default().fg(Color::Yellow),
@@ -511,7 +520,11 @@ fn wrapped_rows(text: &str, width: u16) -> u16 {
     let mut col = 0usize;
     for (index, word) in text.split(' ').enumerate() {
         let word_width = word.chars().count();
-        let needed = if index == 0 { word_width } else { word_width + 1 };
+        let needed = if index == 0 {
+            word_width
+        } else {
+            word_width + 1
+        };
         if col > 0 && col + needed > width {
             rows = rows.saturating_add(1);
             col = word_width;
@@ -627,10 +640,7 @@ fn render_filter(frame: &mut Frame, picker: &Picker, area: Rect) {
         frame.render_widget(Paragraph::new(shown), inner);
     }
     let column = cursor.min(width - 1) as u16;
-    if let Some(cell) = frame
-        .buffer_mut()
-        .cell_mut((inner.x + column, inner.y))
-    {
+    if let Some(cell) = frame.buffer_mut().cell_mut((inner.x + column, inner.y)) {
         cell.set_style(
             Style::default()
                 .fg(Color::Black)
@@ -671,7 +681,11 @@ fn render_notice(frame: &mut Frame, app: &App, area: Rect) {
     let Some(notice) = &app.notice else {
         return;
     };
-    let color = if notice.error { Color::Red } else { Color::Cyan };
+    let color = if notice.error {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
     frame.render_widget(
         Paragraph::new(notice.text.as_str())
             .style(Style::default().fg(color))
@@ -715,8 +729,14 @@ mod tests {
         assert!(text.contains("read-only, this machine only"));
         // A UNC in the header would name port 445 on any other port, and the
         // per-platform paths belong in the mount commands regardless.
-        assert!(!text.contains(r"\\127.0.0.1"), "no path belongs here:\n{text}");
-        assert!(!text.contains("//127.0.0.1"), "no path belongs here:\n{text}");
+        assert!(
+            !text.contains(r"\\127.0.0.1"),
+            "no path belongs here:\n{text}"
+        );
+        assert!(
+            !text.contains("//127.0.0.1"),
+            "no path belongs here:\n{text}"
+        );
     }
 
     #[test]

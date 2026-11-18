@@ -7,8 +7,8 @@
 // the write it announced, and fail somewhere far less obvious.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
 use super::backing::{Backing, FileReader, NodeInfo};
@@ -1190,7 +1190,9 @@ mod tests {
 
         fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
             if path.is_root() {
-                Ok(vec![self.stat(&SmbPath::parse("file").expect("test path"))?])
+                Ok(vec![
+                    self.stat(&SmbPath::parse("file").expect("test path"))?,
+                ])
             } else {
                 Err(status::OBJECT_PATH_NOT_FOUND)
             }
