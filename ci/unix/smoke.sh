@@ -117,11 +117,12 @@ stop_tcpdump() {
         done
     fi
     if running "$tcpdump_sudo"; then
+        # Kept, so a later cleanup tries again and the run fails if it stays.
         echo "[smoke] cleanup could not stop tcpdump (sudo pid $tcpdump_sudo)" >&2
-    else
-        wait "$tcpdump_sudo" 2>/dev/null && status=0 || status=$?
-        $interrupted && (( status == 0 )) && capture_complete=true
+        return 0
     fi
+    wait "$tcpdump_sudo" 2>/dev/null && status=0 || status=$?
+    $interrupted && (( status == 0 )) && capture_complete=true
     tcpdump_sudo=
 }
 
@@ -202,7 +203,20 @@ cleanup() {
     mount_dir=
     elevated_pid=false
 }
-trap cleanup EXIT
+# Teardown attempts every step and reports what failed, so the run cannot end
+# early; but anything still recorded once it is done is a change to this host
+# left in place, and the run fails for it even if everything else passed.
+on_exit() {
+    local status=$?
+    cleanup
+    if [[ -n "$foreign_alias$forwarding_was$tcpdump_sudo" ]] \
+        || $neighbour_route || $feth4450_created || $feth4451_created; then
+        echo '[smoke] cleanup left changes to this host in place (see above)' >&2
+        (( status != 0 )) || status=1
+    fi
+    exit "$status"
+}
+trap on_exit EXIT
 # A fatal signal that arrives during a foreground command kills bash without
 # the EXIT trap. Turned into an exit, it runs cleanup like any other failure.
 trap 'exit 129' HUP
