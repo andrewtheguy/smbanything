@@ -28,7 +28,7 @@ $uiExt = 'WixToolset.UI.wixext'
 if ($LASTEXITCODE -ne 0) { throw "wix extension add $uiExt failed (exit $LASTEXITCODE)" }
 
 # The version from cargo's own parse of the manifest rather than a regex over it — the same
-# `[package]` value the tarball script reads with tomllib, without needing a Python.
+# `[workspace.package]` version the tarball script reads with tomllib, without needing a Python.
 $metadata = & cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed (exit $LASTEXITCODE)" }
 $version = ($metadata.packages | Where-Object { $_.name -eq 'smbanything' }).version

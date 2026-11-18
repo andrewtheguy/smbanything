@@ -18,7 +18,9 @@ jobs:
       - name: Determine version
         id: version
         run: |
-          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          # Every crate inherits the workspace version, so the tag names both
+          # the binary and the smbanything_core an embedder pins by it.
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
           if [ -z "$version" ]; then
             echo "::error::Could not parse version from Cargo.toml"
             exit 1

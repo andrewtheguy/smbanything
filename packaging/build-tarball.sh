@@ -21,7 +21,7 @@ cd "$repo_root"
 version="$(python3 -c '
 import re, sys, tomllib
 with open("Cargo.toml", "rb") as f:
-    version = tomllib.load(f)["package"]["version"]
+    version = tomllib.load(f)["workspace"]["package"]["version"]
 if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
     sys.exit(f"invalid version in Cargo.toml: {version!r}")
 print(version)
