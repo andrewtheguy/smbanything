@@ -1011,9 +1011,15 @@ fn pump(
                 did_work = true;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            // The private listener is gone for this connection: nothing the
+            // client sends can be delivered, and keeping its bytes would only
+            // fill the queue and close its window. Abort, so the slot is
+            // recycled below.
             Err(_) => {
                 bridge.to_upstream.clear();
                 bridge.upstream_write_closed = true;
+                socket.abort();
+                did_work = true;
                 break;
             }
         }

@@ -54,6 +54,9 @@ remove_foreign_alias() {
     undo "remove $foreign_source from $foreign_alias" \
         sudo -n ip addr del "$foreign_source/32" dev "$foreign_alias" \
         && foreign_alias=
+    # undo has reported any failure. Returning it would end cleanup here
+    # under `set -e`, before the unmount and the server's shutdown.
+    return 0
 }
 
 # Whether pid $1 is running: a zombie this shell has not reaped has exited.
@@ -165,6 +168,8 @@ remove_neighbour() {
             sudo -n sysctl -q net.inet.ip.forwarding="$forwarding_was" \
             && forwarding_was=
     fi
+    # As in remove_foreign_alias: every step is attempted, failures reported.
+    return 0
 }
 
 cleanup() {
@@ -381,10 +386,12 @@ if [[ "$platform" == Darwin ]]; then
     # Any reply goes back to the fake neighbour, never onto the real network.
     sudo -n route -q add -host "$foreign_source" -interface feth4451 >/dev/null
     neighbour_route=true
-    # Read just before the write, and undone only if this run changed it.
+    # Read just before the write, and undone only if this run changed it. The
+    # undo is recorded first: a signal that lands once the write is done must
+    # still find it.
     if [[ "$(sysctl -n net.inet.ip.forwarding)" != 1 ]]; then
-        sudo -n sysctl -q net.inet.ip.forwarding=1 >/dev/null
         forwarding_was=0
+        sudo -n sysctl -q net.inet.ip.forwarding=1 >/dev/null
     fi
     start_capture "$utun"
     sudo -n "$python" -I ci/unix/inject-syn.py feth4450 \
