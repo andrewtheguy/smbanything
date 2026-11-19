@@ -5,12 +5,14 @@ on:
   push:
     paths:
       - "**.rs"
-      - rustfmt.toml
+      - "**/rustfmt.toml"
+      - "**/.rustfmt.toml"
       - .github/workflows/rust-format.yml
   pull_request:
     paths:
       - "**.rs"
-      - rustfmt.toml
+      - "**/rustfmt.toml"
+      - "**/.rustfmt.toml"
       - .github/workflows/rust-format.yml
 
 jobs:
